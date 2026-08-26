@@ -1,0 +1,5 @@
+# Copie para android/key.properties e mantenha o arquivo real fora do Git.
+storePassword=ALTERE_AQUI
+keyPassword=ALTERE_AQUI
+keyAlias=upload
+storeFile=upload-keystore.jks

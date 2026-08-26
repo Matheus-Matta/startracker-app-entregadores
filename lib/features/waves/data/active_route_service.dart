@@ -3,7 +3,9 @@ import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 
+import '../../../core/network/api_collection.dart';
 import '../../../core/network/api_client.dart';
+import '../../../core/network/offline_request_queue.dart';
 import '../../../core/storage/session_storage.dart';
 
 class ActiveRoute {
@@ -13,6 +15,7 @@ class ActiveRoute {
     required this.routeNumber,
     required this.status,
     required this.path,
+    required this.deliveryWaypoints,
     required this.warehouse,
     required this.stops,
   });
@@ -22,19 +25,31 @@ class ActiveRoute {
   final String routeNumber;
   final String status;
   final List<RouteCoordinate> path;
+  final Map<int, RouteCoordinate> deliveryWaypoints;
   final RoutePlace? warehouse;
   final List<ActiveRouteStop> stops;
 
   ActiveRouteStop? get currentStop {
-    const working = {'approaching', 'arrived', 'delivering'};
-    for (final stop in stops) {
-      if (working.contains(stop.status)) return stop;
-    }
+    // A lista ja vem ordenada por sequence. Depois de um skip, a parada
+    // anterior pode continuar temporariamente como approaching na resposta;
+    // ainda assim a primeira pendente da nova sequencia deve assumir o mapa.
     for (final stop in stops) {
       if (!stop.isTerminal) return stop;
     }
     return null;
   }
+
+  ActiveRoute copyWith({String? status, List<ActiveRouteStop>? stops}) =>
+      ActiveRoute(
+        routeId: routeId,
+        waveId: waveId,
+        routeNumber: routeNumber,
+        status: status ?? this.status,
+        path: path,
+        deliveryWaypoints: deliveryWaypoints,
+        warehouse: warehouse,
+        stops: stops ?? this.stops,
+      );
 }
 
 class RouteCoordinate {
@@ -75,6 +90,8 @@ class ActiveRouteStop {
     required this.orderId,
     required this.sequence,
     required this.status,
+    required this.orderStatus,
+    required this.isManual,
     required this.plannedEta,
     required this.orderNumber,
     required this.customerName,
@@ -99,6 +116,8 @@ class ActiveRouteStop {
   final int orderId;
   final int sequence;
   final String status;
+  final String orderStatus;
+  final bool isManual;
   final DateTime? plannedEta;
   final String orderNumber;
   final String customerName;
@@ -126,6 +145,8 @@ class ActiveRouteStop {
     orderId: orderId,
     sequence: sequence,
     status: status,
+    orderStatus: orderStatus,
+    isManual: isManual,
     plannedEta: plannedEta,
     orderNumber: orderNumber,
     customerName: customerName,
@@ -145,6 +166,34 @@ class ActiveRouteStop {
     existingRecipientDocument: existingRecipientDocument,
     existingNotes: existingNotes,
   );
+
+  ActiveRouteStop copyWith({String? status, String? orderStatus}) =>
+      ActiveRouteStop(
+        stopId: stopId,
+        orderId: orderId,
+        sequence: sequence,
+        status: status ?? this.status,
+        orderStatus: orderStatus ?? this.orderStatus,
+        isManual: isManual,
+        plannedEta: plannedEta,
+        orderNumber: orderNumber,
+        customerName: customerName,
+        customerPhone: customerPhone,
+        fullAddress: fullAddress,
+        latitude: latitude,
+        longitude: longitude,
+        units: units,
+        weightGrams: weightGrams,
+        contents: contents,
+        proofOverrides: proofOverrides,
+        policy: policy,
+        existingProofId: existingProofId,
+        existingPhotoCount: existingPhotoCount,
+        hasSignature: hasSignature,
+        existingRecipientName: existingRecipientName,
+        existingRecipientDocument: existingRecipientDocument,
+        existingNotes: existingNotes,
+      );
 }
 
 class CompletionPolicy {
@@ -277,18 +326,24 @@ class ActiveRouteException implements Exception {
 }
 
 class ActiveRouteService {
-  const ActiveRouteService(
-    this.apiClient, {
-    this.storage = const SessionStorage(),
-  });
+  ActiveRouteService(this.apiClient, {this.storage = const SessionStorage()});
 
   final ApiClient apiClient;
   final SessionStorage storage;
+  Map<String, dynamic>? _configurationCache;
+  Future<String>? _mapStyleOperation;
 
   static const openFreeMapStyle =
       'https://tiles.openfreemap.org/styles/positron';
 
-  Future<String> getMapStyle() async {
+  void invalidateCache() {
+    _configurationCache = null;
+    _mapStyleOperation = null;
+  }
+
+  Future<String> getMapStyle() => _mapStyleOperation ??= _loadMapStyle();
+
+  Future<String> _loadMapStyle() async {
     Map<String, dynamic> style;
     try {
       final openMapResponse = await Dio().get<dynamic>(openFreeMapStyle);
@@ -355,35 +410,53 @@ class ActiveRouteService {
 
   Future<ActiveRoute> getRoute(int routeId) async {
     try {
+      final refreshToken = DateTime.now().microsecondsSinceEpoch;
+      // A rota é consultada primeiro porque seu wave_id limita a carga de
+      // pedidos abaixo. Antes, cada atualização do mapa baixava todos os
+      // pedidos da conta.
+      final routeResponse = await apiClient.dio.get<dynamic>(
+        '/api/v1/delivery/rotas/$routeId/',
+        queryParameters: {'_map_refresh': refreshToken},
+        options: Options(
+          headers: const {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'},
+        ),
+      );
+      final route = _asMap(routeResponse.data);
+      final waveId = _asInt(route['wave']);
       final results = await Future.wait<dynamic>([
         _deliveryConfiguration(),
-        apiClient.dio.get<dynamic>('/api/v1/delivery/rotas/$routeId/'),
-        _getAll('/api/v1/delivery/paradas/'),
-        _getAll('/api/v1/delivery/pedidos/'),
+        _getAll(
+          '/api/v1/delivery/paradas/',
+          queryParameters: {'route': routeId, '_map_refresh': refreshToken},
+          noCache: true,
+        ),
+        _getAll(
+          '/api/v1/delivery/pedidos/',
+          queryParameters: {'wave': ?waveId, '_map_refresh': refreshToken},
+          noCache: true,
+        ),
         _getAllOptional('/api/v1/delivery/armazens/'),
         _getAll('/api/v1/delivery/comprovantes/'),
         _getAll('/api/v1/delivery/fotos-comprovante/'),
       ]);
       final deliveryConfig = results[0] as Map<String, dynamic>;
-      final routeResponse = results[1] as Response<dynamic>;
-      final route = _asMap(routeResponse.data);
-      final stops = (results[2] as List<Map<String, dynamic>>)
+      final stops = (results[1] as List<Map<String, dynamic>>)
           .where((item) => _asInt(item['route']) == routeId)
           .toList();
       final orders = {
-        for (final item in results[3] as List<Map<String, dynamic>>)
+        for (final item in results[2] as List<Map<String, dynamic>>)
           if (_asInt(item['id']) case final int id) id: item,
       };
       final warehouses = {
-        for (final item in results[4] as List<Map<String, dynamic>>)
+        for (final item in results[3] as List<Map<String, dynamic>>)
           if (_asInt(item['id']) case final int id) id: item,
       };
       final proofs = {
-        for (final item in results[5] as List<Map<String, dynamic>>)
+        for (final item in results[4] as List<Map<String, dynamic>>)
           if (_asInt(item['route_stop']) case final int stopId) stopId: item,
       };
       final photoCounts = <int, int>{};
-      for (final photo in results[6] as List<Map<String, dynamic>>) {
+      for (final photo in results[5] as List<Map<String, dynamic>>) {
         final proofId = _asInt(photo['delivery_proof']);
         if (proofId != null) {
           photoCounts.update(proofId, (count) => count + 1, ifAbsent: () => 1);
@@ -407,6 +480,8 @@ class ActiveRouteService {
             orderId: orderId,
             sequence: _asInt(stop['sequence']) ?? 0,
             status: stop['status']?.toString() ?? 'planned',
+            orderStatus: order['status']?.toString() ?? '',
+            isManual: _asBool(stop['is_manual'], fallback: false),
             plannedEta: DateTime.tryParse(
               stop['planned_eta']?.toString() ?? '',
             ),
@@ -437,15 +512,22 @@ class ActiveRouteService {
       }
       activeStops.sort((a, b) => a.sequence.compareTo(b.sequence));
       final path = _parsePath(route['path_geometry']);
+      final deliveryWaypoints = _parseDeliveryWaypoints(
+        route['planned_waypoints'],
+      );
+      final plannedWarehouse = parseWarehouseWaypoint(
+        route['planned_waypoints'],
+      );
       final firstOrder = activeStops.isEmpty
           ? null
           : orders[activeStops.first.orderId];
-      final warehouseData = warehouses[_asInt(firstOrder?['warehouse'])];
-      final warehouseLat = _asDouble(warehouseData?['lat']);
-      final warehouseLon = _asDouble(warehouseData?['lon']);
-      final warehouseCoordinate = warehouseLat != null && warehouseLon != null
-          ? RouteCoordinate(warehouseLat, warehouseLon)
-          : null;
+      final orderWarehouse = firstOrder?['warehouse'];
+      final embeddedWarehouse = _asMap(orderWarehouse);
+      final warehouseId = orderWarehouse is Map
+          ? _asInt(orderWarehouse['id'])
+          : _asInt(orderWarehouse);
+      final warehouseData = warehouses[warehouseId] ?? embeddedWarehouse;
+      final warehouseCoordinate = _parseCoordinate(warehouseData);
 
       return ActiveRoute(
         routeId: _asInt(route['id']) ?? routeId,
@@ -453,12 +535,15 @@ class ActiveRouteService {
         routeNumber: route['route_number']?.toString() ?? 'Rota #$routeId',
         status: route['status']?.toString() ?? '',
         path: path,
-        warehouse: warehouseCoordinate == null
-            ? null
-            : RoutePlace(
-                name: warehouseData?['name']?.toString() ?? 'Armazém',
-                coordinate: warehouseCoordinate,
-              ),
+        deliveryWaypoints: deliveryWaypoints,
+        warehouse:
+            plannedWarehouse ??
+            (warehouseCoordinate == null
+                ? null
+                : RoutePlace(
+                    name: warehouseData['name']?.toString() ?? 'Armazém',
+                    coordinate: warehouseCoordinate,
+                  )),
         stops: activeStops,
       );
     } on DioException catch (error) {
@@ -466,35 +551,25 @@ class ActiveRouteService {
     }
   }
 
-  Future<void> arrive(int stopId) => _stopAction(stopId, 'arrive');
+  Future<OfflineMutationResult<void>> arrive(int stopId) =>
+      _stopAction(stopId, 'arrive');
 
-  Future<void> begin(int stopId) => _stopAction(stopId, 'begin');
+  Future<OfflineMutationResult<void>> begin(int stopId) =>
+      _stopAction(stopId, 'begin');
 
-  Future<void> startRoute(int routeId) async {
+  Future<OfflineMutationResult<void>> skip({required int stopId}) =>
+      _stopAction(stopId, 'skip');
+
+  Future<OfflineMutationResult<void>> startRoute(int routeId) async {
     try {
-      await apiClient.dio.post<dynamic>(
-        '/api/v1/delivery/rotas/$routeId/start/',
-      );
-    } on DioException catch (error) {
-      throw ActiveRouteException(_errorMessage(error));
-    }
-  }
-
-  Future<void> fail({
-    required int stopId,
-    required String reason,
-    required String notes,
-    double? latitude,
-    double? longitude,
-  }) async {
-    try {
-      await apiClient.dio.post<dynamic>(
-        '/api/v1/delivery/paradas/$stopId/fail/',
-        data: {
-          'reason': reason,
-          'notes': notes,
-          'lat': ?latitude,
-          'lon': ?longitude,
+      return await apiClient.offlineRequests.execute<void>(
+        resourceKey: 'route:$routeId',
+        description: 'Iniciar rota',
+        operation: (key) async {
+          await apiClient.dio.post<dynamic>(
+            '/api/v1/delivery/rotas/$routeId/start/',
+            options: apiClient.offlineRequests.requestOptions(key),
+          );
         },
       );
     } on DioException catch (error) {
@@ -502,7 +577,55 @@ class ActiveRouteService {
     }
   }
 
-  Future<void> complete(DeliveryProofSubmission submission) async {
+  Future<OfflineMutationResult<void>> fail({
+    required int stopId,
+    required String reason,
+    required String notes,
+    double? latitude,
+    double? longitude,
+  }) async {
+    try {
+      return await apiClient.offlineRequests.execute<void>(
+        resourceKey: 'stop:$stopId',
+        description: 'Registrar falha na entrega',
+        operation: (key) async {
+          await apiClient.dio.post<dynamic>(
+            '/api/v1/delivery/paradas/$stopId/fail/',
+            data: {
+              'reason': reason,
+              'notes': notes,
+              'lat': ?latitude,
+              'lon': ?longitude,
+            },
+            options: apiClient.offlineRequests.requestOptions(key),
+          );
+        },
+      );
+    } on DioException catch (error) {
+      throw ActiveRouteException(_errorMessage(error));
+    }
+  }
+
+  Future<OfflineMutationResult<void>> complete(
+    DeliveryProofSubmission submission,
+  ) async {
+    try {
+      return await apiClient.offlineRequests.execute<void>(
+        resourceKey: 'stop:${submission.stop.stopId}',
+        description: 'Finalizar entrega',
+        operation: (key) => _completeRequest(submission, key),
+      );
+    } on ActiveRouteException {
+      rethrow;
+    } on DioException catch (error) {
+      throw ActiveRouteException(_errorMessage(error));
+    }
+  }
+
+  Future<void> _completeRequest(
+    DeliveryProofSubmission submission,
+    String idempotencyKey,
+  ) async {
     try {
       final proofData = <String, dynamic>{
         // items e completed_at são resultados geridos pelo complete/.
@@ -525,12 +648,20 @@ class ActiveRouteService {
         final response = await apiClient.dio.patch<dynamic>(
           '/api/v1/delivery/comprovantes/$existingId/',
           data: FormData.fromMap(proofData),
+          options: apiClient.offlineRequests.requestOptions(
+            idempotencyKey,
+            step: 'proof',
+          ),
         );
         proofId = _asInt(_asMap(response.data)['id']) ?? existingId;
       } else {
         final response = await apiClient.dio.post<dynamic>(
           '/api/v1/delivery/comprovantes/',
           data: FormData.fromMap(proofData),
+          options: apiClient.offlineRequests.requestOptions(
+            idempotencyKey,
+            step: 'proof',
+          ),
         );
         final createdId = _asInt(_asMap(response.data)['id']);
         if (createdId == null) {
@@ -542,7 +673,7 @@ class ActiveRouteService {
       }
 
       var sequence = submission.stop.existingPhotoCount + 1;
-      for (final photo in submission.photos) {
+      for (final (index, photo) in submission.photos.indexed) {
         await apiClient.dio.post<dynamic>(
           '/api/v1/delivery/fotos-comprovante/',
           data: FormData.fromMap({
@@ -553,6 +684,10 @@ class ActiveRouteService {
               filename: photo.filename,
             ),
           }),
+          options: apiClient.offlineRequests.requestOptions(
+            idempotencyKey,
+            step: 'photo-$index',
+          ),
         );
       }
 
@@ -565,18 +700,34 @@ class ActiveRouteService {
                     .map((result) => result.toJson())
                     .toList(),
               },
+        options: apiClient.offlineRequests.requestOptions(
+          idempotencyKey,
+          step: 'complete',
+        ),
       );
     } on ActiveRouteException {
       rethrow;
-    } on DioException catch (error) {
-      throw ActiveRouteException(_errorMessage(error));
+    } on DioException {
+      rethrow;
     }
   }
 
-  Future<void> _stopAction(int stopId, String action) async {
+  Future<OfflineMutationResult<void>> _stopAction(
+    int stopId,
+    String action, {
+    Map<String, dynamic>? data,
+  }) async {
     try {
-      await apiClient.dio.post<dynamic>(
-        '/api/v1/delivery/paradas/$stopId/$action/',
+      return await apiClient.offlineRequests.execute<void>(
+        resourceKey: 'stop:$stopId',
+        description: 'Atualizar etapa da entrega',
+        operation: (key) async {
+          await apiClient.dio.post<dynamic>(
+            '/api/v1/delivery/paradas/$stopId/$action/',
+            data: data,
+            options: apiClient.offlineRequests.requestOptions(key),
+          );
+        },
       );
     } on DioException catch (error) {
       throw ActiveRouteException(_errorMessage(error));
@@ -586,8 +737,15 @@ class ActiveRouteService {
   Future<Map<String, dynamic>> _deliveryConfiguration({
     bool refresh = false,
   }) async {
+    if (!refresh) {
+      final configuration = _configurationCache;
+      if (configuration != null) return configuration;
+    }
     final cached = await storage.readDeliveryConfig();
-    if (!refresh) return cached;
+    if (!refresh) {
+      _configurationCache = cached;
+      return cached;
+    }
 
     try {
       final response = await apiClient.dio.get<dynamic>(
@@ -596,11 +754,13 @@ class ActiveRouteService {
       final config = _configurationFromResponse(response.data);
       if (config.isNotEmpty) {
         await storage.saveDeliveryConfig(config);
+        _configurationCache = config;
         return config;
       }
     } on DioException {
       // Login/cache continua sendo uma fonte segura quando a consulta falhar.
     }
+    _configurationCache = cached;
     return cached;
   }
 
@@ -631,24 +791,19 @@ class ActiveRouteService {
     return result;
   }
 
-  Future<List<Map<String, dynamic>>> _getAll(String path) async {
-    final items = <Map<String, dynamic>>[];
-    var page = 1;
-    while (page <= 100) {
-      final response = await apiClient.dio.get<dynamic>(
-        path,
-        queryParameters: {'page': page},
-      );
-      final data = response.data;
-      final raw = data is Map ? data['results'] : data;
-      if (raw is List) {
-        items.addAll(raw.whereType<Map>().map(_asMap));
-      }
-      if (data is! Map || data['next'] == null) break;
-      page++;
-    }
-    return items;
-  }
+  Future<List<Map<String, dynamic>>> _getAll(
+    String path, {
+    Map<String, dynamic>? queryParameters,
+    bool noCache = false,
+  }) => apiClient.getAllPages(
+    path,
+    queryParameters: queryParameters,
+    options: noCache
+        ? Options(
+            headers: const {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'},
+          )
+        : null,
+  );
 
   Future<List<Map<String, dynamic>>> _getAllOptional(String path) async {
     try {
@@ -694,6 +849,65 @@ class ActiveRouteService {
       if (lat != null && lon != null) result.add(RouteCoordinate(lat, lon));
     }
     return result;
+  }
+
+  static Map<int, RouteCoordinate> _parseDeliveryWaypoints(dynamic value) {
+    if (value is! List) return const {};
+    final result = <int, RouteCoordinate>{};
+    for (final raw in value) {
+      final waypoint = _asMap(raw);
+      if (waypoint['kind']?.toString() != 'delivery') continue;
+      final orderId = _asInt(waypoint['order_id']);
+      final location = waypoint['location'];
+      if (orderId == null || location is! List || location.length < 2) {
+        continue;
+      }
+      final longitude = _asDouble(location[0]);
+      final latitude = _asDouble(location[1]);
+      if (latitude != null && longitude != null) {
+        result[orderId] = RouteCoordinate(latitude, longitude);
+      }
+    }
+    return result;
+  }
+
+  static RoutePlace? parseWarehouseWaypoint(dynamic value) {
+    if (value is! List) return null;
+    for (final raw in value) {
+      final waypoint = _asMap(raw);
+      final kind = waypoint['kind']?.toString().toLowerCase();
+      if (!const {'pickup', 'warehouse', 'origin'}.contains(kind)) continue;
+      final coordinate = _parseCoordinate(waypoint);
+      if (coordinate == null) continue;
+      final name = waypoint['name']?.toString().trim() ?? '';
+      return RoutePlace(
+        name: name.isEmpty ? 'Armazém' : name,
+        coordinate: coordinate,
+      );
+    }
+    return null;
+  }
+
+  static RouteCoordinate? _parseCoordinate(dynamic value) {
+    final data = _asMap(value);
+    dynamic rawLocation = data['location'] ?? data['coordinates'];
+    if (rawLocation is Map) {
+      rawLocation = rawLocation['coordinates'];
+    }
+    if (rawLocation is List && rawLocation.length >= 2) {
+      final longitude = _asDouble(rawLocation[0]);
+      final latitude = _asDouble(rawLocation[1]);
+      if (latitude != null && longitude != null) {
+        return RouteCoordinate(latitude, longitude);
+      }
+    }
+    final latitude = _asDouble(data['lat'] ?? data['latitude']);
+    final longitude = _asDouble(
+      data['lon'] ?? data['lng'] ?? data['longitude'],
+    );
+    return latitude == null || longitude == null
+        ? null
+        : RouteCoordinate(latitude, longitude);
   }
 
   static String _fullAddress(Map<String, dynamic> order) => [

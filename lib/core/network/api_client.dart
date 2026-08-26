@@ -1,19 +1,34 @@
 import 'package:dio/dio.dart';
 
 import '../storage/session_storage.dart';
+import 'offline_request_queue.dart';
 
 class ApiClient {
-  ApiClient({required String baseUrl, required SessionStorage storage})
-    : _baseUrl = baseUrl.replaceFirst(RegExp(r'/$'), ''),
-      _storage = storage,
-      dio = Dio(
-        BaseOptions(
-          baseUrl: baseUrl.replaceFirst(RegExp(r'/$'), ''),
-          connectTimeout: const Duration(seconds: 15),
-          receiveTimeout: const Duration(seconds: 15),
-          headers: const {'Accept': 'application/json'},
-        ),
-      ) {
+  ApiClient({
+    required String baseUrl,
+    required SessionStorage storage,
+    Dio? refreshClient,
+  }) : _storage = storage,
+       _refreshClient =
+           refreshClient ??
+           Dio(
+             BaseOptions(
+               baseUrl: baseUrl.replaceFirst(RegExp(r'/$'), ''),
+               connectTimeout: const Duration(seconds: 15),
+               sendTimeout: const Duration(seconds: 15),
+               receiveTimeout: const Duration(seconds: 15),
+               headers: const {'Accept': 'application/json'},
+             ),
+           ),
+       dio = Dio(
+         BaseOptions(
+           baseUrl: baseUrl.replaceFirst(RegExp(r'/$'), ''),
+           connectTimeout: const Duration(seconds: 15),
+           sendTimeout: const Duration(seconds: 30),
+           receiveTimeout: const Duration(seconds: 15),
+           headers: const {'Accept': 'application/json'},
+         ),
+       ) {
     dio.interceptors.add(
       InterceptorsWrapper(
         onRequest: (options, handler) async {
@@ -46,13 +61,15 @@ class ApiClient {
         },
       ),
     );
+    offlineRequests = OfflineRequestQueue(dio, storage);
   }
 
-  static Future<String?>? _refreshOperation;
+  Future<String?>? _refreshOperation;
 
-  final String _baseUrl;
   final SessionStorage _storage;
+  final Dio _refreshClient;
   final Dio dio;
+  late final OfflineRequestQueue offlineRequests;
 
   bool _isLoginOrTokenRequest(String path) {
     return path.endsWith('/api/v1/auth/entregadores/token/') ||
@@ -76,21 +93,17 @@ class ApiClient {
     }
   }
 
+  /// Renova o access token para clientes autenticados que não passam pelo
+  /// interceptor HTTP, como o handshake do WebSocket.
+  Future<String?> refreshAccessToken() => _refreshAccessToken();
+
   Future<String?> _requestNewAccessToken() async {
+    final sessionGeneration = _storage.sessionGeneration;
     final refresh = await _storage.readRefreshToken();
     if (refresh == null || refresh.isEmpty) return null;
 
-    final refreshClient = Dio(
-      BaseOptions(
-        baseUrl: _baseUrl,
-        connectTimeout: const Duration(seconds: 15),
-        receiveTimeout: const Duration(seconds: 15),
-        headers: const {'Accept': 'application/json'},
-      ),
-    );
-
     try {
-      final response = await refreshClient.post<dynamic>(
+      final response = await _refreshClient.post<dynamic>(
         '/api/v1/auth/token/refresh/',
         data: {'refresh': refresh},
       );
@@ -99,6 +112,10 @@ class ApiClient {
 
       final access = data['access']?.toString();
       if (access == null || access.isEmpty) return null;
+
+      // O usuario pode ter feito logout ou entrado em outra conta enquanto o
+      // refresh estava em voo. Nesse caso a resposta antiga deve ser descartada.
+      if (_storage.sessionGeneration != sessionGeneration) return null;
 
       final rotatedRefresh = data['refresh']?.toString();
       if (rotatedRefresh != null && rotatedRefresh.isNotEmpty) {
@@ -109,7 +126,8 @@ class ApiClient {
       return access;
     } on DioException catch (error) {
       if (error.response?.statusCode == 400 ||
-          error.response?.statusCode == 401) {
+          error.response?.statusCode == 401 ||
+          error.response?.statusCode == 403) {
         await _storage.clear();
       }
       return null;

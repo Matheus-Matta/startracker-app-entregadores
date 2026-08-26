@@ -1,15 +1,18 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
-import '../../../core/config/app_config.dart';
-import '../../../core/network/api_client.dart';
+import '../../../app/app_dependencies.dart';
+import '../../../core/async/debouncer.dart';
 import '../../../core/network/paged_result.dart';
-import '../../../core/storage/session_storage.dart';
+import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../data/wave_service.dart';
 import 'wave_detail_page.dart';
 
 class WavesPage extends StatefulWidget {
-  const WavesPage({this.onOpenHome, super.key});
+  const WavesPage({this.isActive = true, this.onOpenHome, super.key});
 
+  final bool isActive;
   final VoidCallback? onOpenHome;
 
   @override
@@ -22,9 +25,15 @@ class _WavesPageState extends State<WavesPage> {
   late Future<PagedResult<WaveListItem>> _result;
   int _page = 1;
   String _status = '';
+  StreamSubscription<FleetRealtimeEvent>? _realtimeSubscription;
+  final Debouncer _realtimeDebouncer = Debouncer(
+    const Duration(milliseconds: 250),
+  );
+  bool _realtimeDirty = false;
 
   static const _statuses = <String, String>{
     '': 'Todos os status',
+    'collecting': 'Em montagem',
     'ready': 'Pronta',
     'optimizing': 'Roteirizando',
     'planned': 'Planejada',
@@ -33,6 +42,7 @@ class _WavesPageState extends State<WavesPage> {
     'started': 'Iniciada',
     'completed': 'Concluída',
     'partially_completed': 'Parcialmente concluída',
+    'closed': 'Encerrada',
     'cancelled': 'Cancelada',
     'failed': 'Falhou',
   };
@@ -40,31 +50,63 @@ class _WavesPageState extends State<WavesPage> {
   @override
   void initState() {
     super.initState();
-    const storage = SessionStorage();
-    _service = WaveService(
-      ApiClient(baseUrl: AppConfig.backendUrl, storage: storage),
-    );
+    _service = AppDependencies.instance.waves;
     _result = _load();
+    _realtimeSubscription = FleetRealtimeChannel.instance.events.listen((
+      event,
+    ) {
+      if (event.isConnected || event.isOrderChange || event.isRouteChange) {
+        _service.invalidateCache();
+        _realtimeDirty = true;
+        if (widget.isActive) _scheduleRealtimeReload();
+      }
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant WavesPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!oldWidget.isActive && widget.isActive && _realtimeDirty) {
+      _scheduleRealtimeReload();
+    }
   }
 
   @override
   void dispose() {
+    _realtimeDebouncer.dispose();
+    _realtimeSubscription?.cancel();
     _searchController.dispose();
     super.dispose();
   }
 
-  Future<PagedResult<WaveListItem>> _load() => _service.getWaves(
-    page: _page,
-    search: _searchController.text,
-    status: _status,
-  );
+  Future<PagedResult<WaveListItem>> _load({bool refresh = false}) =>
+      _service.getWaves(
+        page: _page,
+        search: _searchController.text,
+        status: _status,
+        refresh: refresh,
+      );
 
-  void _reload({bool firstPage = false}) {
+  void _scheduleRealtimeReload() {
+    _realtimeDebouncer.run(() {
+      if (!mounted || !widget.isActive || !_realtimeDirty) return;
+      _realtimeDirty = false;
+      unawaited(_reload());
+    });
+  }
+
+  Future<void> _reload({bool firstPage = false, bool refresh = false}) async {
     if (firstPage) _page = 1;
-    final nextResult = _load();
+    if (refresh) _service.invalidateCache();
+    final nextResult = _load(refresh: refresh);
     setState(() {
       _result = nextResult;
     });
+    try {
+      await nextResult;
+    } catch (_) {
+      // O FutureBuilder apresenta o erro e mantém a ação de tentar novamente.
+    }
   }
 
   Future<void> _openDetails(WaveListItem wave) async {
@@ -72,7 +114,7 @@ class _WavesPageState extends State<WavesPage> {
       MaterialPageRoute<bool>(builder: (_) => WaveDetailPage(wave: wave)),
     );
     if (!mounted) return;
-    _reload();
+    await _reload();
     if (openHome == true) widget.onOpenHome?.call();
   }
 
@@ -82,7 +124,7 @@ class _WavesPageState extends State<WavesPage> {
       children: [
         _Filters(
           controller: _searchController,
-          hint: 'Buscar wave ou rota',
+          hint: 'Buscar carga ou rota',
           status: _status,
           statuses: _statuses,
           onSearch: () => _reload(firstPage: true),
@@ -101,26 +143,26 @@ class _WavesPageState extends State<WavesPage> {
               if (snapshot.hasError) {
                 return _Message(
                   icon: Icons.cloud_off_rounded,
-                  title: 'Não foi possível carregar as waves',
-                  onRetry: _reload,
+                  title: 'Não foi possível carregar as cargas',
+                  onRetry: () => _reload(refresh: true),
                 );
               }
               final result = snapshot.data!;
               return RefreshIndicator(
-                onRefresh: () async => _reload(),
+                onRefresh: () => _reload(refresh: true),
                 child: ListView(
                   physics: const AlwaysScrollableScrollPhysics(),
                   padding: const EdgeInsets.fromLTRB(18, 4, 18, 28),
                   children: [
                     _ResultCount(
                       count: result.items.length,
-                      label: 'waves nesta página',
+                      label: 'cargas nesta página',
                     ),
                     const SizedBox(height: 10),
                     if (result.items.isEmpty)
                       const _Message(
                         icon: Icons.view_timeline_outlined,
-                        title: 'Nenhuma wave encontrada',
+                        title: 'Nenhuma carga encontrada',
                       )
                     else
                       ...result.items.map(
@@ -171,6 +213,7 @@ class _WaveCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final statusStyle = _WaveStatusStyle.forStatus(wave.status);
     return Opacity(
       opacity: _isInactive ? 0.85 : 1,
       child: Material(
@@ -183,7 +226,9 @@ class _WaveCard extends StatelessWidget {
             decoration: BoxDecoration(
               color: Colors.white,
               borderRadius: BorderRadius.circular(21),
-              border: Border.all(color: const Color(0xFFE8E5DC)),
+              border: Border.all(
+                color: statusStyle.foreground.withValues(alpha: .28),
+              ),
             ),
             child: Row(
               children: [
@@ -191,10 +236,10 @@ class _WaveCard extends StatelessWidget {
                   width: 48,
                   height: 48,
                   decoration: BoxDecoration(
-                    color: const Color(0xFFF8E94E),
+                    color: statusStyle.background,
                     borderRadius: BorderRadius.circular(15),
                   ),
-                  child: const Icon(Icons.route_rounded),
+                  child: Icon(statusStyle.icon, color: statusStyle.foreground),
                 ),
                 const SizedBox(width: 13),
                 Expanded(
@@ -202,7 +247,7 @@ class _WaveCard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Wave #${wave.waveId}',
+                        'Carga #${wave.waveId}',
                         style: const TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.w900,
@@ -221,7 +266,11 @@ class _WaveCard extends StatelessWidget {
                         spacing: 7,
                         runSpacing: 6,
                         children: [
-                          _Chip(label: _statusLabel(wave.status)),
+                          _Chip(
+                            label: _statusLabel(wave.status),
+                            backgroundColor: statusStyle.background,
+                            foregroundColor: statusStyle.foreground,
+                          ),
                           if (wave.plannedDistanceMeters > 0)
                             _Chip(
                               label:
@@ -339,20 +388,117 @@ class _ResultCount extends StatelessWidget {
 }
 
 class _Chip extends StatelessWidget {
-  const _Chip({required this.label});
+  const _Chip({
+    required this.label,
+    this.backgroundColor = const Color(0xFFF1EFE8),
+    this.foregroundColor = const Color(0xFF171713),
+  });
+
   final String label;
+  final Color backgroundColor;
+  final Color foregroundColor;
+
   @override
   Widget build(BuildContext context) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
     decoration: BoxDecoration(
-      color: const Color(0xFFF1EFE8),
+      color: backgroundColor,
       borderRadius: BorderRadius.circular(20),
     ),
     child: Text(
       label,
-      style: const TextStyle(fontSize: 9, fontWeight: FontWeight.w700),
+      style: TextStyle(
+        color: foregroundColor,
+        fontSize: 9,
+        fontWeight: FontWeight.w800,
+      ),
     ),
   );
+}
+
+class _WaveStatusStyle {
+  const _WaveStatusStyle({
+    required this.background,
+    required this.foreground,
+    required this.icon,
+  });
+
+  final Color background;
+  final Color foreground;
+  final IconData icon;
+
+  factory _WaveStatusStyle.forStatus(String status) => switch (status) {
+    'collecting' => const _WaveStatusStyle(
+      background: Color(0xFFFFF1C7),
+      foreground: Color(0xFF8A5A00),
+      icon: Icons.inventory_2_outlined,
+    ),
+    'ready' => const _WaveStatusStyle(
+      background: Color(0xFFFFE2B8),
+      foreground: Color(0xFF9A4D00),
+      icon: Icons.local_shipping_outlined,
+    ),
+    'optimizing' => const _WaveStatusStyle(
+      background: Color(0xFFEDE4FF),
+      foreground: Color(0xFF6936B7),
+      icon: Icons.route_rounded,
+    ),
+    'planned' => const _WaveStatusStyle(
+      background: Color(0xFFE6EDFA),
+      foreground: Color(0xFF3A5A8A),
+      icon: Icons.event_available_rounded,
+    ),
+    'released' => const _WaveStatusStyle(
+      background: Color(0xFFDDF6F4),
+      foreground: Color(0xFF14756F),
+      icon: Icons.lock_open_rounded,
+    ),
+    'accepted' => const _WaveStatusStyle(
+      background: Color(0xFFDDEBFF),
+      foreground: Color(0xFF1859A9),
+      icon: Icons.assignment_turned_in_outlined,
+    ),
+    'started' => const _WaveStatusStyle(
+      background: Color(0xFFDDF5E5),
+      foreground: Color(0xFF15753C),
+      icon: Icons.navigation_rounded,
+    ),
+    'completed' => const _WaveStatusStyle(
+      background: Color(0xFFDDF3DF),
+      foreground: Color(0xFF24723A),
+      icon: Icons.check_circle_rounded,
+    ),
+    'partially_completed' => const _WaveStatusStyle(
+      background: Color(0xFFFFE8C9),
+      foreground: Color(0xFF925300),
+      icon: Icons.pending_actions_rounded,
+    ),
+    'closed' => const _WaveStatusStyle(
+      background: Color(0xFFE8E9EC),
+      foreground: Color(0xFF555B66),
+      icon: Icons.archive_rounded,
+    ),
+    'cancelled' => const _WaveStatusStyle(
+      background: Color(0xFFFFE0E0),
+      foreground: Color(0xFFA52424),
+      icon: Icons.cancel_rounded,
+    ),
+    'failed' => const _WaveStatusStyle(
+      background: Color(0xFFFFDADA),
+      foreground: Color(0xFF8E1717),
+      icon: Icons.error_rounded,
+    ),
+    'superseded' => const _WaveStatusStyle(
+      background: Color(0xFFE9E9E7),
+      foreground: Color(0xFF66645E),
+      icon: Icons.swap_horiz_rounded,
+    ),
+    _ => const _WaveStatusStyle(
+      background: Color(0xFFF1EFE8),
+      foreground: Color(0xFF5E5A52),
+      icon: Icons.route_rounded,
+    ),
+  };
 }
 
 class _Pagination extends StatelessWidget {

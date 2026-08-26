@@ -7,12 +7,15 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 
-import '../../../core/config/app_config.dart';
-import '../../../core/network/api_client.dart';
-import '../../../core/storage/session_storage.dart';
+import '../../../app/app_dependencies.dart';
+import '../../../core/async/debouncer.dart';
+import '../../../core/network/offline_request_queue.dart';
+import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../../orders/view/order_detail_page.dart';
 import '../data/active_route_service.dart';
+import '../data/wave_service.dart';
 import 'delivery_completion_page.dart';
+import 'pickup_page.dart';
 
 const _ink = Color(0xFF171713);
 const _cream = Color(0xFFF5F3ED);
@@ -28,41 +31,120 @@ class ActiveWavePage extends StatefulWidget {
   State<ActiveWavePage> createState() => _ActiveWavePageState();
 }
 
-class _ActiveWavePageState extends State<ActiveWavePage> {
+class _ActiveWavePageState extends State<ActiveWavePage>
+    with WidgetsBindingObserver {
   late final ActiveRouteService _service;
+  late final WaveService _waveService;
   final _mapKey = GlobalKey<_ActiveRouteMapState>();
   ActiveRoute? _route;
+  PickupProgress? _pickupProgress;
   String _mapStyle = ActiveRouteService.openFreeMapStyle;
   Position? _position;
   StreamSubscription<Position>? _positionSubscription;
+  StreamSubscription<FleetRealtimeEvent>? _realtimeSubscription;
+  StreamSubscription<OfflineQueueEvent>? _offlineQueueSubscription;
+  final Debouncer _realtimeDebouncer = Debouncer(
+    const Duration(milliseconds: 200),
+  );
   String? _error;
   bool _loading = true;
   bool _performingAction = false;
+  bool _routeRequestRunning = false;
+  bool _routeReloadPending = false;
+  int? _pendingPostponedStopId;
+  int _locationGeneration = 0;
 
   @override
   void initState() {
     super.initState();
-    const storage = SessionStorage();
-    _service = ActiveRouteService(
-      ApiClient(baseUrl: AppConfig.backendUrl, storage: storage),
-    );
+    WidgetsBinding.instance.addObserver(this);
+    final dependencies = AppDependencies.instance;
+    _service = dependencies.activeRoutes;
+    _waveService = dependencies.waves;
     _loadRoute();
     _loadMapStyle();
     _startLocation();
+    _realtimeSubscription = FleetRealtimeChannel.instance.events.listen(
+      _onRealtimeEvent,
+    );
+    _offlineQueueSubscription = dependencies.apiClient.offlineRequests.events
+        .listen(_onOfflineQueueEvent);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _locationGeneration++;
+    _realtimeDebouncer.dispose();
+    _realtimeSubscription?.cancel();
+    _offlineQueueSubscription?.cancel();
     _positionSubscription?.cancel();
     super.dispose();
   }
 
-  Future<void> _loadRoute() async {
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        if (_positionSubscription == null) unawaited(_startLocation());
+        unawaited(
+          AppDependencies.instance.apiClient.offlineRequests.retryNow(),
+        );
+        break;
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        unawaited(_stopLocation());
+      case AppLifecycleState.inactive:
+        break;
+    }
+  }
+
+  Future<void> _loadRoute({int? postponedStopId}) async {
+    if (_routeRequestRunning) {
+      _routeReloadPending = true;
+      _pendingPostponedStopId ??= postponedStopId;
+      return;
+    }
+    _routeRequestRunning = true;
     try {
-      final route = await _service.getRoute(widget.routeId);
+      var route = await _service.getRoute(widget.routeId);
+      final pendingStops = route.stops.where((stop) => !stop.isTerminal).length;
+      if (postponedStopId != null &&
+          pendingStops > 1 &&
+          route.currentStop?.stopId == postponedStopId) {
+        // Alguns proxies/API gateways ainda podem entregar a primeira leitura
+        // com a ordem anterior logo apos o skip. Uma segunda consulta curta,
+        // tambem sem cache, evita manter o cartao no pedido adiado.
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+        route = await _service.getRoute(widget.routeId);
+      }
+      PickupProgress pickup;
+      try {
+        pickup = await _waveService.getPickupProgress(route.waveId);
+      } on WaveServiceException {
+        final pendingTransferred = route.stops
+            .where((stop) => stop.orderStatus == 'awaiting_pickup')
+            .length;
+        pickup =
+            _pickupProgress ??
+            (pendingTransferred == 0
+                ? PickupProgress.disabled(route.waveId)
+                : PickupProgress(
+                    waveId: route.waveId,
+                    enabled: true,
+                    barcodeSource: 'order_number',
+                    total: pendingTransferred,
+                    pickedUp: 0,
+                    pending: pendingTransferred,
+                    isComplete: false,
+                    orders: const [],
+                  ));
+      }
       if (!mounted) return;
       setState(() {
         _route = route;
+        _pickupProgress = pickup;
         _error = null;
         _loading = false;
       });
@@ -72,6 +154,54 @@ class _ActiveWavePageState extends State<ActiveWavePage> {
         _error = error.message;
         _loading = false;
       });
+    } finally {
+      _routeRequestRunning = false;
+      if (_routeReloadPending && mounted) {
+        final pendingPostponedStopId = _pendingPostponedStopId;
+        _routeReloadPending = false;
+        _pendingPostponedStopId = null;
+        unawaited(_loadRoute(postponedStopId: pendingPostponedStopId));
+      }
+    }
+  }
+
+  void _onRealtimeEvent(FleetRealtimeEvent event) {
+    final route = _route;
+    final affectsCurrentRoute =
+        event.isRouteChange &&
+        (event.routeId == null || event.routeId == widget.routeId);
+    final affectsCurrentOrder =
+        event.isOrderChange &&
+        (event.orderId == null ||
+            route == null ||
+            route.stops.any((stop) => stop.orderId == event.orderId));
+    if (!event.isConnected && !affectsCurrentRoute && !affectsCurrentOrder) {
+      return;
+    }
+
+    // A mensagem é um sinal de invalidação. O REST continua sendo a fonte da
+    // verdade para path_geometry, planned_waypoints e sequence das paradas.
+    _realtimeDebouncer.run(() {
+      if (mounted) unawaited(_loadRoute());
+    });
+  }
+
+  void _onOfflineQueueEvent(OfflineQueueEvent event) {
+    final route = _route;
+    final affectsRoute = event.resourceKey == 'route:${widget.routeId}';
+    final affectsStop =
+        route?.stops.any(
+          (stop) => event.resourceKey == 'stop:${stop.stopId}',
+        ) ==
+        true;
+    if (!affectsRoute && !affectsStop) return;
+    if (event.type == OfflineQueueEventType.rejected && mounted) {
+      _message(
+        'A API recusou uma alteracao salva offline. O estado foi restaurado.',
+      );
+    }
+    if (event.type != OfflineQueueEventType.queued && mounted) {
+      unawaited(_loadRoute());
     }
   }
 
@@ -81,6 +211,7 @@ class _ActiveWavePageState extends State<ActiveWavePage> {
   }
 
   Future<void> _startLocation() async {
+    final generation = ++_locationGeneration;
     try {
       var permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
@@ -96,7 +227,8 @@ class _ActiveWavePageState extends State<ActiveWavePage> {
           timeLimit: Duration(seconds: 12),
         ),
       );
-      if (mounted) setState(() => _position = first);
+      if (!mounted || generation != _locationGeneration) return;
+      setState(() => _position = first);
       _positionSubscription =
           Geolocator.getPositionStream(
             locationSettings: const LocationSettings(
@@ -104,24 +236,85 @@ class _ActiveWavePageState extends State<ActiveWavePage> {
               distanceFilter: 10,
             ),
           ).listen((position) {
-            if (mounted) setState(() => _position = position);
+            if (mounted && generation == _locationGeneration) {
+              setState(() => _position = position);
+            }
           });
     } catch (_) {
       // O destino continua visível mesmo quando o GPS está indisponível.
     }
   }
 
-  Future<void> _runStopAction(Future<void> Function() action) async {
+  Future<void> _stopLocation() async {
+    _locationGeneration++;
+    final subscription = _positionSubscription;
+    _positionSubscription = null;
+    await subscription?.cancel();
+  }
+
+  Future<void> _runStopAction(
+    Future<OfflineMutationResult<void>> Function() action, {
+    String? successMessage,
+    int? postponedStopId,
+    ActiveRoute Function(ActiveRoute route)? optimisticUpdate,
+  }) async {
     if (_performingAction) return;
-    setState(() => _performingAction = true);
+    final previousRoute = _route;
+    setState(() {
+      _performingAction = true;
+      if (previousRoute != null && optimisticUpdate != null) {
+        _route = optimisticUpdate(previousRoute);
+      }
+    });
     try {
-      await action();
-      await _loadRoute();
+      final result = await action();
+      if (!result.queued) {
+        await _loadRoute(postponedStopId: postponedStopId);
+      }
+      if (mounted) {
+        if (result.queued) {
+          _message('Sem internet. Alteracao salva para envio automatico.');
+        } else if (successMessage != null) {
+          _message(successMessage);
+        }
+      }
     } on ActiveRouteException catch (error) {
-      if (mounted) _message(error.message);
+      if (mounted) {
+        setState(() => _route = previousRoute);
+        _message(error.message);
+        unawaited(_loadRoute());
+      }
     } finally {
       if (mounted) setState(() => _performingAction = false);
     }
+  }
+
+  Future<void> _finalizeStop(ActiveRouteStop stop) async {
+    if (_performingAction) return;
+    final previousRoute = _route;
+    setState(() {
+      _performingAction = true;
+      _route = _withStopStatus(stop.stopId, 'delivering');
+    });
+    try {
+      if (stop.status != 'arrived' && stop.status != 'delivering') {
+        await _service.arrive(stop.stopId);
+      }
+      if (stop.status != 'delivering') {
+        await _service.begin(stop.stopId);
+      }
+    } on ActiveRouteException catch (error) {
+      if (mounted) {
+        setState(() => _route = previousRoute);
+        _message(error.message);
+        unawaited(_loadRoute());
+      }
+      return;
+    } finally {
+      if (mounted) setState(() => _performingAction = false);
+    }
+    if (!mounted) return;
+    await _openCompletion(stop);
   }
 
   Future<void> _openCompletion(ActiveRouteStop stop) async {
@@ -138,11 +331,15 @@ class _ActiveWavePageState extends State<ActiveWavePage> {
     if (!mounted) return;
     final completed = await Navigator.of(context).push<bool>(
       MaterialPageRoute<bool>(
-        builder: (_) =>
-            DeliveryCompletionPage(stop: effectiveStop, service: _service),
+        builder: (_) => DeliveryCompletionPage(
+          routeId: widget.routeId,
+          stop: effectiveStop,
+          service: _service,
+        ),
       ),
     );
     if (!mounted || completed != true) return;
+    setState(() => _route = _withStopStatus(stop.stopId, 'completed'));
     _message('Entrega finalizada com sucesso.');
     await _loadRoute();
   }
@@ -164,6 +361,12 @@ class _ActiveWavePageState extends State<ActiveWavePage> {
         latitude: _position?.latitude,
         longitude: _position?.longitude,
       ),
+      optimisticUpdate: (route) => _withStopStatusIn(
+        route,
+        stop.stopId,
+        'failed',
+        orderStatus: 'delivery_failed',
+      ),
     );
   }
 
@@ -176,14 +379,75 @@ class _ActiveWavePageState extends State<ActiveWavePage> {
         ),
       ),
     );
-    if (mounted && home == true) Navigator.of(context).pop(true);
+    if (!mounted) return;
+    if (home == true) {
+      Navigator.of(context).pop(true);
+      return;
+    }
+    // Ao voltar para o mapa, busca novamente o path_geometry da rota.
+    await _loadRoute();
   }
 
-  void _explainPostpone() {
-    _message(
-      'A API ainda não possui a ação de adiar a parada. Nada foi alterado para evitar perder a ordem da rota.',
+  Future<void> _openPickup() async {
+    final progress = _pickupProgress;
+    if (progress == null || !progress.enabled || progress.isComplete) return;
+    final completed = await Navigator.of(context).push<bool>(
+      MaterialPageRoute<bool>(
+        builder: (_) => PickupPage(service: _waveService, progress: progress),
+      ),
+    );
+    if (!mounted) return;
+    if (completed == true) _message('Retirada conferida. Rota atualizada.');
+    await _loadRoute();
+  }
+
+  Future<void> _postponeStop(ActiveRouteStop stop) async {
+    if (_performingAction) return;
+    if (_route?.status != 'started') {
+      _message('Inicie a rota antes de avançar para a próxima entrega.');
+      return;
+    }
+    final confirmed = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => const _PostponeSheet(),
+    );
+    if (confirmed != true || !mounted) return;
+    await _runStopAction(
+      () => _service.skip(stopId: stop.stopId),
+      successMessage: 'Pedido adiado. Próxima entrega carregada.',
+      postponedStopId: stop.stopId,
+      optimisticUpdate: (route) =>
+          _withStopStatusIn(route, stop.stopId, 'skipped'),
     );
   }
+
+  ActiveRoute? _withStopStatus(
+    int stopId,
+    String status, {
+    String? orderStatus,
+  }) {
+    final route = _route;
+    return route == null
+        ? null
+        : _withStopStatusIn(route, stopId, status, orderStatus: orderStatus);
+  }
+
+  ActiveRoute _withStopStatusIn(
+    ActiveRoute route,
+    int stopId,
+    String status, {
+    String? orderStatus,
+  }) => route.copyWith(
+    stops: route.stops
+        .map(
+          (stop) => stop.stopId == stopId
+              ? stop.copyWith(status: status, orderStatus: orderStatus)
+              : stop,
+        )
+        .toList(),
+  );
 
   void _message(String text) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
@@ -248,29 +512,29 @@ class _ActiveWavePageState extends State<ActiveWavePage> {
           ),
           Positioned(
             top: MediaQuery.paddingOf(context).top + 68,
-            right: 18,
+            right: 12,
             child: _MapControls(
               onRecenter: () => _mapKey.currentState?.recenter(),
               onPerspective: () => _mapKey.currentState?.togglePerspective(),
             ),
           ),
           _DeliverySheet(
+            key: ValueKey<int?>(stop?.stopId),
             route: route,
             stop: stop,
+            pickupProgress: _pickupProgress,
             position: _position,
             performingAction: _performingAction,
-            onStart: () =>
-                _runStopAction(() => _service.startRoute(route.routeId)),
-            onArrive: stop == null
-                ? null
-                : () => _runStopAction(() => _service.arrive(stop.stopId)),
-            onBegin: stop == null
-                ? null
-                : () => _runStopAction(() => _service.begin(stop.stopId)),
-            onComplete: stop == null ? null : () => _openCompletion(stop),
+            onStart: () => _runStopAction(
+              () => _service.startRoute(route.routeId),
+              optimisticUpdate: (current) =>
+                  current.copyWith(status: 'started'),
+            ),
+            onFinalize: stop == null ? null : () => _finalizeStop(stop),
             onFailure: stop == null ? null : () => _registerFailure(stop),
-            onPostpone: stop == null ? null : _explainPostpone,
+            onPostpone: stop == null ? null : () => _postponeStop(stop),
             onOpenOrder: stop == null ? null : () => _openOrder(stop),
+            onOpenPickup: _openPickup,
           ),
         ],
       ),
@@ -298,6 +562,7 @@ class _ActiveRouteMap extends StatefulWidget {
 
 class _ActiveRouteMapState extends State<_ActiveRouteMap> {
   MapLibreMapController? _controller;
+  Symbol? _driverSymbol;
   bool _styleLoaded = false;
   bool _perspective = true;
 
@@ -314,8 +579,27 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
   @override
   void didUpdateWidget(covariant _ActiveRouteMap oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.style != widget.style) _styleLoaded = false;
-    if (_styleLoaded) _renderRoute();
+    if (oldWidget.style != widget.style) {
+      _styleLoaded = false;
+      _driverSymbol = null;
+      return;
+    }
+    if (!_styleLoaded) return;
+
+    final routeChanged =
+        !identical(oldWidget.route.path, widget.route.path) ||
+        oldWidget.stop?.stopId != widget.stop?.stopId;
+    if (routeChanged) {
+      unawaited(_renderRoute());
+      return;
+    }
+    final oldPosition = oldWidget.position;
+    final position = widget.position;
+    if (oldPosition?.latitude != position?.latitude ||
+        oldPosition?.longitude != position?.longitude ||
+        oldPosition?.heading != position?.heading) {
+      unawaited(_updateDriverPosition());
+    }
   }
 
   @override
@@ -331,11 +615,14 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
     final current = widget.position == null
         ? null
         : LatLng(widget.position!.latitude, widget.position!.longitude);
-    final leg = _nextLeg(widget.route.path, current, destination);
+    final leg = _routeLegFromOrigin(widget.route.path, destination);
     try {
       await controller.clearLines();
       await controller.clearCircles();
       await controller.clearSymbols();
+      _driverSymbol = null;
+      await controller.setSymbolIconAllowOverlap(true);
+      await controller.setSymbolIconIgnorePlacement(true);
       if (leg.length >= 2) {
         await controller.addLine(
           LineOptions(
@@ -361,8 +648,9 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
           SymbolOptions(
             geometry: destination,
             iconImage: 'startracker-delivery-marker',
-            iconSize: .9,
+            iconSize: 1.08,
             iconAnchor: 'bottom',
+            zIndex: 30,
           ),
         );
       }
@@ -375,18 +663,20 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
               warehouse.coordinate.longitude,
             ),
             iconImage: 'startracker-warehouse-marker',
-            iconSize: .88,
+            iconSize: .94,
             iconAnchor: 'bottom',
+            zIndex: 10,
           ),
         );
       }
       if (current != null) {
-        await controller.addSymbol(
+        _driverSymbol = await controller.addSymbol(
           SymbolOptions(
             geometry: current,
             iconImage: 'startracker-driver-pointer',
             iconSize: .92,
             iconAnchor: 'center',
+            zIndex: 20,
           ),
         );
         await _followPosition(current);
@@ -407,10 +697,41 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
     }
   }
 
+  Future<void> _updateDriverPosition() async {
+    final controller = _controller;
+    final position = widget.position;
+    if (controller == null || !_styleLoaded || position == null) return;
+    final current = LatLng(position.latitude, position.longitude);
+    try {
+      final symbol = _driverSymbol;
+      if (symbol == null) {
+        _driverSymbol = await controller.addSymbol(
+          SymbolOptions(
+            geometry: current,
+            iconImage: 'startracker-driver-pointer',
+            iconSize: .92,
+            iconAnchor: 'center',
+            zIndex: 20,
+          ),
+        );
+      } else {
+        await controller.updateSymbol(symbol, SymbolOptions(geometry: current));
+      }
+      await _followPosition(current);
+    } catch (_) {
+      _driverSymbol = null;
+    }
+  }
+
   LatLng? get _destination {
     final stop = widget.stop;
-    if (stop?.latitude == null || stop?.longitude == null) return null;
-    return LatLng(stop!.latitude!, stop.longitude!);
+    if (stop == null) return null;
+    if (stop.latitude != null && stop.longitude != null) {
+      return LatLng(stop.latitude!, stop.longitude!);
+    }
+    final waypoint = widget.route.deliveryWaypoints[stop.orderId];
+    if (waypoint == null) return null;
+    return LatLng(waypoint.latitude, waypoint.longitude);
   }
 
   Future<void> _installMarkerImages() async {
@@ -608,9 +929,8 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
     ),
   );
 
-  List<LatLng> _nextLeg(
+  List<LatLng> _routeLegFromOrigin(
     List<RouteCoordinate> path,
-    LatLng? current,
     LatLng? destination,
   ) {
     if (destination == null) return const [];
@@ -618,10 +938,8 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
     final points = path
         .map((coordinate) => LatLng(coordinate.latitude, coordinate.longitude))
         .toList();
-    final start = current == null ? 0 : _nearestIndex(points, current);
     final end = _nearestIndex(points, destination);
-    if (end < start) return const [];
-    return points.sublist(start, end + 1);
+    return points.sublist(0, end + 1);
   }
 
   int _nearestIndex(List<LatLng> points, LatLng target) {
@@ -681,13 +999,15 @@ class _MapControlButton extends StatelessWidget {
     tooltip: tooltip,
     onPressed: onPressed,
     style: IconButton.styleFrom(
-      backgroundColor: const Color(0xE6141820),
-      foregroundColor: Colors.white,
+      backgroundColor: Colors.white,
+      foregroundColor: _ink,
       minimumSize: const Size(50, 50),
-      iconSize: 23,
+      maximumSize: const Size(50, 50),
+      iconSize: 25,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(17)),
-      shadowColor: Colors.black54,
-      elevation: 7,
+      side: const BorderSide(color: Color(0x1F171713)),
+      shadowColor: const Color(0x66171713),
+      elevation: 6,
     ),
     icon: Icon(icon),
   );
@@ -705,52 +1025,37 @@ class _FloatingHeaderButton extends StatelessWidget {
   final VoidCallback onPressed;
 
   @override
-  Widget build(BuildContext context) => IconButton(
-    tooltip: tooltip,
-    onPressed: onPressed,
-    style: IconButton.styleFrom(
-      backgroundColor: Colors.transparent,
-      foregroundColor: Colors.white,
-      minimumSize: const Size(50, 50),
-      iconSize: 31,
-      shadowColor: Colors.black,
-      elevation: 0,
-    ),
-    icon: Icon(
-      icon,
-      shadows: const [
-        Shadow(color: Colors.black87, blurRadius: 7, offset: Offset(0, 2)),
-      ],
-    ),
-  );
+  Widget build(BuildContext context) =>
+      _MapControlButton(tooltip: tooltip, icon: icon, onPressed: onPressed);
 }
 
 class _DeliverySheet extends StatefulWidget {
   const _DeliverySheet({
+    super.key,
     required this.route,
     required this.stop,
+    required this.pickupProgress,
     required this.position,
     required this.performingAction,
     required this.onStart,
-    required this.onArrive,
-    required this.onBegin,
-    required this.onComplete,
+    required this.onFinalize,
     required this.onFailure,
     required this.onPostpone,
     required this.onOpenOrder,
+    required this.onOpenPickup,
   });
 
   final ActiveRoute route;
   final ActiveRouteStop? stop;
+  final PickupProgress? pickupProgress;
   final Position? position;
   final bool performingAction;
   final VoidCallback onStart;
-  final VoidCallback? onArrive;
-  final VoidCallback? onBegin;
-  final VoidCallback? onComplete;
+  final VoidCallback? onFinalize;
   final VoidCallback? onFailure;
   final VoidCallback? onPostpone;
   final VoidCallback? onOpenOrder;
+  final VoidCallback onOpenPickup;
 
   @override
   State<_DeliverySheet> createState() => _DeliverySheetState();
@@ -925,21 +1230,27 @@ class _DeliverySheetState extends State<_DeliverySheet> {
                 const SizedBox(height: 18),
                 _PrimaryStopAction(
                   routeStatus: widget.route.status,
-                  status: widget.stop!.status,
+                  requiresPickup: widget.stop!.orderStatus == 'awaiting_pickup',
                   loading: widget.performingAction,
                   onStart: widget.onStart,
-                  onArrive: widget.onArrive,
-                  onBegin: widget.onBegin,
-                  onComplete: widget.onComplete,
+                  onFinalize: widget.onFinalize,
+                  onPickup: widget.onOpenPickup,
                 ),
+                if (_pickupPending) ...[
+                  const SizedBox(height: 10),
+                  _TransferredPickupNotice(
+                    progress: widget.pickupProgress!,
+                    currentOrderBlocked:
+                        widget.stop!.orderStatus == 'awaiting_pickup',
+                    onPressed: widget.onOpenPickup,
+                  ),
+                ],
                 const SizedBox(height: 10),
                 Row(
                   children: [
                     Expanded(
                       child: OutlinedButton.icon(
-                        onPressed:
-                            widget.performingAction ||
-                                widget.route.status != 'started'
+                        onPressed: widget.performingAction
                             ? null
                             : widget.onPostpone,
                         icon: const Icon(Icons.skip_next_rounded),
@@ -951,7 +1262,8 @@ class _DeliverySheetState extends State<_DeliverySheet> {
                       child: OutlinedButton.icon(
                         onPressed:
                             widget.performingAction ||
-                                widget.route.status != 'started'
+                                widget.route.status != 'started' ||
+                                widget.stop!.orderStatus == 'awaiting_pickup'
                             ? null
                             : widget.onFailure,
                         style: OutlinedButton.styleFrom(
@@ -974,7 +1286,7 @@ class _DeliverySheetState extends State<_DeliverySheet> {
                 const Divider(),
                 const SizedBox(height: 12),
                 Text(
-                  'Entregas da wave',
+                  'Entregas da carga',
                   style: Theme.of(context).textTheme.titleMedium?.copyWith(
                     fontWeight: FontWeight.w900,
                   ),
@@ -1039,6 +1351,10 @@ class _DeliverySheetState extends State<_DeliverySheet> {
     );
     return _kilometers(meters);
   }
+
+  bool get _pickupPending =>
+      widget.pickupProgress?.enabled == true &&
+      widget.pickupProgress?.isComplete == false;
 
   int _nearestRoutePoint(List<RouteCoordinate> path, RouteCoordinate target) {
     var nearest = 0;
@@ -1140,42 +1456,100 @@ class _DeliveryContentsCard extends StatelessWidget {
       grams >= 1000 ? '${(grams / 1000).toStringAsFixed(1)} kg' : '$grams g';
 }
 
+class _TransferredPickupNotice extends StatelessWidget {
+  const _TransferredPickupNotice({
+    required this.progress,
+    required this.currentOrderBlocked,
+    required this.onPressed,
+  });
+
+  final PickupProgress progress;
+  final bool currentOrderBlocked;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(18),
+      border: Border.all(color: const Color(0xFFE4E1D8)),
+      boxShadow: const [
+        BoxShadow(
+          color: Color(0x0F171713),
+          blurRadius: 14,
+          offset: Offset(0, 5),
+        ),
+      ],
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.move_to_inbox_rounded),
+            const SizedBox(width: 9),
+            Expanded(
+              child: Text(
+                currentOrderBlocked
+                    ? 'Retirada obrigatória para este pedido'
+                    : 'Nova retirada adicionada à rota',
+                style: const TextStyle(fontWeight: FontWeight.w900),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 5),
+        Text(
+          '${progress.pending} pedido${progress.pending == 1 ? '' : 's'} aguardando retirada'
+          '${progress.totalVolumes > 0 ? ' · ${progress.pendingVolumes} volume${progress.pendingVolumes == 1 ? '' : 's'} sem leitura' : ''}.',
+          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 10),
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton.icon(
+            onPressed: onPressed,
+            style: FilledButton.styleFrom(
+              backgroundColor: _ink,
+              foregroundColor: Colors.white,
+            ),
+            icon: const Icon(Icons.qr_code_scanner_rounded),
+            label: const Text(
+              'Conferir retirada',
+              style: TextStyle(fontWeight: FontWeight.w900),
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
 class _PrimaryStopAction extends StatelessWidget {
   const _PrimaryStopAction({
     required this.routeStatus,
-    required this.status,
+    required this.requiresPickup,
     required this.loading,
     required this.onStart,
-    required this.onArrive,
-    required this.onBegin,
-    required this.onComplete,
+    required this.onFinalize,
+    required this.onPickup,
   });
 
   final String routeStatus;
-  final String status;
+  final bool requiresPickup;
   final bool loading;
   final VoidCallback onStart;
-  final VoidCallback? onArrive;
-  final VoidCallback? onBegin;
-  final VoidCallback? onComplete;
+  final VoidCallback? onFinalize;
+  final VoidCallback onPickup;
 
   @override
   Widget build(BuildContext context) {
-    final (label, icon, callback) = routeStatus != 'started'
+    final (label, icon, callback) = requiresPickup
+        ? ('Conferir retirada', Icons.qr_code_scanner_rounded, onPickup)
+        : routeStatus != 'started'
         ? ('Começar a rota', Icons.play_arrow_rounded, onStart)
-        : switch (status) {
-            'arrived' => (
-              'Iniciar atendimento',
-              Icons.play_arrow_rounded,
-              onBegin,
-            ),
-            'delivering' => (
-              'Finalizar entrega',
-              Icons.check_rounded,
-              onComplete,
-            ),
-            _ => ('Registrar chegada', Icons.location_on_rounded, onArrive),
-          };
+        : ('Finalizar entrega', Icons.check_rounded, onFinalize);
     return SizedBox(
       height: 54,
       child: FilledButton.icon(
@@ -1218,7 +1592,9 @@ class _StopTimelineItem extends StatelessWidget {
     child: Row(
       children: [
         Icon(
-          stop.isTerminal
+          stop.orderStatus == 'awaiting_pickup'
+              ? Icons.inventory_2_outlined
+              : stop.isTerminal
               ? Icons.check_circle_rounded
               : Icons.radio_button_unchecked,
           size: 20,
@@ -1232,9 +1608,23 @@ class _StopTimelineItem extends StatelessWidget {
             style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w800),
           ),
         ),
-        Text(
-          stop.orderNumber,
-          style: const TextStyle(fontSize: 9, color: _muted),
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Text(
+              stop.orderNumber,
+              style: const TextStyle(fontSize: 9, color: _muted),
+            ),
+            if (stop.isManual)
+              const Text(
+                'TRANSFERIDO',
+                style: TextStyle(
+                  fontSize: 7,
+                  color: Color(0xFF8A5A00),
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+          ],
         ),
       ],
     ),
@@ -1261,7 +1651,7 @@ class _RouteFinished extends StatelessWidget {
         ),
         const SizedBox(height: 13),
         const Text(
-          'Wave finalizada',
+          'Carga finalizada',
           style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900),
         ),
         const SizedBox(height: 5),
@@ -1275,6 +1665,68 @@ class _FailureData {
   const _FailureData(this.reason, this.notes);
   final String reason;
   final String notes;
+}
+
+class _PostponeSheet extends StatelessWidget {
+  const _PostponeSheet();
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom),
+    child: Material(
+      color: _cream,
+      borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(18, 12, 18, 18),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 45,
+                  height: 5,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFBBB8AF),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 17),
+              const Text(
+                'Ir para a próxima entrega',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900),
+              ),
+              const SizedBox(height: 5),
+              const Text(
+                'O pedido atual será movido para o final das entregas pendentes.',
+                style: TextStyle(color: _muted, fontSize: 12),
+              ),
+              const SizedBox(height: 18),
+              SizedBox(
+                width: double.infinity,
+                height: 52,
+                child: FilledButton.icon(
+                  onPressed: () => Navigator.of(context).pop(true),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _ink,
+                    foregroundColor: Colors.white,
+                  ),
+                  icon: const Icon(Icons.skip_next_rounded),
+                  label: const Text(
+                    'Confirmar próxima entrega',
+                    style: TextStyle(fontWeight: FontWeight.w900),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
 }
 
 class _FailureSheet extends StatefulWidget {

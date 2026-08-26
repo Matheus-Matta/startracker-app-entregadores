@@ -32,8 +32,12 @@ migrate_working_dir/
 .pub/
 /build/
 /android/build/
+/android/.kotlin/
 /coverage/
 .env
+.env.prod
+.env.production
+.env.staging
 
 # Symbolication related
 app.*.symbols
@@ -45,3 +49,10 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+/android/key.properties
+*.jks
+*.keystore
+
+# APKs gerados localmente (o workflow por tag publica os oficiais)
+*.apk
+*.apk.sha256

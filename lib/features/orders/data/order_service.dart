@@ -1,4 +1,5 @@
 import '../../../core/network/api_client.dart';
+import '../../../core/network/api_collection.dart';
 import '../../../core/network/paged_result.dart';
 
 class OrderListItem {
@@ -61,6 +62,10 @@ class OrderDetails {
     required this.status,
     required this.unassignedReason,
     required this.proofOverrides,
+    required this.notes,
+    required this.paymentMethod,
+    required this.paymentValue,
+    required this.splitFromId,
     required this.createdAt,
     required this.updatedAt,
     required this.items,
@@ -96,9 +101,21 @@ class OrderDetails {
   final String status;
   final String unassignedReason;
   final Map<String, dynamic> proofOverrides;
+
+  /// Observacao livre do pedido, exibida ao entregador.
+  final String notes;
+
+  /// `cash`, `card`, `pix`, `to_arrange` ou vazio quando nao informado.
+  final String paymentMethod;
+  final double? paymentValue;
+
+  /// Pedido de origem quando esta nota nasceu de um desmembro.
+  final int? splitFromId;
   final DateTime? createdAt;
   final DateTime? updatedAt;
   final List<OrderItemDetails> items;
+
+  bool get hasPayment => paymentMethod.isNotEmpty || paymentValue != null;
 
   String get fullAddress => [
     [address, addressNumber].where((part) => part.isNotEmpty).join(', '),
@@ -143,18 +160,63 @@ class OrderVolumeDetails {
   final int weightGrams;
 }
 
+class _CachedOrderPage {
+  const _CachedOrderPage(this.createdAt, this.result);
+
+  final DateTime createdAt;
+  final PagedResult<OrderListItem> result;
+}
+
 class OrderService {
-  const OrderService(this.apiClient);
+  OrderService(this.apiClient);
   final ApiClient apiClient;
+  static const _cacheDuration = Duration(seconds: 30);
+  List<Map<String, dynamic>>? _cachedOrders;
+  DateTime? _cacheCreatedAt;
+  Future<List<Map<String, dynamic>>>? _loadOperation;
+  final Map<int, _CachedOrderPage> _pageCache = {};
+  final Map<int, Future<PagedResult<OrderListItem>>> _pageOperations = {};
+  final Map<int, int> _pageOperationGenerations = {};
+  int? _loadOperationGeneration;
+  int _cacheGeneration = 0;
 
   Future<PagedResult<OrderListItem>> getOrders({
     required int page,
     String search = '',
     String status = '',
+    bool refresh = false,
   }) async {
-    const pageSize = 20;
-    final rawItems = await _getAll('/api/v1/delivery/pedidos/');
     final query = search.trim().toLowerCase();
+    if (query.isEmpty && status.isEmpty) {
+      return _getOrderPage(page, refresh: refresh);
+    }
+
+    const pageSize = 20;
+    final rawItems = await _getOrders(refresh: refresh);
+    final items = _parseItems(rawItems, query: query, status: status);
+
+    final start = (page - 1) * pageSize;
+    final pageItems = start >= items.length
+        ? const <OrderListItem>[]
+        : items.sublist(
+            start,
+            start + pageSize < items.length ? start + pageSize : items.length,
+          );
+
+    return PagedResult(
+      items: pageItems,
+      count: items.length,
+      page: page,
+      hasNext: start + pageSize < items.length,
+      hasPrevious: page > 1,
+    );
+  }
+
+  List<OrderListItem> _parseItems(
+    List<Map<String, dynamic>> rawItems, {
+    String query = '',
+    String status = '',
+  }) {
     final items = <OrderListItem>[];
 
     for (final item in rawItems) {
@@ -193,42 +255,97 @@ class OrderService {
       final byDate = _compareNewest(first.createdAt, second.createdAt);
       return byDate != 0 ? byDate : second.id.compareTo(first.id);
     });
-    final start = (page - 1) * pageSize;
-    final pageItems = start >= items.length
-        ? const <OrderListItem>[]
-        : items.sublist(
-            start,
-            start + pageSize < items.length ? start + pageSize : items.length,
-          );
+    return items;
+  }
 
+  void invalidateCache() {
+    _cacheGeneration++;
+    _cachedOrders = null;
+    _cacheCreatedAt = null;
+    _pageCache.clear();
+  }
+
+  Future<PagedResult<OrderListItem>> _getOrderPage(
+    int page, {
+    required bool refresh,
+  }) async {
+    final cached = _pageCache[page];
+    if (!refresh &&
+        cached != null &&
+        DateTime.now().difference(cached.createdAt) < _cacheDuration) {
+      return cached.result;
+    }
+
+    final ongoing = _pageOperations[page];
+    if (ongoing != null &&
+        _pageOperationGenerations[page] == _cacheGeneration) {
+      return ongoing;
+    }
+    final generation = _cacheGeneration;
+    final operation = _loadOrderPage(page);
+    _pageOperations[page] = operation;
+    _pageOperationGenerations[page] = generation;
+    try {
+      final result = await operation;
+      if (generation == _cacheGeneration) {
+        _pageCache[page] = _CachedOrderPage(DateTime.now(), result);
+      }
+      return result;
+    } finally {
+      if (identical(_pageOperations[page], operation)) {
+        _pageOperations.remove(page);
+        _pageOperationGenerations.remove(page);
+      }
+    }
+  }
+
+  Future<PagedResult<OrderListItem>> _loadOrderPage(int page) async {
+    final response = await apiClient.dio.get<dynamic>(
+      '/api/v1/delivery/pedidos/',
+      queryParameters: {'page': page},
+    );
+    final data = response.data;
+    final items = _parseItems(collectionItems(data));
     return PagedResult(
-      items: pageItems,
-      count: items.length,
+      items: items,
+      count: data is Map ? _asInt(data['count']) ?? items.length : items.length,
       page: page,
-      hasNext: start + pageSize < items.length,
-      hasPrevious: page > 1,
+      hasNext: data is Map && data['next'] != null,
+      hasPrevious: data is Map ? data['previous'] != null : page > 1,
     );
   }
 
-  Future<List<Map<String, dynamic>>> _getAll(String path) async {
-    final items = <Map<String, dynamic>>[];
-    var page = 1;
-    while (page <= 100) {
-      final response = await apiClient.dio.get<dynamic>(
-        path,
-        queryParameters: {'page': page},
-      );
-      final data = response.data;
-      final raw = data is Map ? data['results'] : data;
-      if (raw is List) {
-        items.addAll(
-          raw.whereType<Map>().map((item) => Map<String, dynamic>.from(item)),
-        );
-      }
-      if (data is! Map || data['next'] == null) break;
-      page++;
+  Future<List<Map<String, dynamic>>> _getOrders({required bool refresh}) async {
+    final cached = _cachedOrders;
+    final createdAt = _cacheCreatedAt;
+    final cacheIsFresh =
+        cached != null &&
+        createdAt != null &&
+        DateTime.now().difference(createdAt) < _cacheDuration;
+    if (!refresh && cacheIsFresh) return cached;
+
+    final ongoing = _loadOperation;
+    if (ongoing != null && _loadOperationGeneration == _cacheGeneration) {
+      return ongoing;
     }
-    return items;
+
+    final generation = _cacheGeneration;
+    final operation = apiClient.getAllPages('/api/v1/delivery/pedidos/');
+    _loadOperation = operation;
+    _loadOperationGeneration = generation;
+    try {
+      final orders = await operation;
+      if (generation == _cacheGeneration) {
+        _cachedOrders = orders;
+        _cacheCreatedAt = DateTime.now();
+      }
+      return orders;
+    } finally {
+      if (identical(_loadOperation, operation)) {
+        _loadOperation = null;
+        _loadOperationGeneration = null;
+      }
+    }
   }
 
   int _compareNewest(DateTime? first, DateTime? second) {
@@ -242,7 +359,10 @@ class OrderService {
     final response = await apiClient.dio.get<dynamic>(
       '/api/v1/delivery/pedidos/$orderId/',
     );
-    final data = response.data;
+    return OrderService.parseOrderDetails(response.data, orderId);
+  }
+
+  static OrderDetails parseOrderDetails(dynamic data, int orderId) {
     final order = data is Map
         ? Map<String, dynamic>.from(data)
         : <String, dynamic>{};
@@ -318,22 +438,42 @@ class OrderService {
       proofOverrides: rawProofOverrides is Map
           ? Map<String, dynamic>.from(rawProofOverrides)
           : const {},
+      notes: _orderNotes(order),
+      paymentMethod: order['payment_method']?.toString().trim() ?? '',
+      paymentValue: _asDouble(order['payment_value']),
+      splitFromId: _relationId(order['split_from']),
       createdAt: _asDate(order['created_at']),
       updatedAt: _asDate(order['updated_at']),
       items: items,
     );
   }
 
-  DateTime? _asDate(dynamic value) =>
+  /// A observacao do pedido nao tem nome unico nas integracoes que alimentam a
+  /// API; a primeira chave preenchida vence.
+  static String _orderNotes(Map<String, dynamic> order) {
+    const keys = ['notes', 'note', 'observation', 'observacao', 'observations'];
+    for (final key in keys) {
+      final value = order[key]?.toString().trim() ?? '';
+      if (value.isNotEmpty) return value;
+    }
+    return '';
+  }
+
+  static int? _relationId(dynamic value) {
+    if (value is Map) return _asInt(value['id']);
+    return _asInt(value);
+  }
+
+  static DateTime? _asDate(dynamic value) =>
       DateTime.tryParse(value?.toString() ?? '');
 
-  double? _asDouble(dynamic value) => switch (value) {
+  static double? _asDouble(dynamic value) => switch (value) {
     num number => number.toDouble(),
     String text => double.tryParse(text),
     _ => null,
   };
 
-  int? _asInt(dynamic value) => switch (value) {
+  static int? _asInt(dynamic value) => switch (value) {
     int number => number,
     String text => int.tryParse(text),
     _ => null,

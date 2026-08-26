@@ -2,6 +2,12 @@
 
 Aplicativo Flutter para acompanhamento de entregas em tempo real.
 
+A arquitetura, as politicas de cache e o resultado da revisao de desempenho
+estao documentados em [PERFORMANCE.md](PERFORMANCE.md).
+
+A auditoria de seguranca, Android, REST/WebSocket e prontidao para Google Play
+esta em [AUDITORIA_PRODUCAO.md](AUDITORIA_PRODUCAO.md).
+
 ## URL do backend
 
 A URL pode ser definida em tempo de compilação pela variável `BACKEND_URL`.
@@ -39,6 +45,29 @@ flutter build apk --release --dart-define-from-file=.env.production
 O valor fica incorporado ao aplicativo durante o build. Builds release não
 permitem tráfego HTTP sem criptografia; use HTTPS em produção.
 
+## Notificações
+
+O arquivo `.env` também configura os canais em tempo real e o canal de
+notificação nativa do Android:
+
+```dotenv
+NOTIFICATIONS_ENABLED=true
+FLEET_WEBSOCKET_PATH=/ws/mobile/fleet/
+NOTIFICATIONS_WEBSOCKET_PATH=/ws/mobile/notifications/
+NOTIFICATION_CHANNEL_ID=star_tracker_delivery_updates
+NOTIFICATION_CHANNEL_NAME=Atualizacoes de entrega
+NOTIFICATION_CHANNEL_DESCRIPTION=Novas waves e alteracoes de pedidos e rotas
+```
+
+Execute com `flutter run --dart-define-from-file=.env` para incorporar esses
+valores. O JWT é obtido no login e enviado somente no header `Authorization`
+dos handshakes WebSocket; nenhum token ou segredo deve ser gravado no `.env`.
+
+No Android 13 ou superior, o app solicita a permissão do sistema para exibir
+notificações. As opções de novas waves, alterações de rota e atualizações de
+pedidos são persistidas no armazenamento seguro e podem ser alteradas na tela
+de perfil.
+
 ## Login
 
 O aplicativo autentica entregadores em
@@ -52,3 +81,20 @@ configuração segura) com `order.proof_overrides`. Na conclusão, cria ou atual
 o comprovante em multipart, envia cada foto separadamente e só então chama
 `paradas/{id}/complete/` com o resultado de cada item. `items`, `completed_at`
 e o horário da conclusão são sempre controlados pelo servidor.
+
+## APK automático por tag
+
+O workflow `.github/workflows/android-apk.yml` valida, testa, compila e publica
+o APK como artefato e GitHub Release sempre que uma tag `v*` é enviada:
+
+```powershell
+git tag v1.0.1-build5
+git push origin v1.0.1-build5
+```
+
+Também são aceitas tags `v1.0.1` e `v1.0.1+5`. Configure a variável opcional
+`BACKEND_URL` no repositório para substituir `https://tracker.star.dev.br`.
+Para gerar um release assinado, configure os Secrets
+`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD` e
+`ANDROID_STORE_PASSWORD`. Sem os quatro Secrets, o workflow gera um APK demo
+com assinatura debug.

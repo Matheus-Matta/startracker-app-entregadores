@@ -1,4 +1,5 @@
 import '../../../core/network/api_client.dart';
+import '../../../core/network/api_collection.dart';
 
 class ActiveWave {
   const ActiveWave({
@@ -74,28 +75,7 @@ class ActiveWaveService {
   }
 
   Future<List<Map<String, dynamic>>> _getAllRoutes() async {
-    final routes = <Map<String, dynamic>>[];
-    var page = 1;
-    while (page <= 100) {
-      final response = await apiClient.dio.get<dynamic>(
-        '/api/v1/delivery/rotas/',
-        queryParameters: {'page': page},
-      );
-      routes.addAll(_itemsFrom(response.data));
-      final data = response.data;
-      if (data is! Map || data['next'] == null) break;
-      page++;
-    }
-    return routes;
-  }
-
-  List<Map<String, dynamic>> _itemsFrom(dynamic data) {
-    final rawItems = data is Map ? data['results'] : data;
-    if (rawItems is! List) return const [];
-    return rawItems
-        .whereType<Map>()
-        .map((item) => Map<String, dynamic>.from(item))
-        .toList();
+    return apiClient.getAllPages('/api/v1/delivery/rotas/');
   }
 
   int? _asInt(dynamic value) => switch (value) {

@@ -8,6 +8,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../data/active_route_service.dart';
+import '../data/delivery_photo_recovery.dart';
 
 const _ink = Color(0xFF171713);
 const _cream = Color(0xFFF5F3ED);
@@ -16,13 +17,17 @@ const _muted = Color(0xFF77746C);
 
 class DeliveryCompletionPage extends StatefulWidget {
   const DeliveryCompletionPage({
+    required this.routeId,
     required this.stop,
     required this.service,
+    this.recoveredCapture,
     super.key,
   });
 
+  final int routeId;
   final ActiveRouteStop stop;
   final ActiveRouteService service;
+  final RecoveredDeliveryCapture? recoveredCapture;
 
   @override
   State<DeliveryCompletionPage> createState() => _DeliveryCompletionPageState();
@@ -33,6 +38,7 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
   final _documentController = TextEditingController();
   final _notesController = TextEditingController();
   final _picker = ImagePicker();
+  late final DeliveryPhotoRecovery _photoRecovery;
   final _photos = <_CapturedPhoto>[];
   late final List<_ItemCompletionState> _itemStates;
   Uint8List? _signatureBytes;
@@ -45,12 +51,34 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
   @override
   void initState() {
     super.initState();
-    _recipientController.text = widget.stop.existingRecipientName;
-    _documentController.text = widget.stop.existingRecipientDocument;
-    _notesController.text = widget.stop.existingNotes;
+    _photoRecovery = DeliveryPhotoRecovery(widget.service.storage);
+    final recovered = widget.recoveredCapture;
+    final draft = recovered?.draft;
+    _recipientController.text =
+        draft?.recipientName ?? widget.stop.existingRecipientName;
+    _documentController.text =
+        draft?.recipientDocument ?? widget.stop.existingRecipientDocument;
+    _notesController.text = draft?.notes ?? widget.stop.existingNotes;
     _itemStates = widget.stop.contents
         .map(_ItemCompletionState.fromItem)
         .toList();
+    if (draft != null) {
+      for (final state in _itemStates) {
+        final saved = draft.items.where((item) => item.id == state.item.id);
+        if (saved.isEmpty) continue;
+        final item = saved.first;
+        state.status = item.status;
+        state.reason = item.reason;
+        state.notesController.text = item.notes;
+      }
+      _signatureBytes = draft.signatureBytes;
+    }
+    if (recovered != null) {
+      _photos.add(_CapturedPhoto(recovered.filename, recovered.photoBytes));
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _message('Foto recuperada. Confirme os dados da entrega.');
+      });
+    }
   }
 
   @override
@@ -68,17 +96,23 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
     if (_openingCamera || _totalPhotos >= _policy.maximumPhotos) return;
     setState(() => _openingCamera = true);
     try {
+      await _photoRecovery.saveDraft(_currentDraft());
       final file = await _picker.pickImage(
         source: ImageSource.camera,
         preferredCameraDevice: CameraDevice.rear,
         imageQuality: 78,
         maxWidth: 1800,
       );
-      if (file == null) return;
+      if (file == null) {
+        await _photoRecovery.clearDraft();
+        return;
+      }
       final bytes = await file.readAsBytes();
+      await _photoRecovery.clearDraft();
       if (!mounted) return;
       setState(() => _photos.add(_CapturedPhoto(file.name, bytes)));
     } catch (_) {
+      await _photoRecovery.clearDraft();
       if (!mounted) return;
       _message(
         'A câmera é obrigatória para registrar a foto. Permita o acesso nas configurações do telefone.',
@@ -87,6 +121,25 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
       if (mounted) setState(() => _openingCamera = false);
     }
   }
+
+  PendingDeliveryDraft _currentDraft() => PendingDeliveryDraft(
+    routeId: widget.routeId,
+    stopId: widget.stop.stopId,
+    recipientName: _recipientController.text,
+    recipientDocument: _documentController.text,
+    notes: _notesController.text,
+    items: _itemStates
+        .map(
+          (state) => DeliveryDraftItem(
+            id: state.item.id,
+            status: state.status,
+            reason: state.reason,
+            notes: state.notesController.text,
+          ),
+        )
+        .toList(),
+    signatureBytes: _signatureBytes,
+  );
 
   Future<void> _openSignature() async {
     final signature = await Navigator.of(context).push<Uint8List>(
@@ -1033,10 +1086,25 @@ class _SignaturePad extends StatefulWidget {
 class _SignaturePadState extends State<_SignaturePad> {
   final _boundaryKey = GlobalKey();
   final _points = <Offset?>[];
+  final ValueNotifier<int> _revision = ValueNotifier<int>(0);
 
   bool get hasSignature => _points.whereType<Offset>().length > 3;
 
-  void clear() => setState(_points.clear);
+  void clear() {
+    _points.clear();
+    _revision.value++;
+  }
+
+  void _addPoint(Offset? point) {
+    _points.add(point);
+    _revision.value++;
+  }
+
+  @override
+  void dispose() {
+    _revision.dispose();
+    super.dispose();
+  }
 
   Future<Uint8List?> exportPng() async {
     if (!hasSignature) return null;
@@ -1059,22 +1127,27 @@ class _SignaturePadState extends State<_SignaturePad> {
       clipBehavior: Clip.antiAlias,
       child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onPanStart: (details) =>
-            setState(() => _points.add(details.localPosition)),
-        onPanUpdate: (details) =>
-            setState(() => _points.add(details.localPosition)),
-        onPanEnd: (_) => setState(() => _points.add(null)),
+        onPanStart: (details) => _addPoint(details.localPosition),
+        onPanUpdate: (details) => _addPoint(details.localPosition),
+        onPanEnd: (_) => _addPoint(null),
         child: Stack(
           fit: StackFit.expand,
           children: [
-            CustomPaint(painter: _SignaturePainter(_points)),
-            if (!hasSignature)
-              const Center(
-                child: Text(
-                  'Assine aqui',
-                  style: TextStyle(color: Color(0xFFAAA79F), fontSize: 18),
-                ),
-              ),
+            CustomPaint(painter: _SignaturePainter(_points, _revision)),
+            ValueListenableBuilder<int>(
+              valueListenable: _revision,
+              builder: (context, _, _) => hasSignature
+                  ? const SizedBox.shrink()
+                  : const Center(
+                      child: Text(
+                        'Assine aqui',
+                        style: TextStyle(
+                          color: Color(0xFFAAA79F),
+                          fontSize: 18,
+                        ),
+                      ),
+                    ),
+            ),
           ],
         ),
       ),
@@ -1083,7 +1156,7 @@ class _SignaturePadState extends State<_SignaturePad> {
 }
 
 class _SignaturePainter extends CustomPainter {
-  const _SignaturePainter(this.points);
+  _SignaturePainter(this.points, Listenable repaint) : super(repaint: repaint);
   final List<Offset?> points;
 
   @override
@@ -1103,5 +1176,5 @@ class _SignaturePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _SignaturePainter oldDelegate) => true;
+  bool shouldRepaint(covariant _SignaturePainter oldDelegate) => false;
 }
