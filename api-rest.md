@@ -92,7 +92,7 @@ inclui a política vigente de comprovantes:
   "user": {"id": 10, "username": "entregador", "name": "Entregador"},
   "account": {"id": 1, "name": "Conta Exemplo"},
   "delivery_config": {
-    "version": 1,
+    "version": 3,
     "require_photo": true,
     "minimum_photos": 1,
     "maximum_photos": 5,
@@ -100,7 +100,24 @@ inclui a política vigente de comprovantes:
     "require_recipient_name": true,
     "require_document": false,
     "require_note_on_failure": true,
-    "capture_timestamp": true
+    "capture_timestamp": true,
+    "pickup_enabled": false,
+    "pickup_barcode_source": "order_number",
+    "label_width_mm": 80,
+    "label_height_mm": 120,
+    "availability": {
+      "can_edit": true,
+      "driver_id": 7,
+      "value": "available",
+      "label": "Disponível",
+      "options": [
+        {"value": "available", "label": "Disponível"},
+        {"value": "busy", "label": "Ocupado"},
+        {"value": "offline", "label": "Desconectado"}
+      ],
+      "update_url": "/api/v1/delivery/entregadores/7/disponibilidade/",
+      "method": "POST"
+    }
   }
 }
 ```
@@ -117,7 +134,7 @@ Resposta `200 OK`:
 ```json
 {
   "delivery_config": {
-    "version": 1,
+    "version": 3,
     "require_photo": true,
     "minimum_photos": 1,
     "maximum_photos": 5,
@@ -125,7 +142,24 @@ Resposta `200 OK`:
     "require_recipient_name": true,
     "require_document": false,
     "require_note_on_failure": true,
-    "capture_timestamp": true
+    "capture_timestamp": true,
+    "pickup_enabled": false,
+    "pickup_barcode_source": "order_number",
+    "label_width_mm": 80,
+    "label_height_mm": 120,
+    "availability": {
+      "can_edit": true,
+      "driver_id": 7,
+      "value": "available",
+      "label": "Disponível",
+      "options": [
+        {"value": "available", "label": "Disponível"},
+        {"value": "busy", "label": "Ocupado"},
+        {"value": "offline", "label": "Desconectado"}
+      ],
+      "update_url": "/api/v1/delivery/entregadores/7/disponibilidade/",
+      "method": "POST"
+    }
   }
 }
 ```
@@ -134,7 +168,7 @@ Campos da política:
 
 | Campo | Tipo | Uso no aplicativo |
 | --- | --- | --- |
-| `version` | inteiro | Versão do contrato da política; atualmente `1` |
+| `version` | inteiro | Versão do contrato da política; atualmente `3` |
 | `require_photo` | booleano | Exige foto para concluir a entrega |
 | `minimum_photos` | inteiro | Quantidade mínima de fotos exigida |
 | `maximum_photos` | inteiro | Quantidade máxima de fotos permitida |
@@ -145,12 +179,19 @@ Campos da política:
 | `capture_timestamp` | booleano | Data e hora são registradas pelo servidor |
 | `pickup_enabled` | booleano | A carga precisa ser conferida antes de ser roteirizada |
 | `pickup_barcode_source` | texto | O que a etiqueta traz: `order_number` ou `external_id` |
+| `label_width_mm` | inteiro | Largura da etiqueta impressa, em milímetros |
+| `label_height_mm` | inteiro | Altura da etiqueta impressa, em milímetros |
+| `availability` | objeto | Estado atual, opções e endpoint para o entregador editar a própria disponibilidade |
 
 Esse endpoint usa exclusivamente a conta do JWT, não aceita troca de tenant por
 `account_id` e responde `403 Forbidden` se o usuário não possuir o perfil
 Entregador nessa conta. `capture_timestamp` informa que a data e a hora são
-registradas pelo servidor. A versão permite que o app reconheça futuras
-alterações no contrato.
+registradas pelo servidor.
+
+`version` sobe sempre que o contrato ganha campo. A `2` acrescentou
+`pickup_enabled`, `pickup_barcode_source` e as medidas da etiqueta. A `3`
+acrescentou `availability`, permitindo ao app montar o seletor e salvar no
+`update_url` sem fixar o ID do entregador ou as opções no código do aplicativo.
 
 Respostas de erro:
 
@@ -381,22 +422,94 @@ resposta; somente seu fingerprint é apresentado.
 
 O módulo de entregas usa `/api/v1/delivery/`. Seu catálogo inclui
 `configuracao`, `configuracoes-veiculo`, `entregadores`,
-`vinculos-entregador-veiculo`, `turnos`, `jornadas`, `areas`, `armazens`,
+`vinculos-entregador-veiculo`, `turnos`, `areas`, `armazens`,
 `regras-distribuicao`, `pedidos`, `pedidos-wave`, `waves`, `otimizacoes`,
 `nao-atribuidos`, `rotas`, `paradas`, `comprovantes`, `fotos-comprovante`,
 `eventos` e `tentativas`.
 
-### Turno e jornada são coisas diferentes
+### Entrada automática de pedidos em cargas
 
-| Recurso | Modelo | O que é |
+Cada conta possui um único registro em `delivery/configuracao`. O campo
+`waves_enabled` controla a entrada automática dos pedidos em cargas:
+
+| Valor | Comportamento |
+| --- | --- |
+| `true` | O pedido elegível entra em `waiting_wave` e pode ser distribuído automaticamente para uma carga. |
+| `false` | O pedido fica em `ready_for_routing`, sem vínculo automático com uma carga, e continua disponível para planejamento manual. |
+
+Para desativar a automação, consulte o registro da conta e altere-o pelo ID:
+
+```http
+GET /api/v1/delivery/configuracao/
+Authorization: Bearer ACCESS_TOKEN
+```
+
+```http
+PATCH /api/v1/delivery/configuracao/7/
+Authorization: Bearer ACCESS_TOKEN
+Content-Type: application/json
+
+{"waves_enabled": false}
+```
+
+A alteração afeta os próximos pedidos que tiverem endereço e coordenadas
+resolvidos. Ela não remove pedidos de cargas já formadas.
+
+### Armazéns
+
+O CRUD de `delivery/armazens` usa o padrão descrito na seção 3. Seus campos são:
+
+| Campo | Tipo | Descrição |
 | --- | --- | --- |
-| `turnos` | `WorkSchedule` | Horário reutilizável (“Comercial 08:00–17:00”, com almoço). Um mesmo turno atende vários entregadores; só decide **quem pode receber carga agora**. |
-| `jornadas` | `DriverShift` | A operação em curso: entregador, veículo, posição inicial e capacidade. É o que o roteirizador consome como veículo. |
+| `id` | inteiro (leitura) | Identificador do armazém. |
+| `account` | inteiro (leitura) | Conta definida pelo JWT. |
+| `name` | texto | Nome do armazém. |
+| `cnpj` | texto, opcional | CNPJ do estabelecimento, com ou sem formatação. |
+| `active` | booleano | Indica se o armazém pode ser usado como origem. |
+| `address` | texto | Logradouro. |
+| `address_number` | texto, opcional | Número do endereço. |
+| `address_complement` | texto, opcional | Complemento. |
+| `neighborhood` | texto, opcional | Bairro. |
+| `city` | texto | Cidade. |
+| `state` | texto | Estado. |
+| `postal_code` | texto, opcional | CEP. |
+| `lat` | decimal | Latitude entre -90 e 90. |
+| `lon` | decimal | Longitude entre -180 e 180. |
+| `created_at`, `updated_at` | data e hora (leitura) | Auditoria do cadastro. |
 
-> **Mudança em relação à versão anterior:** `delivery/turnos` apontava para
-> `DriverShift`. Esse recurso agora responde em `delivery/jornadas`, e
-> `delivery/turnos` passou a ser o horário reutilizável. Clientes que criavam
-> jornadas precisam trocar a URL.
+Exemplo de criação:
+
+```http
+POST /api/v1/delivery/armazens/
+Authorization: Bearer ACCESS_TOKEN
+Content-Type: application/json
+
+{
+  "name": "CD Principal",
+  "cnpj": "12.345.678/0001-90",
+  "active": true,
+  "address": "Avenida Brasil",
+  "address_number": "1000",
+  "city": "Rio de Janeiro",
+  "state": "RJ",
+  "postal_code": "20000-000",
+  "lat": -22.9068,
+  "lon": -43.1729
+}
+```
+
+O `cnpj` é retornado nas operações de listagem e consulta e pode ser alterado
+por `PUT` ou `PATCH`. O campo `account` nunca deve ser enviado; listagens,
+consultas e alterações permanecem limitadas à conta do JWT.
+
+### Turno (`WorkSchedule`)
+
+`turnos` é o horário reutilizável — um "Comercial 08:00–17:00" atende vários
+entregadores ao mesmo tempo (com almoço opcional) e só decide **quem pode
+receber carga agora**. Não existe mais um recurso separado para "a operação
+em curso": veículo, posição inicial e capacidade do entregador vêm direto de
+`DriverProfile.default_vehicle` e de `configuracoes-veiculo` — não há um
+registro manual de jornada para criar ou manter.
 
 Campos de `turnos`:
 
@@ -413,11 +526,16 @@ Campos de `turnos`:
 meia-noite (ex.: `22:00`–`06:00`). O almoço precisa cair dentro do expediente.
 
 Um entregador só enxerga o turno ao qual está vinculado; perfis
-administrativos listam todos os turnos da conta.
+administrativos listam todos os turnos da conta. No portal, a tela do turno
+tem um multi-select de entregadores: marcar/desmarcar ali atribui ou libera
+o `work_schedule` de vários entregadores de uma vez, em vez de abrir o
+cadastro de cada um. A API continua atribuindo turno pelo campo
+`work_schedule` do próprio `entregadores` (veja abaixo) — o multi-select é
+só um atalho do portal para editar o mesmo campo em lote.
 
 ### Turno e disponibilidade do entregador
 
-O recurso `entregadores` ganhou dois campos graváveis e três de leitura:
+O recurso `entregadores` possui dois campos graváveis e quatro de leitura:
 
 | Campo | Tipo | Descrição |
 | --- | --- | --- |
@@ -426,6 +544,7 @@ O recurso `entregadores` ganhou dois campos graváveis e três de leitura:
 | `schedule` | objeto ou `null` (leitura) | O turno vinculado já expandido, para o app não precisar de uma segunda chamada |
 | `availability_label` | texto (leitura) | Rótulo pronto para exibir: `Disponível`, `Ocupado` ou `Desconectado` |
 | `is_on_duty` | booleano (leitura) | Se está em horário de trabalho **agora** |
+| `can_edit_availability` | booleano (leitura) | Se o usuário autenticado pode alterar a disponibilidade desse entregador |
 
 `is_on_duty` não é o mesmo que estar livre: quem está numa rota continua em
 horário, só que `busy`. Sem turno vinculado ele é sempre `true`.
@@ -436,6 +555,7 @@ horário, só que `busy`. Sem turno vinculado ele é sempre `true`.
   "user": 10,
   "availability": "available",
   "availability_label": "Disponível",
+  "can_edit_availability": true,
   "is_on_duty": true,
   "work_schedule": 3,
   "schedule": {
@@ -454,6 +574,12 @@ horário, só que `busy`. Sem turno vinculado ele é sempre `true`.
 entregador como `busy`, e concluí-la devolve para `available`. Quem foi posto
 em `offline` manualmente não é reativado pelo fim de uma rota.
 
+`available`/`busy` são só o rótulo que a operação vê no mapa — turno e rota
+ativa continuam sendo quem decide elegibilidade para a alocação automática de
+carga. **`offline` é a exceção**: um entregador marcado assim nunca recebe
+pedido pela alocação automática (`allocate_orders`), mesmo dentro do turno.
+Atribuição manual de wave continua permitida.
+
 #### Alterar só a disponibilidade
 
 Para não reenviar o cadastro inteiro só para dizer "estou de volta":
@@ -469,12 +595,23 @@ Content-Type: application/json
 A resposta `200 OK` traz o entregador já atualizado. Um valor fora de
 `available`/`busy`/`offline` responde `400`.
 
+No app do entregador, não construa essa URL manualmente: use
+`delivery_config.availability.update_url`, envie uma das opções publicadas em
+`delivery_config.availability.options` e atualize o seletor com o objeto
+retornado. A configuração é consultável novamente após o login e sempre traz o
+estado atual do próprio entregador.
+
 Quem pode chamar:
 
 | Quem | Pode alterar |
 | --- | --- |
 | Entregador | Apenas a própria disponibilidade — o escopo do perfil já esconde os colegas, então o id de outro entregador responde `404` |
 | Perfis com `delivery.change_driverprofile` | A de qualquer entregador da conta |
+
+Para interfaces administrativas, use `can_edit_availability` em cada objeto da
+listagem. Um perfil que possua apenas `delivery.view_driverprofile` enxerga o
+entregador, mas recebe `can_edit_availability: false` e uma tentativa de alteração
+responde `403 Forbidden`.
 
 ### Regra de horário na distribuição de carga
 
@@ -486,14 +623,38 @@ Antes de incluir um entregador numa carga, o servidor avalia o turno dele:
 | Dentro do expediente | Sim |
 | Dentro do intervalo de almoço | Não |
 | Fora do expediente | Não |
+| `availability = offline` | Não, independente do turno |
 
-A verificação acontece no backend, em `available_shifts()`, que é o ponto por
+A verificação acontece no backend, em `available_drivers()`, que é o ponto por
 onde passa toda distribuição automática — não é validação só de tela. Uma wave
-com jornada fixada manualmente pelo operador continua honrando essa escolha.
+com entregador fixado manualmente pelo operador continua honrando essa escolha.
 
 Itens e volumes não possuem endpoints CRUD independentes. Eles são
 sub-recursos aninhados no payload de `pedidos` e sempre respeitam a conta do
 pedido.
+
+### Prioridade de entregador por área (`DeliveryAreaDriver`)
+
+Cada `DeliveryArea` pode ter uma lista ordenada de entregadores, em vez de um
+vínculo solto: `DeliveryAreaDriver` guarda `area`, `driver` e `priority`
+(inteiro positivo, `1` é o mais prioritário). Quando a alocação automática
+resolve um pedido daquela área, tenta o entregador de prioridade `1`; se ele
+estiver ocupado, sem vaga ou offline, cai pro `2`, depois o `3`, e assim por
+diante. Entregador sem nenhum vínculo de área continua servindo qualquer área
+(comportamento de sempre); a lista de prioridade só entra em jogo pra quem
+tem vínculo.
+
+Uma `DeliveryWave` trava na área do primeiro pedido que recebeu
+(`DeliveryWave.delivery_area`): enquanto ela estiver aberta (`collecting`/
+`ready`), só aceita pedido novo da mesma área, mesmo que o entregador dela não
+tenha restrição — evita misturar pedidos de áreas diferentes na carga de um
+entregador que foi escolhido especificamente pela prioridade daquela área.
+
+O CRUD de `DeliveryAreaDriver` segue o padrão genérico
+(`/api/v1/delivery/area-entregadores/` — ver [Padrão dos CRUDs](#3-padrão-dos-cruds)).
+No portal, a atribuição acontece na tela de editar área
+(`/app/entregas/areas/{id}/editar/`), com um seletor que já monta a lista
+ordenada.
 
 ### Modelo de pedido, item e volume
 
@@ -526,12 +687,35 @@ Os principais campos de `DeliveryOrder` são:
 | Endereço | `address`, `address_number`, `address_complement`, `neighborhood`, `city`, `state`, `postal_code` |
 | Coordenadas | `lat`, `lon` |
 | Carga agregada | `volume` em cm³, `weight` em gramas e `units` |
+| Carga pendente (leitura) | `pending_volume`, `pending_weight`, `pending_units` |
 | Planejamento | `priority`, `effective_priority`, `skills`, `service_duration_seconds`, `delivery_window_start`, `delivery_window_end`, `ready_at`, `promised_at` |
+| Pagamento (opcional) | `payment_method`, `payment_value` |
 | Operação | `status`, `delivery_area`, `unassigned_reason`, `proof_overrides` |
+| Desmembro (leitura) | `split_from` — id do pedido original, quando esta nota nasceu de um desmembro (ver [Reentrega do que ficou pendente](#reentrega-do-que-ficou-pendente)) |
 | Auditoria | `created_at`, `updated_at` |
 
 `account` é definido pelo JWT e é somente leitura. Relacionamentos como
 `warehouse` e `delivery_area` precisam pertencer à mesma conta.
+
+**`priority` vai de `-2` a `1`** (inteiro; `1` é o mais prioritário, `-2` o
+menos). Além de influenciar a alocação em waves, ele também vira regra rígida
+na sequência das paradas dentro de uma rota já otimizada: pedidos com
+prioridade maior sempre vêm antes dos de prioridade menor, mesmo que o
+otimizador (VROOM) preferisse outra ordem por distância — dentro de cada
+grupo de mesma prioridade, a ordem calculada pelo otimizador é preservada.
+`effective_priority` (0-100, somente leitura de fato — recalculado pelo
+servidor) é só o sinal usado internamente para desempatar rotas dentro de um
+mesmo grupo de prioridade, não precisa ser enviado.
+
+> ⚠️ **Breaking change**: antes, `priority` ia de `0` a `100`. Integrações OMS
+> que enviem um valor fora de `-2..1` recebem `400` na criação/importação do
+> pedido. Pedidos já existentes com valor fora da faixa foram reamassados
+> (`> 0` virou `1`) numa migration; não há mais valor negativo herdado do
+> período anterior a esta mudança.
+
+`payment_method` aceita `cash`, `card`, `pix`, `to_arrange` ou vazio (não
+informado). `payment_value` é um decimal opcional (até 2 casas). Nenhum dos
+dois participa da roteirização — é só informação exibida no pedido.
 
 Quando o pedido possui volumes, os agregados são calculados pelo servidor:
 
@@ -544,6 +728,13 @@ units = quantidade de volumes
 Um item pode conter vários volumes. Pedido sem itemização mantém os valores
 agregados enviados diretamente em `volume`, `weight` e `units`, preservando a
 compatibilidade com integrações OMS antigas.
+
+`pending_volume`, `pending_weight` e `pending_units` são somente leitura e
+calculados na hora a partir dos itens que **ainda não foram entregues**. Num
+pedido inteiro os dois conjuntos são iguais; depois de uma entrega parcial, os
+`pending_*` encolhem enquanto `volume`/`weight`/`units` continuam descrevendo o
+pedido contratado. É o par `pending_*` que a capacidade do veículo e o
+roteirizador consomem. Pedido sem itemização repete o total declarado.
 
 ### Criar um pedido com itens
 
@@ -566,8 +757,10 @@ Content-Type: application/json
   "city": "São Gonçalo",
   "state": "RJ",
   "postal_code": "24451-230",
-  "priority": 30,
+  "priority": 1,
   "service_duration_seconds": 300,
+  "payment_method": "pix",
+  "payment_value": "249.90",
   "items": [
     {
       "name": "Guarda-roupa",
@@ -787,11 +980,57 @@ roteirizador retorna `400`. Uma wave de outro entregador permanece invisível e
 retorna `404`. A permissão dedicada não autoriza `PUT`, `PATCH`, `DELETE` nem as
 ações administrativas `optimize`, `release`, `close` e `cancel`.
 
+#### O trajeto da rota
+
+`GET delivery/rotas/{route_id}/` traz o CRUD padrão do recurso, incluindo o
+trajeto calculado pelo roteirizador:
+
+```json
+{
+  "id": 25,
+  "status": "started",
+  "planned_distance": 25057,
+  "planned_duration": 1860,
+  "path_geometry": {
+    "type": "LineString",
+    "coordinates": [[-43.0994, -22.8569], [-43.0993, -22.8567], "..."]
+  },
+  "planned_waypoints": [
+    {"kind": "pickup", "warehouse_id": 1, "name": "Centro de Distribuição Principal", "location": [-43.0027, -22.8298]},
+    {"kind": "delivery", "order_id": 370, "name": "PED-2026-001", "location": [-43.0004, -22.8218]}
+  ],
+  "path_updated_at": "2026-08-22T19:21:54-03:00"
+}
+```
+
+| Campo | Descrição |
+| --- | --- |
+| `path_geometry` | `LineString` GeoJSON em `[lon, lat]`, na ordem em que o trajeto é percorrido |
+| `planned_waypoints` | Origem(ns) e paradas na ordem devolvida pelo roteirizador, com o `order_id`/`warehouse_id` de cada uma |
+| `path_updated_at` | Quando o trajeto foi recalculado pela última vez |
+
+`path_geometry` cobre **só as paradas ainda pendentes** — não é o trajeto
+completo da rota desde o início. Uma parada já `completed` não aparece nele;
+o primeiro ponto da geometria fica próximo da localização atual do veículo (ou
+da primeira parada pendente), não da primeira parada da rota. É por isso que
+recalcular o trajeto ao concluir uma parada ou ao adiar uma
+([`skip/`](#próxima-entrega-adiar-uma-parada)) só mexe no trecho restante: o
+`GET` seguinte já reflete a rota encolhida.
+
+Para saber a que parada cada ponto do trajeto corresponde, cruze com
+`GET delivery/paradas/?route={route_id}`, ordenado por `sequence` — cada
+parada traz o `order_id`, e a distância entre as coordenadas do pedido
+(`lat`/`lon`) e o ponto mais próximo em `path_geometry.coordinates` é o
+desvio real de percurso. O mapa e o app usam esse cruzamento para desenhar a
+rota junto com as paradas.
+
 ### Retirada da carga (conferência por código de barras)
 
 Com `pickup_enabled` ligado na configuração da conta, **a wave só pode ser
 roteirizada depois que todos os pedidos dela forem retirados** — ou removidos
-da carga. A conferência é feita lendo a etiqueta de cada pedido.
+da carga. A conferência é feita lendo a etiqueta de **cada volume** do
+pedido: um pedido com três volumes só conta como retirado depois das três
+leituras.
 
 O que a etiqueta traz vem de `pickup_barcode_source`:
 
@@ -799,6 +1038,12 @@ O que a etiqueta traz vem de `pickup_barcode_source`:
 | --- | --- |
 | `order_number` (padrão) | `DeliveryOrder.order_number` |
 | `external_id` | `DeliveryOrder.external_id`; pedido sem código externo cai no número do pedido, para a etiqueta nunca sair em branco |
+
+Esse valor é a base do código. Pedido sem itemização, ou com um único volume,
+usa a base pura (`PED-2026-001`). Pedido com mais de um volume ganha um
+sufixo por posição — `PED-2026-001-1`, `PED-2026-001-2` — na mesma ordem e
+com o mesmo total que aparece impresso em cada etiqueta, uma por volume (veja
+[Etiquetas: uma por volume](delivery.md#etiquetas-uma-por-volume)).
 
 #### Consultar o progresso
 
@@ -821,32 +1066,43 @@ Authorization: Bearer ACCESS_TOKEN
       "order_id": 81,
       "order_number": "PED-2026-001",
       "customer": "Cliente Exemplo",
-      "code": "PED-2026-001",
-      "picked_up_at": "2026-08-22T09:14:00-03:00"
+      "codes": [
+        {"code": "PED-2026-001-1", "scanned_at": "2026-08-22T09:14:00-03:00"},
+        {"code": "PED-2026-001-2", "scanned_at": null}
+      ],
+      "picked_up_at": null
     }
   ]
 }
 ```
 
+`total`/`picked_up`/`pending`/`is_complete` continuam por **pedido**, não por
+volume — é o que trava a roteirização. `codes` é a lista de etiquetas daquele
+pedido; `picked_up_at` do pedido só deixa de ser `null` quando todo `codes`
+estiver com `scanned_at` preenchido.
+
 #### Registrar a retirada
 
 O app manda o que a câmera leu; o portal manda o que foi digitado — é o mesmo
-endpoint. A resposta é o mesmo payload de progresso, já atualizado.
+endpoint, um código de volume por chamada. A resposta é o mesmo payload de
+progresso, já atualizado.
 
 ```http
 POST /api/v1/delivery/waves/10/retirada/
 Authorization: Bearer ACCESS_TOKEN
 Content-Type: application/json
 
-{"code": "PED-2026-001"}
+{"code": "PED-2026-001-1"}
 ```
 
 O código é comparado ignorando maiúsculas e espaços, porque leitor de mão e
-digitação manual chegam com formatações diferentes.
+digitação manual chegam com formatações diferentes. Cada volume só é aceito
+uma vez; ler o último volume pendente de um pedido é o que marca
+`picked_up_at` dele.
 
 | Status | Situação |
 | --- | --- |
-| `400` | Código vazio, não corresponde a nenhum pedido da carga, ou pedido já retirado |
+| `400` | Código vazio, não corresponde a nenhum volume da carga, o pedido já está totalmente retirado, ou aquele volume específico já foi lido |
 | `403` | Usuário não é o entregador da carga nem tem `delivery.change_deliverywave` |
 | `404` | Wave fora da conta do JWT ou de outro entregador |
 
@@ -866,9 +1122,17 @@ A trava vive no serviço de roteirização, não só no botão do portal — val
 igual para API, tarefa periódica e simulador. Remover o pedido da carga também
 libera: o que saiu da wave deixa de ser cobrado na conferência.
 
-A retirada é gravada no vínculo `WaveOrder`, não no pedido. Tirar o pedido da
-carga apaga a conferência junto — na carga seguinte ele precisa ser bipado de
-novo.
+#### Efeito no status do pedido
+
+Com a conferência ligada, o pedido entra na carga em `awaiting_pickup` — está
+esperando ser retirado do armazém — e passa para `ready_for_routing` assim que
+**todos os volumes** forem lidos. Com a conferência desligada, ele vai direto
+para `ready_for_routing`: a retirada continua existindo, só não exige leitura.
+
+A retirada é gravada no vínculo `WaveOrder`, não no pedido — e cada leitura de
+volume, num registro à parte ligado a esse mesmo vínculo. Tirar o pedido da
+carga apaga a conferência inteira junto, volumes lidos inclusive: na carga
+seguinte ele precisa ser bipado de novo, do zero.
 
 ### Assinatura, fotos e conclusão da entrega
 
@@ -1131,21 +1395,137 @@ Content-Type: application/json
 
 Regras:
 
+- o checklist cobre **apenas os itens ainda não entregues**. Numa reentrega, o
+  que o cliente já recebeu não volta a ser perguntado e não pode ser
+  desmarcado — nem por um `complete/` nem por um `fail/` posterior;
 - omitir `items`, enviar lista vazia ou omitir um item da lista marca esse
-  item (ou todos, se `items` não vier) como `delivered` — pedidos sem
-  itens cadastrados continuam funcionando exatamente como antes deste
+  item (ou todos os pendentes, se `items` não vier) como `delivered` — pedidos
+  sem itens cadastrados continuam funcionando exatamente como antes deste
   recurso, sem enviar nada;
 - todo item `delivered` entra em `DeliveryProof.items`; nenhum item `failed`
   entra lá — o motivo e a observação da falha ficam no próprio item
   (`DeliveryOrderItem.failure_reason`/`failure_notes`), não no comprovante;
-- o pedido muda para `delivered` quando todo item foi entregue (ou o pedido
-  não tem itens cadastrados), `delivery_failed` quando nenhum item foi
-  entregue, e `partially_delivered` quando o resultado for misto.
+- o status do pedido sai de **todos** os seus itens, não só dos conferidos
+  agora: `delivered` quando todos foram entregues, `delivery_failed` quando
+  nenhum foi. **Um resultado misto (parte entregue, parte não) nunca vira
+  `partially_delivered`**: o(s) item(ns) que faltou(aram) é(são) desmembrado(s)
+  numa nota nova, `manual_assignment` (ver
+  [Reentrega do que ficou pendente](#reentrega-do-que-ficou-pendente)), e
+  este pedido fecha como `delivered` — o que ficou nele foi mesmo entregue.
+  Pedido sem itemização segue tudo-ou-nada — o resultado da visita é o do
+  pedido.
 
 Uma falha total da parada — o entregador não conseguiu entregar nada, sem
 comprovante — continua usando `POST paradas/{id}/fail/` (sem relação com
-`items`); nesse caso todos os itens do pedido também são marcados `failed` com
-o mesmo motivo e observação da parada.
+`items`); nesse caso os itens **ainda pendentes** são marcados `failed` com o
+mesmo motivo e observação da parada. Um pedido que já tinha item entregue
+passa pelo mesmo desmembro acima (fecha `delivered`, o resto vira nota
+`manual_assignment`) em vez de `delivery_failed`.
+
+#### Reentrega do que ficou pendente
+
+Item que não sai numa visita — porque não saiu do armazém (conferência,
+`POST waves/{id}/nao-vai/`) ou porque a entrega deixou pra trás (resultado
+misto em `paradas/{id}/complete/` ou `fail/`) — não fica preso ao pedido
+original. Ele é desmembrado numa **nota nova**:
+
+- a nota filha nasce com `status = manual_assignment`, os mesmos dados de
+  cliente/endereço/agendamento/pagamento do pedido original (`split_from`
+  aponta pra ele) e só o(s) item(ns) que faltou(aram), com status resetado
+  pra `pending`;
+- `volume`/`weight`/`units` da nota filha descrevem só o que ela carrega, não
+  o pedido original inteiro;
+- o pedido original fecha como `delivered` (ou é cancelado, se **todos** os
+  itens foram desmembrados — nada dele de fato saiu) e não guarda mais
+  nenhuma pendência;
+- a nota filha conta como exceção no despacho, pra não sumir da operação, mas
+  **não** é pega pela alocação automática de wave — precisa ser roteirizada à
+  mão (`/app/entregas/roteirizacoes/nova/`), igual a qualquer pedido
+  `manual_assignment`.
+
+Na conferência de retirada (`wave_pickup`/`POST waves/{id}/nao-vai/`), marcar
+um pedido como "não vai" tem o mesmo efeito: gera a nota `manual_assignment`
+e tira o pedido da carga atual — sem essa marcação, ele fica preso esperando
+uma bipagem que não vai vir.
+
+> Antes desta versão, um resultado misto deixava o pedido inteiro em
+> `partially_delivered` e a reentrega reaproveitava a mesma nota (via
+> "Incluir pedidos com entrega falha ou parcial" na tela de criar wave). Isso
+> foi substituído pelo desmembro acima; `partially_delivered` não é mais
+> oferecido para reenfileiramento automático, só `delivery_failed`.
+
+### Transferir um pedido para outra carga
+
+Para a urgência: o veículo quebra no meio do roteiro e os pedidos que sobraram
+precisam sair hoje, quase sempre com um entregador que **já está na rua**. Por
+isso a transferência funciona mesmo com a carga de origem em rota.
+
+```http
+GET /api/v1/delivery/pedidos/81/transferir/
+Authorization: Bearer ACCESS_TOKEN
+```
+
+```json
+{
+  "order_id": 81,
+  "order_number": "PED-2026-001",
+  "status": "out_for_delivery",
+  "wave_id": 10,
+  "available_waves": [
+    {
+      "id": 12,
+      "status": "released",
+      "driver": "Carlos Souza",
+      "vehicle": "STR2A26",
+      "on_the_road": true
+    }
+  ]
+}
+```
+
+`available_waves` traz só as cargas que podem receber o pedido: da mesma conta,
+em `collecting`/`ready`/`planned`/`released`, e nunca a carga em que ele já
+está. `on_the_road` avisa que aquele entregador já saiu — o pedido entraria no
+fim do roteiro dele.
+
+Para mover, mande a carga escolhida. A resposta é o mesmo payload, já com o
+`wave_id` novo:
+
+```http
+POST /api/v1/delivery/pedidos/81/transferir/
+Authorization: Bearer ACCESS_TOKEN
+Content-Type: application/json
+
+{"wave": 12}
+```
+
+O que acontece, em ordem:
+
+1. as paradas **ainda pendentes** do pedido nas rotas em andamento são
+   canceladas — as concluídas ficam intactas, são histórico e o comprovante
+   coletado continua valendo;
+2. o vínculo com a carga antiga é apagado e um novo é criado;
+3. se a carga destino ainda não foi roteirizada, o pedido entra na fila dela;
+   se o entregador **já está na rua**, o pedido vira parada no fim do roteiro
+   dele, com `is_manual`;
+4. só o trecho restante das duas rotas é recalculado.
+
+O otimizador **não** roda de novo: nenhuma `OptimizationRun` é criada e o que
+o entregador já cumpriu não é remexido.
+
+Com `pickup_enabled` ligado, **a conferência zera**: como ela mora no vínculo
+`WaveOrder`, o pedido volta a `awaiting_pickup` e quem for levar precisa bipar
+a etiqueta. É o comportamento desejado — quem assume a carga confere o que
+está pegando.
+
+| Status | Situação |
+| --- | --- |
+| `400` | Carga não informada, de outra conta, encerrada, ou é a mesma em que o pedido já está; pedido já entregue, cancelado ou devolvido |
+| `403` | Perfil sem `delivery.change_deliverywave` |
+| `404` | Pedido fora da conta do JWT |
+
+No portal a ação fica na tela da carga, por pedido, e **continua disponível com
+a carga travada** — é justamente em rota que a urgência acontece.
 
 ### Próxima entrega: adiar uma parada
 
@@ -1202,10 +1582,9 @@ Respostas de erro:
 
 | Recurso | Ações adicionais ao CRUD |
 | --- | --- |
+| `pedidos` | `POST pedidos/import/`, `POST pedidos/{id}/geocode/`, `GET`/`POST pedidos/{id}/transferir/` |
 | `entregadores` | `POST entregadores/{id}/disponibilidade/` |
-| `waves` | `GET`/`POST waves/{id}/retirada/` para a conferência da carga |
-| `pedidos` | `POST pedidos/import/`, `POST pedidos/{id}/geocode/` |
-| `waves` | `POST waves/{id}/prepare-route/` para o dono; `optimize/`, `release/`, `close/`, `cancel/` para perfis administrativos |
+| `waves` | `GET`/`POST waves/{id}/retirada/`; `POST waves/{id}/nao-vai/` (marca um pedido da carga como não vai sair, gera nota `manual_assignment`); `POST waves/{id}/prepare-route/` para o dono; `optimize/`, `release/`, `close/`, `cancel/` para perfis administrativos |
 | `rotas` | `POST rotas/{id}/accept/`, `start/`, `release/`, `lock/`, `unlock/`, `cancel/` |
 | `paradas` | `POST paradas/{id}/arrive/`, `begin/`, `complete/`, `fail/`, `skip/` |
 | `comprovantes` | CRUD com validação de conta e parada |
@@ -1215,12 +1594,28 @@ Respostas de erro:
 
 | Modelo | Valores de `status` |
 | --- | --- |
-| Pedido | `created`, `awaiting_geocode`, `outside_delivery_area`, `waiting_wave`, `ready_for_routing`, `routing`, `awaiting_pickup`, `routed`, `released`, `out_for_delivery`, `delivered`, `partially_delivered`, `delivery_failed`, `routing_failed`, `returned`, `cancelled` |
+| Pedido | `created`, `awaiting_geocode`, `outside_delivery_area`, `waiting_wave`, `ready_for_routing`, `routing`, `awaiting_pickup`, `routed`, `released`, `out_for_delivery`, `delivered`, `partially_delivered` (legado, não é mais gerado — ver nota abaixo), `delivery_failed`, `routing_failed`, `returned`, `cancelled`, `manual_assignment` |
 | Item do pedido | `pending`, `delivered`, `failed` |
 | Entregador (`availability`) | `available`, `busy`, `offline` |
 | Wave | `collecting`, `ready`, `optimizing`, `planned`, `released`, `closed`, `cancelled`, `failed`, `completed`, `partially_completed` |
 | Rota | `planned`, `released`, `accepted`, `started`, `completed`, `partially_completed`, `cancelled`, `superseded` |
 | Parada | `planned`, `approaching`, `arrived`, `delivering`, `completed`, `failed`, `skipped`, `cancelled` |
+
+> **`awaiting_pickup` é o pedido esperando ser retirado do armazém.** O que
+> `pickup_enabled` muda é *como* essa retirada acontece: com a conferência
+> desligada, é só pegar e ir; com ela ligada, é preciso bipar a etiqueta.
+> Nesse caso o pedido entra na carga já em `awaiting_pickup` e só volta para
+> `ready_for_routing` quando o código é lido — e a wave não roteiriza
+> enquanto sobrar pedido para conferir.
+
+> **`manual_assignment` é uma nota nascida de um desmembro** (`split_from`
+> aponta pro pedido original) — item que não saiu na conferência ou que
+> voltou de uma entrega parcial. Nunca é pego pela alocação automática de
+> wave (`allocate_orders` só busca `waiting_wave`); precisa ser roteirizado
+> à mão em `/app/entregas/roteirizacoes/nova/` ou via `create_manual_waves`.
+> `partially_delivered` é mantido no schema só por compatibilidade com dados
+> antigos — o fluxo atual nunca deixa um pedido nesse status (ver
+> [Reentrega do que ficou pendente](#reentrega-do-que-ficou-pendente)).
 
 ### Fluxo administrativo
 
@@ -1237,6 +1632,12 @@ Respostas de erro:
 
 Waves também aceitam `POST .../{id}/cancel/`. Rotas administrativas aceitam
 `release`, `lock`, `unlock` e `cancel` no mesmo padrão de URL.
+
+Fora desse fluxo automático, o portal permite montar uma carga à mão em
+`/app/entregas/waves/nova-manual/`, escolhendo o entregador e marcando os
+pedidos numa tela só. E qualquer pedido pode mudar de carga a qualquer momento
+com [`pedidos/{id}/transferir/`](#transferir-um-pedido-para-outra-carga),
+inclusive com a carga de origem já em rota.
 
 ### Fluxo do entregador
 
@@ -1321,3 +1722,36 @@ curl http://localhost:8000/api/v1/veiculos/ \
 
 Percorra `next` até que seu valor seja `null`. Quando o access expirar, renove-o
 com o refresh; quando precisar mudar de conta, repita o login.
+
+## 9. Changelog
+
+A API continua em `/api/v1/` — as mudanças abaixo são aditivas, exceto onde
+marcado como breaking change.
+
+**2026-08-26**
+
+- ⚠️ **Breaking**: `DeliveryOrder.priority` estreitou de `0..100` para
+  `-2..1`. Valor fora da faixa responde `400` na criação/importação. Dados
+  existentes foram reamassados numa migration (`> 0` virou `1`). Passa a
+  valer também como regra rígida de ordenação das paradas dentro de uma rota
+  (prioridade maior sempre primeiro, dentro do que o otimizador já calculou).
+- Novos campos opcionais em `DeliveryOrder`: `payment_method` (`cash`,
+  `card`, `pix`, `to_arrange`) e `payment_value` (decimal).
+- Novo status de pedido `manual_assignment` e campo `split_from`
+  (somente leitura): resultado misto numa parada, ou item marcado "não vai"
+  na conferência, desmembra o que faltou numa nota nova nesse status, fora
+  da alocação automática — o pedido original fecha `delivered`. Substitui o
+  fluxo antigo de `partially_delivered` (mantido só por compatibilidade com
+  dados anteriores a esta versão). Ver
+  [Reentrega do que ficou pendente](#reentrega-do-que-ficou-pendente).
+- Novo recurso `DeliveryAreaDriver` (`/api/v1/delivery/area-entregadores/`):
+  prioridade de entregador por área, usada no fallback da alocação
+  automática. Ver [Prioridade de entregador por área](#prioridade-de-entregador-por-área-deliveryareadriver).
+- Nova ação `POST /api/v1/delivery/waves/{id}/nao-vai/`
+  (`{"order_id": <id>}`): marca um pedido da carga como não vai sair,
+  equivalente à ação "não vai" da conferência no portal.
+- `availability = offline` do entregador passou a bloquear a alocação
+  automática de carga (antes só turno e rota ativa bloqueavam — ver
+  [Turno e disponibilidade do entregador](#turno-e-disponibilidade-do-entregador)).
+- `DeliveryArea.geometry` passou a aceitar `MultiPolygon`, além de `Polygon`
+  (o editor de área no portal ganhou união/recorte de formas desenhadas).

@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 
-import '../../../core/config/app_config.dart';
-import '../../../core/network/api_client.dart';
-import '../../../core/storage/session_storage.dart';
+import '../../../app/app_dependencies.dart';
 import '../../delivery/view/delivery_page.dart';
+import '../../waves/data/delivery_photo_recovery.dart';
+import '../../waves/view/delivery_completion_page.dart';
 import '../data/auth_service.dart';
 import 'login_page.dart';
 
@@ -15,30 +15,29 @@ class AuthGate extends StatefulWidget {
 }
 
 class _AuthGateState extends State<AuthGate> {
-  late final Future<bool> _session;
+  late final Future<_AuthBootstrap> _session;
 
   @override
   void initState() {
     super.initState();
-    const storage = SessionStorage();
-    final authService = AuthService(
-      apiClient: ApiClient(baseUrl: AppConfig.backendUrl, storage: storage),
-      storage: storage,
-    );
-    _session = _restoreSafely(authService);
+    _session = _restoreSafely(AppDependencies.instance.auth);
   }
 
-  Future<bool> _restoreSafely(AuthService authService) async {
+  Future<_AuthBootstrap> _restoreSafely(AuthService authService) async {
     try {
-      return await authService.restoreSession();
+      final loggedIn = await authService.restoreSession();
+      final recovery = await DeliveryPhotoRecovery(
+        AppDependencies.instance.storage,
+      ).recoverLostCapture();
+      return _AuthBootstrap(loggedIn: loggedIn, recovery: recovery);
     } catch (_) {
-      return false;
+      return const _AuthBootstrap(loggedIn: false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<bool>(
+    return FutureBuilder<_AuthBootstrap>(
       future: _session,
       builder: (context, snapshot) {
         if (snapshot.connectionState != ConnectionState.done) {
@@ -49,8 +48,74 @@ class _AuthGateState extends State<AuthGate> {
             ),
           );
         }
-        return snapshot.data == true ? const DeliveryPage() : const LoginPage();
+        final bootstrap = snapshot.data;
+        if (bootstrap?.loggedIn != true) return const LoginPage();
+        final recovery = bootstrap?.recovery;
+        return recovery == null
+            ? const DeliveryPage()
+            : _RecoveredDeliveryLauncher(capture: recovery);
       },
     );
   }
+}
+
+class _AuthBootstrap {
+  const _AuthBootstrap({required this.loggedIn, this.recovery});
+
+  final bool loggedIn;
+  final RecoveredDeliveryCapture? recovery;
+}
+
+class _RecoveredDeliveryLauncher extends StatefulWidget {
+  const _RecoveredDeliveryLauncher({required this.capture});
+
+  final RecoveredDeliveryCapture capture;
+
+  @override
+  State<_RecoveredDeliveryLauncher> createState() =>
+      _RecoveredDeliveryLauncherState();
+}
+
+class _RecoveredDeliveryLauncherState
+    extends State<_RecoveredDeliveryLauncher> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _openRecovery());
+  }
+
+  Future<void> _openRecovery() async {
+    final dependencies = AppDependencies.instance;
+    try {
+      final route = await dependencies.activeRoutes.getRoute(
+        widget.capture.draft.routeId,
+      );
+      final stop = route.stops.firstWhere(
+        (item) => item.stopId == widget.capture.draft.stopId,
+      );
+      if (!mounted) return;
+      await Navigator.of(context).push<bool>(
+        MaterialPageRoute<bool>(
+          builder: (_) => DeliveryCompletionPage(
+            routeId: route.routeId,
+            stop: stop,
+            service: dependencies.activeRoutes,
+            recoveredCapture: widget.capture,
+          ),
+        ),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'A foto foi recuperada, mas a entrega nao pode ser carregada agora.',
+          ),
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => const DeliveryPage();
 }

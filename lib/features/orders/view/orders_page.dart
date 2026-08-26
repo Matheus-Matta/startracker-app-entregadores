@@ -1,15 +1,18 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
-import '../../../core/config/app_config.dart';
-import '../../../core/network/api_client.dart';
+import '../../../app/app_dependencies.dart';
+import '../../../core/async/debouncer.dart';
 import '../../../core/network/paged_result.dart';
-import '../../../core/storage/session_storage.dart';
+import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../data/order_service.dart';
 import 'order_detail_page.dart';
 
 class OrdersPage extends StatefulWidget {
-  const OrdersPage({this.onOpenHome, super.key});
+  const OrdersPage({this.isActive = true, this.onOpenHome, super.key});
 
+  final bool isActive;
   final VoidCallback? onOpenHome;
 
   @override
@@ -22,13 +25,18 @@ class _OrdersPageState extends State<OrdersPage> {
   late Future<PagedResult<OrderListItem>> _result;
   int _page = 1;
   String _status = '';
+  StreamSubscription<FleetRealtimeEvent>? _realtimeSubscription;
+  final Debouncer _realtimeDebouncer = Debouncer(
+    const Duration(milliseconds: 250),
+  );
+  bool _realtimeDirty = false;
 
   static const statuses = <String, String>{
     '': 'Todos os status',
     'created': 'Criado',
     'awaiting_geocode': 'Aguardando geocodificação',
     'outside_delivery_area': 'Fora da área',
-    'waiting_wave': 'Aguardando wave',
+    'waiting_wave': 'Aguardando carga',
     'ready_for_routing': 'Pronto para roteirização',
     'routing': 'Roteirizando',
     'awaiting_pickup': 'Aguardando retirada',
@@ -41,20 +49,37 @@ class _OrdersPageState extends State<OrdersPage> {
     'routing_failed': 'Falha na roteirização',
     'returned': 'Devolvido',
     'cancelled': 'Cancelado',
+    'manual_assignment': 'Roteirização manual',
   };
 
   @override
   void initState() {
     super.initState();
-    const storage = SessionStorage();
-    _service = OrderService(
-      ApiClient(baseUrl: AppConfig.backendUrl, storage: storage),
-    );
+    _service = AppDependencies.instance.orders;
     _result = _load();
+    _realtimeSubscription = FleetRealtimeChannel.instance.events.listen((
+      event,
+    ) {
+      if (event.isConnected || event.isOrderChange) {
+        _service.invalidateCache();
+        _realtimeDirty = true;
+        if (widget.isActive) _scheduleRealtimeReload();
+      }
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant OrdersPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!oldWidget.isActive && widget.isActive && _realtimeDirty) {
+      _scheduleRealtimeReload();
+    }
   }
 
   @override
   void dispose() {
+    _realtimeDebouncer.dispose();
+    _realtimeSubscription?.cancel();
     _searchController.dispose();
     super.dispose();
   }
@@ -65,12 +90,31 @@ class _OrdersPageState extends State<OrdersPage> {
     status: _status,
   );
 
-  void _reload({bool firstPage = false}) {
+  void _scheduleRealtimeReload() {
+    _realtimeDebouncer.run(() {
+      if (!mounted || !widget.isActive || !_realtimeDirty) return;
+      _realtimeDirty = false;
+      unawaited(_reload());
+    });
+  }
+
+  Future<void> _reload({bool firstPage = false, bool refresh = false}) async {
     if (firstPage) _page = 1;
-    final nextResult = _load();
+    if (refresh) _service.invalidateCache();
+    final nextResult = _service.getOrders(
+      page: _page,
+      search: _searchController.text,
+      status: _status,
+      refresh: refresh,
+    );
     setState(() {
       _result = nextResult;
     });
+    try {
+      await nextResult;
+    } catch (_) {
+      // O FutureBuilder apresenta o erro e mantém a ação de tentar novamente.
+    }
   }
 
   Future<void> _openDetails(OrderListItem order) async {
@@ -81,7 +125,7 @@ class _OrdersPageState extends State<OrdersPage> {
       ),
     );
     if (!mounted) return;
-    _reload();
+    await _reload();
     if (openHome == true) widget.onOpenHome?.call();
   }
 
@@ -151,12 +195,12 @@ class _OrdersPageState extends State<OrdersPage> {
                 return _OrdersMessage(
                   icon: Icons.cloud_off_rounded,
                   title: 'Não foi possível carregar os pedidos',
-                  onRetry: _reload,
+                  onRetry: () => _reload(refresh: true),
                 );
               }
               final result = snapshot.data!;
               return RefreshIndicator(
-                onRefresh: () async => _reload(),
+                onRefresh: () => _reload(refresh: true),
                 child: ListView(
                   physics: const AlwaysScrollableScrollPhysics(),
                   padding: const EdgeInsets.fromLTRB(18, 4, 18, 28),

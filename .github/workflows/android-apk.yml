@@ -1,0 +1,148 @@
+name: Android APK por tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: Gerar APK ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      BACKEND_URL: ${{ vars.BACKEND_URL || 'https://tracker.star.dev.br' }}
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+
+    steps:
+      - name: Baixar codigo
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Configurar Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.4'
+          channel: stable
+          cache: true
+
+      - name: Interpretar versao da tag
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(\+([0-9]+)|-build([0-9]+))?$ ]]; then
+            build_name="${BASH_REMATCH[1]}"
+            build_number="${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+          else
+            echo "Tag invalida: $GITHUB_REF_NAME"
+            echo "Use v1.2.3, v1.2.3+45 ou v1.2.3-build45."
+            exit 1
+          fi
+          if [[ -z "$build_number" ]]; then
+            build_number="$GITHUB_RUN_NUMBER"
+          fi
+          safe_tag="$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9._-' '-')"
+          echo "BUILD_NAME=$build_name" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
+          echo "APK_NAME=StarTracker-Entregas-$safe_tag.apk" >> "$GITHUB_ENV"
+
+      - name: Criar configuracao de producao
+        shell: bash
+        run: |
+          {
+            echo "BACKEND_URL=$BACKEND_URL"
+            echo "NOTIFICATIONS_ENABLED=true"
+            echo "FLEET_WEBSOCKET_PATH=/ws/mobile/fleet/"
+            echo "NOTIFICATIONS_WEBSOCKET_PATH=/ws/mobile/notifications/"
+            echo "NOTIFICATION_CHANNEL_ID=star_tracker_delivery_updates"
+            echo "NOTIFICATION_CHANNEL_NAME=Atualizacoes de entrega"
+            echo "NOTIFICATION_CHANNEL_DESCRIPTION=Novas cargas e alteracoes de pedidos e rotas"
+          } > .env.prod
+
+      - name: Configurar assinatura
+        shell: bash
+        run: |
+          if [[ -n "$ANDROID_KEYSTORE_BASE64" && -n "$ANDROID_KEY_ALIAS" && -n "$ANDROID_KEY_PASSWORD" && -n "$ANDROID_STORE_PASSWORD" ]]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/upload-keystore.jks
+            {
+              echo "storePassword=$ANDROID_STORE_PASSWORD"
+              echo "keyPassword=$ANDROID_KEY_PASSWORD"
+              echo "keyAlias=$ANDROID_KEY_ALIAS"
+              echo "storeFile=upload-keystore.jks"
+            } > android/key.properties
+            echo "BUILD_VARIANT=release" >> "$GITHUB_ENV"
+            echo "APK_SOURCE=build/app/outputs/flutter-apk/app-release.apk" >> "$GITHUB_ENV"
+          else
+            echo "Chave de release ausente; sera gerado um APK demo assinado pelo Android Debug."
+            echo "BUILD_VARIANT=debug" >> "$GITHUB_ENV"
+            echo "APK_SOURCE=build/app/outputs/flutter-apk/app-debug.apk" >> "$GITHUB_ENV"
+          fi
+
+      - name: Instalar dependencias
+        run: flutter pub get
+
+      - name: Analisar codigo
+        run: flutter analyze
+
+      - name: Executar testes
+        run: flutter test
+
+      - name: Gerar APK
+        shell: bash
+        run: |
+          flutter build apk \
+            --$BUILD_VARIANT \
+            --build-name="$BUILD_NAME" \
+            --build-number="$BUILD_NUMBER" \
+            --dart-define-from-file=.env.prod
+
+      - name: Preparar artefato
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "$APK_SOURCE" "dist/$APK_NAME"
+          cd dist
+          sha256sum "$APK_NAME" > "$APK_NAME.sha256"
+          echo "### APK Android" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag: \`$GITHUB_REF_NAME\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Versao: \`$BUILD_NAME+$BUILD_NUMBER\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Variante: \`$BUILD_VARIANT\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Arquivo: \`$APK_NAME\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enviar artefato do workflow
+        uses: actions/upload-artifact@v7
+        with:
+          name: apk-${{ github.ref_name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publicar no GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: StarTracker Entregas ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
+
+      - name: Remover arquivos de assinatura
+        if: always()
+        shell: bash
+        run: rm -f android/key.properties android/upload-keystore.jks

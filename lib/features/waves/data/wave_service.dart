@@ -1,7 +1,16 @@
 import 'package:dio/dio.dart';
 
+import '../../../core/network/api_collection.dart';
 import '../../../core/network/api_client.dart';
+import '../../../core/network/offline_request_queue.dart';
 import '../../../core/network/paged_result.dart';
+import '../../../core/presentation/delivery_terminology.dart';
+import 'pickup_label_scope.dart';
+
+/// Normaliza um codigo de etiqueta do mesmo jeito que a API compara: sem
+/// espacos e sem diferenca entre maiusculas e minusculas.
+String normalizePickupCode(String code) =>
+    code.trim().toUpperCase().replaceAll(RegExp(r'\s+'), '');
 
 class WaveListItem {
   const WaveListItem({
@@ -97,6 +106,46 @@ class PickupProgress {
   final int pending;
   final bool isComplete;
   final List<PickupOrder> orders;
+
+  int get totalVolumes =>
+      orders.fold(0, (total, order) => total + order.totalVolumes);
+
+  int get scannedVolumes =>
+      orders.fold(0, (total, order) => total + order.scannedVolumes);
+
+  int get pendingVolumes => totalVolumes - scannedVolumes;
+}
+
+class PickupCode {
+  const PickupCode({required this.code, required this.scannedAt});
+
+  final String code;
+  final DateTime? scannedAt;
+
+  bool get isScanned => scannedAt != null;
+}
+
+/// Faixa de volumes que pertence a um item do pedido.
+///
+/// As etiquetas chegam em uma lista plana, na mesma ordem dos itens e dos
+/// volumes de cada item; a faixa e o que permite conferir um item inteiro a
+/// partir de uma unica leitura.
+class PickupItemGroup {
+  const PickupItemGroup({
+    required this.id,
+    required this.name,
+    required this.firstVolumeIndex,
+    required this.volumeCount,
+  });
+
+  final int id;
+  final String name;
+  final int firstVolumeIndex;
+  final int volumeCount;
+
+  bool covers(int volumeIndex) =>
+      volumeIndex >= firstVolumeIndex &&
+      volumeIndex < firstVolumeIndex + volumeCount;
 }
 
 class PickupOrder {
@@ -104,17 +153,69 @@ class PickupOrder {
     required this.orderId,
     required this.orderNumber,
     required this.customer,
-    required this.code,
+    required this.codes,
     required this.pickedUpAt,
+    this.items = const [],
   });
 
   final int orderId;
   final String orderNumber;
   final String customer;
-  final String code;
+  final List<PickupCode> codes;
   final DateTime? pickedUpAt;
+  final List<PickupItemGroup> items;
 
   bool get isPickedUp => pickedUpAt != null;
+
+  int get totalVolumes => codes.isEmpty ? 1 : codes.length;
+
+  int get scannedVolumes => codes.isEmpty
+      ? (isPickedUp ? 1 : 0)
+      : codes.where((code) => code.isScanned).length;
+
+  int get pendingVolumes => totalVolumes - scannedVolumes;
+
+  /// Codigos que uma unica leitura confirma no escopo de etiqueta escolhido.
+  ///
+  /// O primeiro elemento e sempre a etiqueta lida — e dela que sai o retorno
+  /// exibido ao entregador. Os demais sao os volumes ainda pendentes cobertos
+  /// pela mesma etiqueta.
+  List<String> codesForScan(String scannedCode, PickupLabelScope scope) {
+    final key = normalizePickupCode(scannedCode);
+    var index = -1;
+    for (var position = 0; position < codes.length; position++) {
+      if (normalizePickupCode(codes[position].code) == key) {
+        index = position;
+        break;
+      }
+    }
+    if (index < 0) return [scannedCode.trim()];
+    if (scope == PickupLabelScope.volume) return [codes[index].code];
+
+    var start = 0;
+    var end = codes.length;
+    if (scope == PickupLabelScope.item) {
+      final group = _itemAt(index);
+      // Sem itemizacao conhecida, a leitura vale so pelo volume lido.
+      if (group == null) return [codes[index].code];
+      start = group.firstVolumeIndex;
+      end = (group.firstVolumeIndex + group.volumeCount).clamp(0, codes.length);
+    }
+
+    final covered = <String>[codes[index].code];
+    for (var position = start; position < end; position++) {
+      if (position == index || codes[position].isScanned) continue;
+      covered.add(codes[position].code);
+    }
+    return covered;
+  }
+
+  PickupItemGroup? _itemAt(int volumeIndex) {
+    for (final item in items) {
+      if (item.covers(volumeIndex)) return item;
+    }
+    return null;
+  }
 }
 
 class WaveOrderItem {
@@ -153,18 +254,33 @@ class WaveServiceException implements Exception {
   final String message;
 }
 
+class _WaveListSnapshot {
+  const _WaveListSnapshot(this.createdAt, this.routes, this.waves);
+
+  final DateTime createdAt;
+  final List<Map<String, dynamic>> routes;
+  final List<Map<String, dynamic>> waves;
+}
+
 class WaveService {
-  const WaveService(this.apiClient);
+  WaveService(this.apiClient);
   final ApiClient apiClient;
+  static const _listCacheDuration = Duration(seconds: 30);
+  _WaveListSnapshot? _listCache;
+  Future<_WaveListSnapshot>? _listOperation;
+  int? _listOperationGeneration;
+  int _listCacheGeneration = 0;
 
   Future<PagedResult<WaveListItem>> getWaves({
     required int page,
     String search = '',
     String status = '',
+    bool refresh = false,
   }) async {
     const pageSize = 20;
-    final routes = await _getAll('/api/v1/delivery/rotas/');
-    final waves = await _getWavesAllowed();
+    final snapshot = await _getListSnapshot(refresh: refresh);
+    final routes = List<Map<String, dynamic>>.from(snapshot.routes);
+    final waves = List<Map<String, dynamic>>.from(snapshot.waves);
     final query = search.trim().toLowerCase();
     final items = <WaveListItem>[];
 
@@ -232,6 +348,46 @@ class WaveService {
     );
   }
 
+  void invalidateCache() {
+    _listCacheGeneration++;
+    _listCache = null;
+  }
+
+  Future<_WaveListSnapshot> _getListSnapshot({required bool refresh}) async {
+    final cached = _listCache;
+    if (!refresh &&
+        cached != null &&
+        DateTime.now().difference(cached.createdAt) < _listCacheDuration) {
+      return cached;
+    }
+    final ongoing = _listOperation;
+    if (ongoing != null && _listOperationGeneration == _listCacheGeneration) {
+      return ongoing;
+    }
+    final generation = _listCacheGeneration;
+    final operation = _loadListSnapshot();
+    _listOperation = operation;
+    _listOperationGeneration = generation;
+    try {
+      final snapshot = await operation;
+      if (generation == _listCacheGeneration) _listCache = snapshot;
+      return snapshot;
+    } finally {
+      if (identical(_listOperation, operation)) {
+        _listOperation = null;
+        _listOperationGeneration = null;
+      }
+    }
+  }
+
+  Future<_WaveListSnapshot> _loadListSnapshot() async {
+    final results = await Future.wait([
+      _getAll('/api/v1/delivery/rotas/'),
+      _getWavesAllowed(),
+    ]);
+    return _WaveListSnapshot(DateTime.now(), results[0], results[1]);
+  }
+
   Future<List<Map<String, dynamic>>> _getWavesAllowed() async {
     try {
       return await _getAll('/api/v1/delivery/waves/');
@@ -251,26 +407,14 @@ class WaveService {
   ) {
     final routeId = _asInt(route?['id']);
     final waveStatus = wave['status']?.toString() ?? '';
-    final routeStatus = route?['status']?.toString();
-    const waveOwnedStatuses = {
-      'collecting',
-      'ready',
-      'optimizing',
-      'failed',
-      'closed',
-      'cancelled',
-      'completed',
-      'partially_completed',
-    };
-    final displayStatus = waveOwnedStatuses.contains(waveStatus)
-        ? waveStatus
-        : routeStatus ?? waveStatus;
+    final routeStatus = route?['status']?.toString() ?? '';
+    final displayStatus = WaveService.displayStatus(waveStatus, routeStatus);
     final routeNumber = route?['route_number']?.toString() ?? '';
     return WaveListItem(
       waveId: waveId,
       routeId: routeId,
       routeNumber: routeId == null
-          ? 'Aguardando roteirização'
+          ? 'Aguardando retirada'
           : routeNumber.isEmpty
           ? 'Rota #$routeId'
           : routeNumber,
@@ -301,6 +445,28 @@ class WaveService {
     return query.isEmpty ||
         item.routeNumber.toLowerCase().contains(query) ||
         item.waveId.toString().contains(query);
+  }
+
+  static String displayStatus(String waveStatus, String routeStatus) {
+    // A rota em andamento prevalece sobre um status defasado da wave. Isso
+    // permite retomar o mapa mesmo quando uma transferencia adiciona uma nova
+    // retirada pendente durante a execucao.
+    if (routeStatus == 'started') return routeStatus;
+
+    const waveOwnedStatuses = {
+      'collecting',
+      'ready',
+      'optimizing',
+      'failed',
+      'closed',
+      'cancelled',
+      'completed',
+      'partially_completed',
+    };
+    if (waveOwnedStatuses.contains(waveStatus) || routeStatus.isEmpty) {
+      return waveStatus;
+    }
+    return routeStatus;
   }
 
   DateTime? _waveDate(Map<String, dynamic> wave) => DateTime.tryParse(
@@ -453,10 +619,10 @@ class WaveService {
       waveId: _asInt(route['wave']) ?? wave.waveId,
       routeId: _asInt(route['id']) ?? wave.routeId,
       routeNumber: route['route_number']?.toString() ?? wave.routeNumber,
-      status:
-          waveData['status']?.toString() ??
-          route['status']?.toString() ??
-          wave.status,
+      status: WaveService.displayStatus(
+        waveData['status']?.toString() ?? wave.status,
+        route['status']?.toString() ?? '',
+      ),
       plannedDistanceMeters:
           _asInt(route['planned_distance']) ?? wave.plannedDistanceMeters,
       plannedDurationSeconds: _asInt(route['planned_duration']) ?? 0,
@@ -474,7 +640,9 @@ class WaveService {
       final response = await apiClient.dio.get<dynamic>(
         '/api/v1/delivery/waves/$waveId/retirada/',
       );
-      return _pickupProgress(response.data, waveId);
+      return _withWaveOrders(
+        WaveService.parsePickupProgress(response.data, waveId),
+      );
     } on DioException catch (error) {
       if (error.response?.statusCode == 404 ||
           error.response?.statusCode == 405) {
@@ -487,14 +655,96 @@ class WaveService {
   Future<PickupProgress> registerPickup({
     required int waveId,
     required String code,
+    PickupProgress? optimisticProgress,
+  }) => registerPickupCodes(
+    waveId: waveId,
+    codes: [code],
+    optimisticProgress: optimisticProgress,
+  );
+
+  /// Confere uma etiqueta que pode cobrir mais de um volume.
+  ///
+  /// A API aceita um codigo por chamada, entao o escopo de item ou de pedido
+  /// vira uma sequencia de chamadas. So a primeira — a etiqueta que o
+  /// entregador leu — propaga erro: um volume adicional recusado (ja lido ou
+  /// removido da carga) nao invalida a leitura inteira.
+  Future<PickupProgress> registerPickupCodes({
+    required int waveId,
+    required List<String> codes,
+    PickupProgress? optimisticProgress,
+  }) async {
+    final pendingCodes = codes
+        .map((code) => code.trim())
+        .where((code) => code.isNotEmpty)
+        .toList();
+    if (pendingCodes.isEmpty) {
+      throw const WaveServiceException('Informe ou leia um código válido.');
+    }
+    try {
+      final result = await apiClient.offlineRequests.execute<PickupProgress>(
+        resourceKey: 'pickup:$waveId',
+        description: 'Conferir retirada',
+        operation: (key) async {
+          dynamic lastPayload;
+          for (var index = 0; index < pendingCodes.length; index++) {
+            try {
+              final response = await apiClient.dio.post<dynamic>(
+                '/api/v1/delivery/waves/$waveId/retirada/',
+                data: {'code': pendingCodes[index]},
+                options: apiClient.offlineRequests.requestOptions(
+                  key,
+                  step: pendingCodes.length == 1 ? null : 'code-$index',
+                ),
+              );
+              lastPayload = response.data;
+            } on DioException catch (error) {
+              if (index == 0 || OfflineRequestQueue.isNetworkFailure(error)) {
+                rethrow;
+              }
+            }
+          }
+          invalidateCache();
+          return _withWaveOrders(
+            WaveService.parsePickupProgress(lastPayload, waveId),
+          );
+        },
+      );
+      final progress = result.value ?? optimisticProgress;
+      if (progress != null) return progress;
+      throw const WaveServiceException(
+        'A retirada foi salva para envio quando a conexão voltar.',
+      );
+    } on DioException catch (error) {
+      throw WaveServiceException(_errorMessage(error));
+    }
+  }
+
+  /// Marca um pedido da carga como "não vai".
+  ///
+  /// A API tira o pedido desta carga e desmembra o que ficou numa nota nova em
+  /// `manual_assignment`, liberando a roteirização do restante.
+  Future<PickupProgress> markOrderNotGoing({
+    required int waveId,
+    required int orderId,
   }) async {
     try {
       final response = await apiClient.dio.post<dynamic>(
-        '/api/v1/delivery/waves/$waveId/retirada/',
-        data: {'code': code.trim()},
+        '/api/v1/delivery/waves/$waveId/nao-vai/',
+        data: {'order_id': orderId},
       );
-      return _pickupProgress(response.data, waveId);
+      invalidateCache();
+      final data = response.data;
+      if (data is Map && data['orders'] is List) {
+        return _withWaveOrders(WaveService.parsePickupProgress(data, waveId));
+      }
+      return getPickupProgress(waveId);
     } on DioException catch (error) {
+      if (OfflineRequestQueue.isNetworkFailure(error)) {
+        throw const WaveServiceException(
+          'Sem conexão. Marcar "não vai" precisa de internet para gerar a '
+          'nova nota do pedido.',
+        );
+      }
       throw WaveServiceException(_errorMessage(error));
     }
   }
@@ -534,11 +784,34 @@ class WaveService {
     return _asInt(value);
   }
 
-  Future<WaveListItem> optimizeAndRelease(WaveListItem wave) async {
+  Future<OfflineMutationResult<WaveListItem>> optimizeAndRelease(
+    WaveListItem wave,
+  ) async {
+    try {
+      return await apiClient.offlineRequests.execute<WaveListItem>(
+        resourceKey: 'wave:${wave.waveId}',
+        description: 'Preparar rota da carga',
+        operation: (key) => _optimizeAndReleaseRequest(wave, key),
+      );
+    } on WaveServiceException {
+      rethrow;
+    } on DioException catch (error) {
+      throw WaveServiceException(_errorMessage(error));
+    }
+  }
+
+  Future<WaveListItem> _optimizeAndReleaseRequest(
+    WaveListItem wave,
+    String idempotencyKey,
+  ) async {
     try {
       try {
         await apiClient.dio.post<dynamic>(
           '/api/v1/delivery/waves/${wave.waveId}/prepare-route/',
+          options: apiClient.offlineRequests.requestOptions(
+            idempotencyKey,
+            step: 'prepare',
+          ),
         );
       } on DioException catch (error) {
         if (error.response?.statusCode != 404 &&
@@ -548,11 +821,20 @@ class WaveService {
         // Compatibilidade temporária com o contrato administrativo anterior.
         await apiClient.dio.post<dynamic>(
           '/api/v1/delivery/waves/${wave.waveId}/optimize/',
+          options: apiClient.offlineRequests.requestOptions(
+            idempotencyKey,
+            step: 'optimize',
+          ),
         );
         await apiClient.dio.post<dynamic>(
           '/api/v1/delivery/waves/${wave.waveId}/release/',
+          options: apiClient.offlineRequests.requestOptions(
+            idempotencyKey,
+            step: 'release',
+          ),
         );
       }
+      invalidateCache();
       final routes = await _getAll('/api/v1/delivery/rotas/');
       final matching =
           routes.where((route) => _asInt(route['wave']) == wave.waveId).toList()
@@ -563,7 +845,7 @@ class WaveService {
             );
       if (matching.isEmpty) {
         throw const WaveServiceException(
-          'A roteirização terminou sem criar uma rota para esta wave.',
+          'A roteirização terminou sem criar uma rota para esta carga.',
         );
       }
       final route = matching.first;
@@ -581,16 +863,25 @@ class WaveService {
       );
     } on WaveServiceException {
       rethrow;
-    } on DioException catch (error) {
-      throw WaveServiceException(_errorMessage(error));
+    } on DioException {
+      rethrow;
     }
   }
 
-  Future<void> startRoute(int routeId) async {
+  Future<OfflineMutationResult<void>> startRoute(int routeId) async {
     try {
-      await apiClient.dio.post<dynamic>(
-        '/api/v1/delivery/rotas/$routeId/start/',
+      final result = await apiClient.offlineRequests.execute<void>(
+        resourceKey: 'route:$routeId',
+        description: 'Iniciar rota',
+        operation: (key) async {
+          await apiClient.dio.post<dynamic>(
+            '/api/v1/delivery/rotas/$routeId/start/',
+            options: apiClient.offlineRequests.requestOptions(key),
+          );
+        },
       );
+      invalidateCache();
+      return result;
     } on DioException catch (error) {
       throw WaveServiceException(_errorMessage(error));
     }
@@ -599,42 +890,55 @@ class WaveService {
   Future<List<Map<String, dynamic>>> _getAll(
     String path, {
     Map<String, dynamic>? queryParameters,
-  }) async {
-    final items = <Map<String, dynamic>>[];
-    var page = 1;
-
-    while (page <= 100) {
-      final response = await apiClient.dio.get<dynamic>(
-        path,
-        queryParameters: {...?queryParameters, 'page': page},
-      );
-      final data = response.data;
-      final rawItems = data is Map ? data['results'] : data;
-      if (rawItems is List) {
-        items.addAll(
-          rawItems.whereType<Map>().map(
-            (item) => Map<String, dynamic>.from(item),
-          ),
-        );
-      }
-      if (data is! Map || data['next'] == null) break;
-      page++;
-    }
-    return items;
-  }
+  }) => apiClient.getAllPages(path, queryParameters: queryParameters);
 
   String _errorMessage(DioException error) {
     final data = error.response?.data;
-    if (data is List && data.isNotEmpty) return data.first.toString();
+    if (data is List && data.isNotEmpty) {
+      return useDeliveryTerminology(data.first.toString());
+    }
     if (data is Map) {
       final detail = data['detail'] ?? data['non_field_errors'];
-      if (detail is String && detail.isNotEmpty) return detail;
-      if (detail is List && detail.isNotEmpty) return detail.first.toString();
+      if (detail is String && detail.isNotEmpty) {
+        return useDeliveryTerminology(detail);
+      }
+      if (detail is List && detail.isNotEmpty) {
+        return useDeliveryTerminology(detail.first.toString());
+      }
     }
     return 'Não foi possível concluir a operação. Tente novamente.';
   }
 
-  PickupProgress _pickupProgress(dynamic raw, int fallbackWaveId) {
+  /// Converte os itens de um pedido em faixas de volumes.
+  ///
+  /// Devolve vazio quando a soma dos volumes dos itens nao bate com a lista de
+  /// etiquetas: sem essa correspondencia nao da pra dizer qual etiqueta e de
+  /// qual item, e o escopo por item cai de volta para o volume lido.
+  static List<PickupItemGroup> parsePickupItems(dynamic raw, int codeCount) {
+    if (raw is! List) return const [];
+    final groups = <PickupItemGroup>[];
+    var offset = 0;
+    for (final rawItem in raw.whereType<Map>()) {
+      final item = Map<String, dynamic>.from(rawItem);
+      final rawVolumes = item['volumes'];
+      final volumeCount = rawVolumes is List
+          ? rawVolumes.length
+          : _asInt(item['units']) ?? 0;
+      if (volumeCount <= 0) continue;
+      groups.add(
+        PickupItemGroup(
+          id: _asInt(item['id']) ?? 0,
+          name: item['name']?.toString() ?? 'Item ${groups.length + 1}',
+          firstVolumeIndex: offset,
+          volumeCount: volumeCount,
+        ),
+      );
+      offset += volumeCount;
+    }
+    return offset == codeCount ? groups : const [];
+  }
+
+  static PickupProgress parsePickupProgress(dynamic raw, int fallbackWaveId) {
     final data = raw is Map
         ? Map<String, dynamic>.from(raw)
         : const <String, dynamic>{};
@@ -643,15 +947,48 @@ class WaveService {
     if (rawOrders is List) {
       for (final rawOrder in rawOrders.whereType<Map>()) {
         final order = Map<String, dynamic>.from(rawOrder);
+        final pickedUpAt = DateTime.tryParse(
+          order['picked_up_at']?.toString() ?? '',
+        );
+        final codes = <PickupCode>[];
+        final rawCodes = order['codes'];
+        if (rawCodes is List) {
+          for (final rawCode in rawCodes) {
+            if (rawCode is Map) {
+              final codeData = Map<String, dynamic>.from(rawCode);
+              final code = codeData['code']?.toString().trim() ?? '';
+              if (code.isEmpty) continue;
+              codes.add(
+                PickupCode(
+                  code: code,
+                  scannedAt: DateTime.tryParse(
+                    codeData['scanned_at']?.toString() ?? '',
+                  ),
+                ),
+              );
+            } else {
+              final code = rawCode?.toString().trim() ?? '';
+              if (code.isNotEmpty) {
+                codes.add(PickupCode(code: code, scannedAt: pickedUpAt));
+              }
+            }
+          }
+        }
+        // Compatibilidade com a versao anterior, que devolvia um unico code.
+        if (codes.isEmpty) {
+          final legacyCode = order['code']?.toString().trim() ?? '';
+          if (legacyCode.isNotEmpty) {
+            codes.add(PickupCode(code: legacyCode, scannedAt: pickedUpAt));
+          }
+        }
         orders.add(
           PickupOrder(
             orderId: _asInt(order['order_id']) ?? 0,
             orderNumber: order['order_number']?.toString() ?? '',
             customer: order['customer']?.toString() ?? 'Cliente',
-            code: order['code']?.toString() ?? '',
-            pickedUpAt: DateTime.tryParse(
-              order['picked_up_at']?.toString() ?? '',
-            ),
+            codes: codes,
+            pickedUpAt: pickedUpAt,
+            items: parsePickupItems(order['items'], codes.length),
           ),
         );
       }
@@ -670,6 +1007,110 @@ class WaveService {
     );
   }
 
+  Future<PickupProgress> _withWaveOrders(PickupProgress progress) async {
+    if (!progress.enabled || progress.total == 0) return progress;
+    try {
+      final results = await Future.wait([
+        _getAllOptional(
+          '/api/v1/delivery/pedidos-wave/',
+          queryParameters: {'wave': progress.waveId},
+        ),
+        _getAll(
+          '/api/v1/delivery/pedidos/',
+          queryParameters: {'wave': progress.waveId},
+        ),
+      ]);
+      final links = results[0];
+      final rawOrders = results[1];
+      final waveLinks = links
+          .where((link) => _relationId(link['wave']) == progress.waveId)
+          .toList();
+      final linkedIds = <int>{};
+      for (final link in waveLinks) {
+        final orderId = _relationId(link['order']);
+        if (orderId != null) linkedIds.add(orderId);
+      }
+
+      final existingById = {
+        for (final order in progress.orders) order.orderId: order,
+      };
+      final merged = <PickupOrder>[];
+      final includedIds = <int>{};
+      for (final order in rawOrders) {
+        final orderId = _asInt(order['id']);
+        if (orderId == null) continue;
+        final linkedWave = _relationId(
+          order['wave'] ?? order['wave_id'] ?? order['delivery_wave'],
+        );
+        if (linkedIds.isNotEmpty && !linkedIds.contains(orderId)) continue;
+        if (linkedIds.isEmpty && linkedWave != progress.waveId) continue;
+        final existing = existingById[orderId];
+        final number = order['order_number']?.toString() ?? '';
+        final externalId = order['external_id']?.toString().trim() ?? '';
+        final barcodeBase =
+            progress.barcodeSource == 'external_id' && externalId.isNotEmpty
+            ? externalId
+            : number;
+        final codes = existing?.codes.isNotEmpty == true
+            ? existing!.codes
+            : _pickupCodes(
+                barcodeBase,
+                _asInt(order['units']) ?? 1,
+                existing?.pickedUpAt,
+              );
+        final items = existing?.items.isNotEmpty == true
+            ? existing!.items
+            : WaveService.parsePickupItems(order['items'], codes.length);
+        merged.add(
+          PickupOrder(
+            orderId: orderId,
+            orderNumber: number,
+            customer:
+                order['customer_name']?.toString() ??
+                existing?.customer ??
+                'Cliente',
+            codes: codes,
+            pickedUpAt: existing?.pickedUpAt,
+            items: items,
+          ),
+        );
+        includedIds.add(orderId);
+      }
+      for (final existing in progress.orders) {
+        if (includedIds.add(existing.orderId)) merged.add(existing);
+      }
+      if (merged.isEmpty) return progress;
+      return PickupProgress(
+        waveId: progress.waveId,
+        enabled: progress.enabled,
+        barcodeSource: progress.barcodeSource,
+        total: progress.total,
+        pickedUp: progress.pickedUp,
+        pending: progress.pending,
+        isComplete: progress.isComplete,
+        orders: merged,
+      );
+    } on DioException {
+      return progress;
+    }
+  }
+
+  List<PickupCode> _pickupCodes(
+    String base,
+    int volumeCount,
+    DateTime? pickedUpAt,
+  ) {
+    if (base.trim().isEmpty) return const [];
+    final total = volumeCount > 1 ? volumeCount : 1;
+    return List.generate(
+      total,
+      (index) => PickupCode(
+        code: total == 1 ? base : '$base-${index + 1}',
+        scannedAt: pickedUpAt,
+      ),
+    );
+  }
+
   int _compareNewest(DateTime? first, DateTime? second) {
     if (first == null && second == null) return 0;
     if (first == null) return 1;
@@ -677,13 +1118,13 @@ class WaveService {
     return second.compareTo(first);
   }
 
-  int? _asInt(dynamic value) => switch (value) {
+  static int? _asInt(dynamic value) => switch (value) {
     int number => number,
     String text => int.tryParse(text),
     _ => null,
   };
 
-  bool _asBool(dynamic value) => switch (value) {
+  static bool _asBool(dynamic value) => switch (value) {
     bool boolean => boolean,
     num number => number != 0,
     String text => const {'true', '1', 'yes'}.contains(text.toLowerCase()),

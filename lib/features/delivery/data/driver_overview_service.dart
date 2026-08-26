@@ -20,13 +20,14 @@ class DriverOverview {
 }
 
 class DriverOverviewService {
-  const DriverOverviewService(this.apiClient);
+  const DriverOverviewService(this.apiClient, {required this.profileService});
 
   final ApiClient apiClient;
+  final ProfileService profileService;
 
   Future<DriverOverview> getOverview() async {
     final results = await Future.wait<dynamic>([
-      ProfileService(apiClient).getProfile(),
+      profileService.getProfile(),
       apiClient.dio.get<dynamic>('/api/v1/delivery/entregadores/'),
     ]);
     final profile = results[0] as DeliveryProfile;

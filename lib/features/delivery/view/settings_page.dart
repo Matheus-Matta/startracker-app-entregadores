@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 
-import '../../../core/config/app_config.dart';
-import '../../../core/network/api_client.dart';
-import '../../../core/storage/session_storage.dart';
+import '../../../app/app_dependencies.dart';
+import '../../../core/notifications/app_notification_manager.dart';
+import '../../../core/notifications/notification_preferences.dart';
+import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../../auth/data/profile_service.dart';
 import '../../auth/view/login_page.dart';
+import '../../waves/data/pickup_label_scope.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
@@ -15,21 +17,60 @@ class SettingsPage extends StatefulWidget {
 
 class _SettingsPageState extends State<SettingsPage> {
   late final Future<DeliveryProfile> _profile;
-  bool _newWaves = true;
-  bool _routeChanges = true;
-  bool _orderUpdates = false;
+  NotificationPreferences _notificationPreferences =
+      NotificationPreferences.defaults;
+  bool _loadingNotificationPreferences = true;
+  PickupLabelScope _labelScope = PickupLabelScope.fallback;
 
   @override
   void initState() {
     super.initState();
-    const storage = SessionStorage();
-    _profile = ProfileService(
-      ApiClient(baseUrl: AppConfig.backendUrl, storage: storage),
-    ).getProfile();
+    final dependencies = AppDependencies.instance;
+    _profile = dependencies.profile.getProfile();
+    _loadNotificationPreferences();
+    _loadLabelScope();
+  }
+
+  Future<void> _loadLabelScope() async {
+    final stored = await AppDependencies.instance.storage
+        .readPickupLabelScope();
+    if (!mounted) return;
+    setState(() => _labelScope = PickupLabelScope.fromStorage(stored));
+  }
+
+  Future<void> _updateLabelScope(PickupLabelScope scope) async {
+    setState(() => _labelScope = scope);
+    await AppDependencies.instance.storage.savePickupLabelScope(
+      scope.storageValue,
+    );
+  }
+
+  Future<void> _loadNotificationPreferences() async {
+    final preferences = await AppDependencies.instance.storage
+        .readNotificationPreferences();
+    if (!mounted) return;
+    setState(() {
+      _notificationPreferences = preferences;
+      _loadingNotificationPreferences = false;
+    });
+  }
+
+  Future<void> _updateNotificationPreferences(
+    NotificationPreferences preferences,
+  ) async {
+    setState(() => _notificationPreferences = preferences);
+    await AppNotificationManager.instance.updatePreferences(
+      preferences,
+      requestPermissionIfNeeded: true,
+    );
   }
 
   Future<void> _logout() async {
-    await const SessionStorage().clear();
+    final dependencies = AppDependencies.instance;
+    await AppNotificationManager.instance.stop();
+    await FleetRealtimeChannel.instance.stop();
+    dependencies.clearSessionCaches();
+    await dependencies.storage.clear();
     if (!mounted) return;
     Navigator.of(context).pushAndRemoveUntil(
       MaterialPageRoute<void>(builder: (_) => const LoginPage()),
@@ -123,22 +164,59 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
               const SizedBox(height: 6),
               _NotificationSwitch(
-                title: 'Novas waves',
-                subtitle: 'Avisar quando uma wave for liberada',
-                value: _newWaves,
-                onChanged: (value) => setState(() => _newWaves = value),
+                title: 'Novas cargas',
+                subtitle: 'Avisar quando uma carga for liberada',
+                value: _notificationPreferences.newWaves,
+                onChanged: _loadingNotificationPreferences
+                    ? null
+                    : (value) => _updateNotificationPreferences(
+                        _notificationPreferences.copyWith(newWaves: value),
+                      ),
               ),
               _NotificationSwitch(
                 title: 'Alterações de rota',
                 subtitle: 'Mudanças de paradas e sequência',
-                value: _routeChanges,
-                onChanged: (value) => setState(() => _routeChanges = value),
+                value: _notificationPreferences.routeChanges,
+                onChanged: _loadingNotificationPreferences
+                    ? null
+                    : (value) => _updateNotificationPreferences(
+                        _notificationPreferences.copyWith(routeChanges: value),
+                      ),
               ),
               _NotificationSwitch(
                 title: 'Atualizações de pedidos',
                 subtitle: 'Status e observações dos pedidos',
-                value: _orderUpdates,
-                onChanged: (value) => setState(() => _orderUpdates = value),
+                value: _notificationPreferences.orderUpdates,
+                onChanged: _loadingNotificationPreferences
+                    ? null
+                    : (value) => _updateNotificationPreferences(
+                        _notificationPreferences.copyWith(orderUpdates: value),
+                      ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 14),
+        _Panel(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Retirada',
+                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w900),
+              ),
+              const SizedBox(height: 2),
+              const Text(
+                'O que uma leitura confirma na conferência da carga',
+                style: TextStyle(color: Color(0xFF858279), fontSize: 12),
+              ),
+              const SizedBox(height: 8),
+              ...PickupLabelScope.values.map(
+                (scope) => _LabelScopeTile(
+                  scope: scope,
+                  selected: scope == _labelScope,
+                  onTap: () => _updateLabelScope(scope),
+                ),
               ),
             ],
           ),
@@ -208,6 +286,38 @@ class _ProfileRow extends StatelessWidget {
   );
 }
 
+class _LabelScopeTile extends StatelessWidget {
+  const _LabelScopeTile({
+    required this.scope,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final PickupLabelScope scope;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => ListTile(
+    onTap: onTap,
+    contentPadding: EdgeInsets.zero,
+    leading: Icon(
+      selected
+          ? Icons.radio_button_checked_rounded
+          : Icons.radio_button_unchecked_rounded,
+      color: selected ? const Color(0xFF171713) : const Color(0xFF858279),
+    ),
+    title: Text(
+      scope.label,
+      style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
+    ),
+    subtitle: Text(
+      scope.description,
+      style: const TextStyle(color: Color(0xFF858279), fontSize: 12),
+    ),
+  );
+}
+
 class _NotificationSwitch extends StatelessWidget {
   const _NotificationSwitch({
     required this.title,
@@ -218,7 +328,7 @@ class _NotificationSwitch extends StatelessWidget {
   final String title;
   final String subtitle;
   final bool value;
-  final ValueChanged<bool> onChanged;
+  final ValueChanged<bool>? onChanged;
 
   @override
   Widget build(BuildContext context) => SwitchListTile(

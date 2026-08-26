@@ -1,8 +1,6 @@
 import 'package:flutter/material.dart';
 
-import '../../../core/config/app_config.dart';
-import '../../../core/network/api_client.dart';
-import '../../../core/storage/session_storage.dart';
+import '../../../app/app_dependencies.dart';
 import '../data/order_service.dart';
 
 const _ink = Color(0xFF171713);
@@ -31,10 +29,7 @@ class _OrderDetailPageState extends State<OrderDetailPage> {
   @override
   void initState() {
     super.initState();
-    const storage = SessionStorage();
-    _service = OrderService(
-      ApiClient(baseUrl: AppConfig.backendUrl, storage: storage),
-    );
+    _service = AppDependencies.instance.orders;
     _details = _service.getOrderDetails(widget.orderId);
   }
 
@@ -168,7 +163,7 @@ class _OrderBody extends StatelessWidget {
     'created': 'Criado',
     'awaiting_geocode': 'Aguardando geocodificação',
     'outside_delivery_area': 'Fora da área',
-    'waiting_wave': 'Aguardando wave',
+    'waiting_wave': 'Aguardando carga',
     'ready_for_routing': 'Pronto para roteirização',
     'routing': 'Roteirizando',
     'awaiting_pickup': 'Aguardando retirada',
@@ -181,6 +176,7 @@ class _OrderBody extends StatelessWidget {
     'routing_failed': 'Falha na roteirização',
     'returned': 'Devolvido',
     'cancelled': 'Cancelado',
+    'manual_assignment': 'Roteirização manual',
   };
 
   @override
@@ -224,6 +220,14 @@ class _OrderBody extends StatelessWidget {
               ),
           ],
         ),
+        if (order.hasPayment) ...[
+          const SizedBox(height: 12),
+          _PaymentCard(order: order),
+        ],
+        if (order.notes.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          _NotesCard(notes: order.notes),
+        ],
         const SizedBox(height: 12),
         _PlanningCard(order: order),
         const SizedBox(height: 20),
@@ -270,6 +274,11 @@ class _OrderBody extends StatelessWidget {
               _DetailRow(label: 'ID externo', value: order.externalId),
             if (order.warehouseId != null)
               _DetailRow(label: 'Armazém', value: '#${order.warehouseId}'),
+            if (order.splitFromId != null)
+              _DetailRow(
+                label: 'Desmembrado de',
+                value: 'Pedido #${order.splitFromId}',
+              ),
             if (order.createdAt != null)
               _DetailRow(
                 label: 'Criado em',
@@ -533,6 +542,58 @@ class _PlanningCard extends StatelessWidget {
     if (start != null) _formatDate(start),
     if (end != null) _formatDate(end),
   ].join(' até ');
+}
+
+class _PaymentCard extends StatelessWidget {
+  const _PaymentCard({required this.order});
+
+  final OrderDetails order;
+
+  static const _methodLabels = <String, String>{
+    'cash': 'Dinheiro',
+    'card': 'Cartão',
+    'pix': 'Pix',
+    'to_arrange': 'A combinar',
+  };
+
+  @override
+  Widget build(BuildContext context) => _SectionCard(
+    title: 'Pagamento',
+    icon: Icons.payments_outlined,
+    children: [
+      _DetailRow(
+        label: 'Forma',
+        value: order.paymentMethod.isEmpty
+            ? 'Não informada'
+            : _methodLabels[order.paymentMethod] ?? order.paymentMethod,
+      ),
+      if (order.paymentValue != null)
+        _DetailRow(label: 'Valor', value: _formatCurrency(order.paymentValue!)),
+      if (order.paymentMethod == 'cash' && order.paymentValue != null)
+        const _DetailRow(
+          label: 'Atenção',
+          value: 'Receber o valor na entrega.',
+        ),
+    ],
+  );
+}
+
+class _NotesCard extends StatelessWidget {
+  const _NotesCard({required this.notes});
+
+  final String notes;
+
+  @override
+  Widget build(BuildContext context) => _SectionCard(
+    title: 'Observação',
+    icon: Icons.sticky_note_2_outlined,
+    children: [
+      Text(
+        notes,
+        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+      ),
+    ],
+  );
 }
 
 class _ItemCard extends StatelessWidget {
@@ -805,6 +866,18 @@ class _ErrorState extends StatelessWidget {
       ),
     ),
   );
+}
+
+String _formatCurrency(double value) {
+  final negative = value < 0;
+  final parts = value.abs().toStringAsFixed(2).split('.');
+  final digits = parts.first;
+  final grouped = StringBuffer();
+  for (var index = 0; index < digits.length; index++) {
+    if (index > 0 && (digits.length - index) % 3 == 0) grouped.write('.');
+    grouped.write(digits[index]);
+  }
+  return '${negative ? '-' : ''}R\$ $grouped,${parts.last}';
 }
 
 String _formatWeight(int grams) {

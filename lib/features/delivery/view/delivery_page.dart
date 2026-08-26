@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
-import '../../../core/config/app_config.dart';
-import '../../../core/network/api_client.dart';
+import '../../../app/app_dependencies.dart';
+import '../../../core/async/debouncer.dart';
 import '../../../core/network/paged_result.dart';
-import '../../../core/storage/session_storage.dart';
+import '../../../core/notifications/app_notification_manager.dart';
+import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../../notifications/view/notifications_page.dart';
 import '../../orders/data/order_service.dart';
 import '../../orders/view/orders_page.dart';
@@ -25,8 +28,74 @@ class DeliveryPage extends StatefulWidget {
   State<DeliveryPage> createState() => _DeliveryPageState();
 }
 
-class _DeliveryPageState extends State<DeliveryPage> {
+class _DeliveryPageState extends State<DeliveryPage>
+    with WidgetsBindingObserver {
   int _tabIndex = 0;
+  final Set<int> _createdTabs = {0};
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(_startRealtime());
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    unawaited(_stopRealtime());
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.resumed:
+        unawaited(_startRealtime());
+        break;
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        unawaited(_stopRealtime());
+      case AppLifecycleState.inactive:
+        // Estados transitorios, como abrir a central de notificacoes, nao
+        // devem provocar uma reconexao completa.
+        break;
+    }
+  }
+
+  Future<void> _startRealtime() async {
+    await AppDependencies.instance.apiClient.offlineRequests.retryNow();
+    // O gerenciador assina o canal de frota antes da conexao para nao perder a
+    // mensagem `connected`, usada como gatilho de reconciliacao REST.
+    await AppNotificationManager.instance.start();
+    await FleetRealtimeChannel.instance.start();
+  }
+
+  Future<void> _stopRealtime() async {
+    await AppNotificationManager.instance.stop();
+    await FleetRealtimeChannel.instance.stop();
+  }
+
+  void _selectTab(int index) {
+    if (index == _tabIndex) return;
+    setState(() {
+      _tabIndex = index;
+      _createdTabs.add(index);
+    });
+  }
+
+  Widget _buildTab(int index) {
+    if (!_createdTabs.contains(index)) return const SizedBox.shrink();
+    final isActive = index == _tabIndex;
+    return switch (index) {
+      0 => _HomePage(isActive: isActive, onOpenProfile: () => _selectTab(4)),
+      1 => WavesPage(isActive: isActive, onOpenHome: () => _selectTab(0)),
+      2 => OrdersPage(isActive: isActive, onOpenHome: () => _selectTab(0)),
+      3 => NotificationsPage(isActive: isActive),
+      _ => const SettingsPage(),
+    };
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -37,19 +106,13 @@ class _DeliveryPageState extends State<DeliveryPage> {
           children: [
             _AppHeader(
               index: _tabIndex,
-              onOpenNotifications: () => setState(() => _tabIndex = 3),
-              onOpenProfile: () => setState(() => _tabIndex = 4),
+              onOpenNotifications: () => _selectTab(3),
+              onOpenProfile: () => _selectTab(4),
             ),
             Expanded(
               child: IndexedStack(
                 index: _tabIndex,
-                children: [
-                  _HomePage(onOpenProfile: () => setState(() => _tabIndex = 4)),
-                  WavesPage(onOpenHome: () => setState(() => _tabIndex = 0)),
-                  OrdersPage(onOpenHome: () => setState(() => _tabIndex = 0)),
-                  const NotificationsPage(),
-                  const SettingsPage(),
-                ],
+                children: List.generate(5, _buildTab),
               ),
             ),
           ],
@@ -57,7 +120,7 @@ class _DeliveryPageState extends State<DeliveryPage> {
       ),
       bottomNavigationBar: _BottomNavigation(
         index: _tabIndex,
-        onChanged: (index) => setState(() => _tabIndex = index),
+        onChanged: _selectTab,
       ),
     );
   }
@@ -74,7 +137,13 @@ class _AppHeader extends StatelessWidget {
   final VoidCallback onOpenNotifications;
   final VoidCallback onOpenProfile;
 
-  static const _titles = ['Home', 'Waves', 'Pedidos', 'Notificações', 'Perfil'];
+  static const _titles = [
+    'Home',
+    'Cargas',
+    'Pedidos',
+    'Notificações',
+    'Perfil',
+  ];
 
   @override
   Widget build(BuildContext context) {
@@ -141,7 +210,7 @@ class _BottomNavigation extends StatelessWidget {
 
   static const _destinations = [0, 2, 1, 4];
 
-  static const _labels = ['Home', 'Pedidos', 'Waves', 'Perfil'];
+  static const _labels = ['Home', 'Pedidos', 'Cargas', 'Perfil'];
 
   static const _icons = [
     Icons.home_outlined,
@@ -219,8 +288,9 @@ class _BottomNavigation extends StatelessWidget {
 }
 
 class _HomePage extends StatefulWidget {
-  const _HomePage({required this.onOpenProfile});
+  const _HomePage({required this.isActive, required this.onOpenProfile});
 
+  final bool isActive;
   final VoidCallback onOpenProfile;
 
   @override
@@ -228,24 +298,53 @@ class _HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<_HomePage> {
-  ActiveWaveService? _activeWaveServiceCache;
-  OrderService? _orderServiceCache;
-  DriverOverviewService? _driverServiceCache;
   Future<ActiveWave?>? _activeWaveCache;
   Future<PagedResult<OrderListItem>>? _ordersCache;
   Future<DriverOverview>? _driverCache;
+  StreamSubscription<FleetRealtimeEvent>? _realtimeSubscription;
+  final Debouncer _realtimeDebouncer = Debouncer(
+    const Duration(milliseconds: 250),
+  );
+  bool _pendingOrderReload = false;
+  bool _pendingRouteReload = false;
+  bool _pendingConnectionReload = false;
 
-  ActiveWaveService get _activeWaveService {
-    return _activeWaveServiceCache ??= _createActiveWaveService();
+  @override
+  void initState() {
+    super.initState();
+    _realtimeSubscription = FleetRealtimeChannel.instance.events.listen((
+      event,
+    ) {
+      if (event.isOrderChange || event.isConnected) {
+        _orderService.invalidateCache();
+      }
+      _pendingOrderReload |= event.isOrderChange;
+      _pendingRouteReload |= event.isRouteChange;
+      _pendingConnectionReload |= event.isConnected;
+      if (widget.isActive) _scheduleRealtimeReload();
+    });
   }
 
-  OrderService get _orderService {
-    return _orderServiceCache ??= _createOrderService();
+  @override
+  void didUpdateWidget(covariant _HomePage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!oldWidget.isActive && widget.isActive) _scheduleRealtimeReload();
   }
 
-  DriverOverviewService get _driverService {
-    return _driverServiceCache ??= _createDriverService();
+  @override
+  void dispose() {
+    _realtimeDebouncer.dispose();
+    _realtimeSubscription?.cancel();
+    super.dispose();
   }
+
+  ActiveWaveService get _activeWaveService =>
+      AppDependencies.instance.activeWave;
+
+  OrderService get _orderService => AppDependencies.instance.orders;
+
+  DriverOverviewService get _driverService =>
+      AppDependencies.instance.driverOverview;
 
   Future<ActiveWave?> get _activeWave {
     return _activeWaveCache ??= _activeWaveService.getActiveWave();
@@ -259,33 +358,60 @@ class _HomePageState extends State<_HomePage> {
     return _driverCache ??= _driverService.getOverview();
   }
 
-  ActiveWaveService _createActiveWaveService() {
-    const storage = SessionStorage();
-    return ActiveWaveService(
-      ApiClient(baseUrl: AppConfig.backendUrl, storage: storage),
-    );
-  }
-
-  OrderService _createOrderService() {
-    const storage = SessionStorage();
-    return OrderService(
-      ApiClient(baseUrl: AppConfig.backendUrl, storage: storage),
-    );
-  }
-
-  DriverOverviewService _createDriverService() {
-    const storage = SessionStorage();
-    return DriverOverviewService(
-      ApiClient(baseUrl: AppConfig.backendUrl, storage: storage),
-    );
-  }
-
-  void _reload() {
-    setState(() {
-      _activeWaveCache = _activeWaveService.getActiveWave();
-      _ordersCache = _orderService.getOrders(page: 1);
-      _driverCache = _driverService.getOverview();
+  void _scheduleRealtimeReload() {
+    if (!_pendingOrderReload &&
+        !_pendingRouteReload &&
+        !_pendingConnectionReload) {
+      return;
+    }
+    _realtimeDebouncer.run(() {
+      if (!mounted || !widget.isActive) return;
+      final refreshOrders = _pendingOrderReload || _pendingConnectionReload;
+      final refreshRoute = _pendingRouteReload || _pendingConnectionReload;
+      final refreshDriver = _pendingConnectionReload;
+      _pendingOrderReload = false;
+      _pendingRouteReload = false;
+      _pendingConnectionReload = false;
+      unawaited(
+        _reload(
+          activeWave: refreshRoute,
+          orders: refreshOrders,
+          driver: refreshDriver,
+        ),
+      );
     });
+  }
+
+  Future<void> _reload({
+    bool activeWave = true,
+    bool orders = true,
+    bool driver = true,
+  }) async {
+    if (!mounted) return;
+    final operations = <Future<dynamic>>[];
+    setState(() {
+      if (activeWave) {
+        final operation = _activeWaveService.getActiveWave();
+        _activeWaveCache = operation;
+        operations.add(operation);
+      }
+      if (orders) {
+        _orderService.invalidateCache();
+        final operation = _orderService.getOrders(page: 1, refresh: true);
+        _ordersCache = operation;
+        operations.add(operation);
+      }
+      if (driver) {
+        final operation = _driverService.getOverview();
+        _driverCache = operation;
+        operations.add(operation);
+      }
+    });
+    try {
+      await Future.wait(operations);
+    } catch (_) {
+      // Cada FutureBuilder apresenta o erro da sua própria seção.
+    }
   }
 
   Future<void> _openActiveWave(ActiveWave wave) async {
@@ -294,13 +420,13 @@ class _HomePageState extends State<_HomePage> {
         builder: (_) => ActiveWavePage(routeId: wave.routeId),
       ),
     );
-    if (mounted) _reload();
+    if (mounted) await _reload();
   }
 
   @override
   Widget build(BuildContext context) {
     return RefreshIndicator(
-      onRefresh: () async => _reload(),
+      onRefresh: _reload,
       child: ListView(
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.fromLTRB(18, 15, 18, 28),
@@ -369,7 +495,7 @@ class _HomePageState extends State<_HomePage> {
               if (snapshot.hasError) {
                 return _EmptyWaveCard(
                   icon: Icons.cloud_off_rounded,
-                  title: 'Não foi possível consultar a wave',
+                  title: 'Não foi possível consultar a carga',
                   message: 'Verifique sua conexão e tente novamente.',
                   onRetry: _reload,
                 );
@@ -378,8 +504,8 @@ class _HomePageState extends State<_HomePage> {
               if (wave == null) {
                 return const _EmptyWaveCard(
                   icon: Icons.inventory_2_outlined,
-                  title: 'Nenhuma wave ativa',
-                  message: 'Quando uma wave for liberada, ela aparecerá aqui.',
+                  title: 'Nenhuma carga ativa',
+                  message: 'Quando uma carga for liberada, ela aparecerá aqui.',
                 );
               }
               return _ActiveWaveCard(
@@ -862,7 +988,7 @@ class _ActiveWaveCard extends StatelessWidget {
               ),
               const SizedBox(height: 24),
               Text(
-                'Wave #${wave.waveId}',
+                'Carga #${wave.waveId}',
                 style: const TextStyle(
                   color: _ink,
                   fontSize: 27,

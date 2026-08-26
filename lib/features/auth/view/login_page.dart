@@ -1,8 +1,6 @@
 import 'package:flutter/material.dart';
 
-import '../../../core/config/app_config.dart';
-import '../../../core/network/api_client.dart';
-import '../../../core/storage/session_storage.dart';
+import '../../../app/app_dependencies.dart';
 import '../../delivery/view/delivery_page.dart';
 import '../data/auth_service.dart';
 
@@ -20,18 +18,14 @@ class _LoginPageState extends State<LoginPage> {
   final _userFocusNode = FocusNode();
   final _passwordFocusNode = FocusNode();
   late final AuthService _authService;
-  bool _rememberMe = false;
+  bool _rememberMe = true;
   bool _isLoading = false;
   String? _errorMessage;
 
   @override
   void initState() {
     super.initState();
-    const storage = SessionStorage();
-    _authService = AuthService(
-      apiClient: ApiClient(baseUrl: AppConfig.backendUrl, storage: storage),
-      storage: storage,
-    );
+    _authService = AppDependencies.instance.auth;
   }
 
   @override
@@ -56,6 +50,7 @@ class _LoginPageState extends State<LoginPage> {
         password: _passwordController.text,
         rememberSession: _rememberMe,
       );
+      AppDependencies.instance.clearSessionCaches();
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
         MaterialPageRoute<void>(builder: (_) => const DeliveryPage()),

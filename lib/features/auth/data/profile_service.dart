@@ -15,11 +15,16 @@ class DeliveryProfile {
 }
 
 class ProfileService {
-  const ProfileService(this.apiClient);
+  ProfileService(this.apiClient);
 
   final ApiClient apiClient;
+  DeliveryProfile? _cachedProfile;
 
-  Future<DeliveryProfile> getProfile() async {
+  Future<DeliveryProfile> getProfile({bool refresh = false}) async {
+    if (!refresh) {
+      final cached = _cachedProfile;
+      if (cached != null) return cached;
+    }
     final response = await apiClient.dio.get<Map<String, dynamic>>(
       '/api/v1/auth/me/',
     );
@@ -33,11 +38,15 @@ class ProfileService {
     final username = (user['username'] ?? user['identifier'] ?? 'entregador')
         .toString();
 
-    return DeliveryProfile(
+    final profile = DeliveryProfile(
       name: (user['name'] ?? user['full_name'] ?? username).toString(),
       username: username,
       email: (user['email'] ?? 'E-mail não informado').toString(),
       accountName: (account['name'] ?? 'Star Tracker').toString(),
     );
+    _cachedProfile = profile;
+    return profile;
   }
+
+  void invalidateCache() => _cachedProfile = null;
 }

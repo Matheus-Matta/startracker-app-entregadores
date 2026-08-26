@@ -1,6 +1,7 @@
 import 'package:dio/dio.dart';
 
 import '../../../core/network/api_client.dart';
+import '../../../core/network/offline_request_queue.dart';
 import '../../../core/storage/session_storage.dart';
 
 class AuthService {
@@ -54,34 +55,24 @@ class AuthService {
         data: {'token': access},
       );
       return true;
-    } on DioException {
+    } on DioException catch (error) {
+      // Uma sessao lembrada continua utilizavel sem rede. A validade sera
+      // confirmada (e o token renovado, se necessario) quando a API voltar.
+      if (OfflineRequestQueue.isNetworkFailure(error)) return true;
       return _refreshSession();
     }
   }
 
   Future<bool> _refreshSession() async {
-    final refresh = await storage.readRefreshToken();
-    if (refresh == null || refresh.isEmpty) {
-      await storage.clear();
-      return false;
+    final access = await apiClient.refreshAccessToken();
+    if (access == null || access.isEmpty) {
+      // O ApiClient apaga os tokens somente quando a API confirma que o
+      // refresh e invalido (400/401/403). Em falhas de rede ou servidor, o
+      // refresh continua armazenado e a sessao deve permanecer disponivel.
+      final refresh = await storage.readRefreshToken();
+      return refresh != null && refresh.isNotEmpty;
     }
-
-    try {
-      final response = await apiClient.dio.post<Map<String, dynamic>>(
-        '/api/v1/auth/token/refresh/',
-        data: {'refresh': refresh},
-      );
-      final access = response.data?['access'] as String?;
-      if (access == null || access.isEmpty) {
-        await storage.clear();
-        return false;
-      }
-      await storage.saveToken(access);
-      return true;
-    } on DioException {
-      await storage.clear();
-      return false;
-    }
+    return true;
   }
 
   Map<String, dynamic> _deliveryConfigFrom(Map<String, dynamic> data) {

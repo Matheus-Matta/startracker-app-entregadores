@@ -1,8 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
-import '../../../core/config/app_config.dart';
-import '../../../core/network/api_client.dart';
-import '../../../core/storage/session_storage.dart';
+import '../../../app/app_dependencies.dart';
+import '../../../core/network/offline_request_queue.dart';
 import '../../orders/view/order_detail_page.dart';
 import '../data/wave_service.dart';
 import 'active_wave_page.dart';
@@ -29,8 +30,10 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
   late String _currentStatus;
   PickupProgress? _pickupProgress;
   bool _startingRoute = false;
+  StreamSubscription<OfflineQueueEvent>? _offlineQueueSubscription;
 
   static const _statusLabels = <String, String>{
+    'collecting': 'Carga em montagem',
     'ready': 'Pronta para roteirizar',
     'optimizing': 'Roteirizando',
     'failed': 'Falha na roteirização',
@@ -40,6 +43,7 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
     'started': 'Em andamento',
     'completed': 'Concluída',
     'partially_completed': 'Parcialmente concluída',
+    'closed': 'Encerrada',
     'cancelled': 'Cancelada',
     'superseded': 'Substituída',
   };
@@ -47,13 +51,22 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
   @override
   void initState() {
     super.initState();
-    const storage = SessionStorage();
-    _service = WaveService(
-      ApiClient(baseUrl: AppConfig.backendUrl, storage: storage),
-    );
+    _service = AppDependencies.instance.waves;
     _currentWave = widget.wave;
     _currentStatus = _currentWave.status;
     _details = _loadDetails();
+    _offlineQueueSubscription = AppDependencies
+        .instance
+        .apiClient
+        .offlineRequests
+        .events
+        .listen(_onOfflineQueueEvent);
+  }
+
+  @override
+  void dispose() {
+    _offlineQueueSubscription?.cancel();
+    super.dispose();
   }
 
   Future<WaveDetails> _loadDetails() {
@@ -83,42 +96,92 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
 
   Future<void> _startRoute() async {
     if (_startingRoute || !_canStart) return;
+    final previousWave = _currentWave;
+    final previousStatus = _currentStatus;
     setState(() => _startingRoute = true);
     try {
+      PickupProgress latestPickup;
+      try {
+        latestPickup = await _service.getPickupProgress(_currentWave.waveId);
+      } on WaveServiceException {
+        final cached = _pickupProgress;
+        if (cached == null) rethrow;
+        latestPickup = cached;
+      }
+      if (!mounted) return;
+      setState(() => _pickupProgress = latestPickup);
+      if (latestPickup.enabled && !latestPickup.isComplete) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'A carga mudou. Confira os pedidos transferidos antes de iniciar.',
+            ),
+          ),
+        );
+        await _openPickup();
+        return;
+      }
       if (_currentStatus == 'ready') {
-        final prepared = await _service.optimizeAndRelease(_currentWave);
+        setState(() => _currentStatus = 'optimizing');
+        final result = await _service.optimizeAndRelease(_currentWave);
         if (!mounted) return;
+        if (result.queued) {
+          _message('Sem internet. Preparacao da carga salva para envio.');
+          return;
+        }
+        final prepared = result.value!;
         setState(() {
           _currentWave = prepared;
           _currentStatus = prepared.status;
         });
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Wave roteirizada e rota liberada.')),
-        );
-        await _openActiveRoute();
-        return;
       }
       final routeId = _currentWave.routeId;
       if (routeId == null) {
         throw const WaveServiceException(
-          'Esta wave ainda não possui uma rota para iniciar.',
+          'Esta carga ainda não possui uma rota para iniciar.',
         );
       }
-      await _service.startRoute(routeId);
-      if (!mounted) return;
       setState(() => _currentStatus = 'started');
+      final startResult = await _service.startRoute(routeId);
+      if (!mounted) return;
+      if (startResult.queued) {
+        _message('Sem internet. Inicio da rota salvo para envio automatico.');
+        return;
+      }
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Rota iniciada com sucesso.')),
       );
       await _openActiveRoute();
     } on WaveServiceException catch (error) {
       if (!mounted) return;
+      setState(() {
+        _currentWave = previousWave;
+        _currentStatus = previousStatus;
+      });
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text(error.message)));
+      unawaited(_refresh());
     } finally {
       if (mounted) setState(() => _startingRoute = false);
     }
+  }
+
+  void _onOfflineQueueEvent(OfflineQueueEvent event) {
+    final routeId = _currentWave.routeId;
+    final affectsCurrent =
+        event.resourceKey == 'wave:${_currentWave.waveId}' ||
+        (routeId != null && event.resourceKey == 'route:$routeId');
+    if (!affectsCurrent || event.type == OfflineQueueEventType.queued) return;
+    if (event.type == OfflineQueueEventType.rejected) {
+      _message('A API recusou a alteracao offline. O estado foi restaurado.');
+    }
+    unawaited(_refresh());
+  }
+
+  void _message(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
   Future<void> _openActiveRoute() async {
@@ -157,34 +220,52 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
     if (openHome == true) Navigator.of(context).pop(true);
   }
 
-  bool get _needsPickup =>
-      _currentStatus == 'ready' &&
-      _pickupProgress?.enabled == true &&
-      _pickupProgress?.isComplete == false;
+  bool get _pickupPending =>
+      _pickupProgress?.enabled == true && _pickupProgress?.isComplete == false;
+
+  bool get _requiresPickupBeforeStart =>
+      _currentStatus != 'started' && _pickupPending;
 
   bool get _canStart {
-    if (_currentStatus == 'ready') {
-      final pickup = _pickupProgress;
-      return pickup != null && (!pickup.enabled || pickup.isComplete);
+    if (!const {
+      'ready',
+      'planned',
+      'released',
+      'accepted',
+    }.contains(_currentStatus)) {
+      return false;
     }
-    return const {'planned', 'released', 'accepted'}.contains(_currentStatus);
+    final pickup = _pickupProgress;
+    return pickup != null && (!pickup.enabled || pickup.isComplete);
   }
 
   bool get _canOpenActive => _currentStatus == 'started';
 
-  String get _buttonLabel => switch (_currentStatus) {
-    'ready' when _pickupProgress == null => 'Carregando retirada...',
-    'ready' when _needsPickup =>
-      'Conferir retirada (${_pickupProgress!.pickedUp}/${_pickupProgress!.total})',
-    'ready' => 'Roteirizar wave',
-    'optimizing' => 'Roteirizando wave',
-    'started' => 'Rota em andamento',
-    'completed' => 'Rota concluída',
-    'partially_completed' => 'Rota concluída parcialmente',
-    'cancelled' => 'Rota cancelada',
-    'superseded' => 'Rota substituída',
-    _ => 'Começar a rota',
-  };
+  String get _buttonLabel {
+    if (_currentStatus == 'started') return 'Rota em andamento';
+    if (_pickupProgress == null && _canHaveRouteAction) {
+      return 'Carregando retirada...';
+    }
+    if (_requiresPickupBeforeStart) {
+      return 'Conferir retirada (${_pickupProgress!.pickedUp}/${_pickupProgress!.total})';
+    }
+    return switch (_currentStatus) {
+      'ready' => 'Roteirizar carga',
+      'optimizing' => 'Roteirizando carga',
+      'completed' => 'Rota concluída',
+      'partially_completed' => 'Rota concluída parcialmente',
+      'cancelled' => 'Rota cancelada',
+      'superseded' => 'Rota substituída',
+      _ => 'Começar a rota',
+    };
+  }
+
+  bool get _canHaveRouteAction => const {
+    'ready',
+    'planned',
+    'released',
+    'accepted',
+  }.contains(_currentStatus);
 
   String get _busyLabel =>
       _currentStatus == 'ready' ? 'Roteirizando...' : 'Iniciando rota...';
@@ -233,12 +314,12 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
             child: FilledButton.icon(
               onPressed: _startingRoute
                   ? null
-                  : _needsPickup
+                  : _canOpenActive
+                  ? _openActiveRoute
+                  : _requiresPickupBeforeStart
                   ? _openPickup
                   : _canStart
                   ? _startRoute
-                  : _canOpenActive
-                  ? _openActiveRoute
                   : null,
               style: FilledButton.styleFrom(
                 backgroundColor: _ink,
@@ -260,7 +341,7 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
                   : Icon(
                       _canOpenActive
                           ? Icons.navigation_rounded
-                          : _needsPickup
+                          : _requiresPickupBeforeStart
                           ? Icons.qr_code_scanner_rounded
                           : Icons.play_arrow_rounded,
                     ),
@@ -296,7 +377,7 @@ class _DetailHeader extends StatelessWidget {
         alignment: Alignment.center,
         children: [
           Text(
-            'Wave #$waveId',
+            'Carga #$waveId',
             style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900),
           ),
           Align(
@@ -376,7 +457,7 @@ class _DetailsBody extends StatelessWidget {
           children: [
             const Expanded(
               child: Text(
-                'Pedidos da wave',
+                'Pedidos da carga',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900),
               ),
             ),
@@ -391,17 +472,30 @@ class _DetailsBody extends StatelessWidget {
         ),
         const SizedBox(height: 11),
         if (details.orders.isEmpty)
-          const _EmptyOrders(message: 'Nenhum pedido nesta wave')
+          const _EmptyOrders(message: 'Nenhum pedido nesta carga')
         else
           ...details.orders.map(
             (order) => Padding(
               padding: const EdgeInsets.only(bottom: 10),
-              child: _OrderCard(order: order, onTap: () => onOpenOrder(order)),
+              child: _OrderCard(
+                order: order,
+                pickup: details.pickup.enabled
+                    ? _pickupOrder(order.orderId)
+                    : null,
+                onTap: () => onOpenOrder(order),
+              ),
             ),
           ),
       ],
     ),
   );
+
+  PickupOrder? _pickupOrder(int orderId) {
+    for (final order in details.pickup.orders) {
+      if (order.orderId == orderId) return order;
+    }
+    return null;
+  }
 }
 
 class _PickupProgressCard extends StatelessWidget {
@@ -462,7 +556,8 @@ class _PickupProgressCard extends StatelessWidget {
                         ),
                         const SizedBox(height: 2),
                         Text(
-                          '${progress.pickedUp} de ${progress.total} pedidos conferidos',
+                          '${progress.pickedUp} de ${progress.total} pedidos · '
+                          '${progress.scannedVolumes} de ${progress.totalVolumes} volumes',
                           style: const TextStyle(color: _muted, fontSize: 10),
                         ),
                       ],
@@ -648,15 +743,17 @@ class _Metric extends StatelessWidget {
 }
 
 class _OrderCard extends StatelessWidget {
-  const _OrderCard({required this.order, required this.onTap});
+  const _OrderCard({required this.order, required this.onTap, this.pickup});
 
   final WaveOrderItem order;
+  final PickupOrder? pickup;
   final VoidCallback onTap;
 
   static const _statusLabels = <String, String>{
     'created': 'Criado',
     'awaiting_geocode': 'Aguardando endereço',
-    'waiting_wave': 'Na wave',
+    'awaiting_pickup': 'Aguardando retirada',
+    'waiting_wave': 'Na carga',
     'ready_for_routing': 'Pronto para rota',
     'routing': 'Roteirizando',
     'routed': 'Roteirizado',
@@ -673,6 +770,7 @@ class _OrderCard extends StatelessWidget {
     'failed': 'Falhou',
     'skipped': 'Pulada',
     'cancelled': 'Cancelada',
+    'manual_assignment': 'Roteirização manual',
   };
 
   @override
@@ -732,9 +830,14 @@ class _OrderCard extends StatelessWidget {
                         ),
                         const SizedBox(width: 8),
                         _StatusBadge(
-                          label:
-                              _statusLabels[order.stopStatus] ??
-                              order.stopStatus,
+                          label: pickup == null
+                              ? _statusLabels[order.stopStatus] ??
+                                    order.stopStatus
+                              : pickup!.isPickedUp
+                              ? 'Retirado'
+                              : pickup!.scannedVolumes > 0
+                              ? '${pickup!.scannedVolumes}/${pickup!.totalVolumes} volumes'
+                              : 'Aguardando retirada',
                         ),
                       ],
                     ),
@@ -906,7 +1009,7 @@ class _ErrorState extends StatelessWidget {
           const Icon(Icons.cloud_off_rounded, size: 44, color: _muted),
           const SizedBox(height: 12),
           const Text(
-            'Não foi possível carregar esta wave',
+            'Não foi possível carregar esta carga',
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900),
           ),
