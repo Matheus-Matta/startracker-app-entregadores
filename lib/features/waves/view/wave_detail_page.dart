@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../../../app/app_dependencies.dart';
 import '../../../core/network/offline_request_queue.dart';
+import '../../../core/presentation/app_messages.dart';
 import '../../orders/view/order_detail_page.dart';
 import '../data/wave_service.dart';
 import 'active_wave_page.dart';
@@ -111,12 +112,9 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
       if (!mounted) return;
       setState(() => _pickupProgress = latestPickup);
       if (latestPickup.enabled && !latestPickup.isComplete) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'A carga mudou. Confira os pedidos transferidos antes de iniciar.',
-            ),
-          ),
+        showAppMessage(
+          context,
+          'A carga mudou. Confira os pedidos transferidos antes de iniciar.',
         );
         await _openPickup();
         return;
@@ -148,9 +146,7 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
         _message('Sem internet. Inicio da rota salvo para envio automatico.');
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Rota iniciada com sucesso.')),
-      );
+      showAppMessage(context, 'Rota iniciada com sucesso.');
       await _openActiveRoute();
     } on WaveServiceException catch (error) {
       if (!mounted) return;
@@ -158,9 +154,7 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
         _currentWave = previousWave;
         _currentStatus = previousStatus;
       });
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.message)));
+      showAppMessage(context, error.message);
       unawaited(_refresh());
     } finally {
       if (mounted) setState(() => _startingRoute = false);
@@ -181,7 +175,7 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
 
   void _message(String text) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+    showAppMessage(context, text);
   }
 
   Future<void> _openActiveRoute() async {

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../../core/presentation/app_messages.dart';
 
 import '../../../app/app_dependencies.dart';
 import '../../delivery/view/delivery_page.dart';
@@ -106,12 +107,9 @@ class _RecoveredDeliveryLauncherState
       );
     } catch (_) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'A foto foi recuperada, mas a entrega nao pode ser carregada agora.',
-          ),
-        ),
+      showAppMessage(
+        context,
+        'A foto foi recuperada, mas a entrega nao pode ser carregada agora.',
       );
     }
   }

@@ -7,6 +7,7 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 
 import '../../../app/app_dependencies.dart';
 import '../../../core/network/offline_request_queue.dart';
+import '../../../core/presentation/app_messages.dart';
 import '../data/pickup_label_scope.dart';
 import '../data/wave_service.dart';
 
@@ -412,16 +413,13 @@ class _PickupPageState extends State<PickupPage> {
     _feedbackTimer?.cancel();
     if (!mounted) return;
     setState(() => _scanFeedback = feedback);
-    _feedbackTimer = Timer(
-      Duration(seconds: feedback.success || feedback.warning ? 4 : 6),
-      () {
-        if (mounted) setState(() => _scanFeedback = null);
-      },
-    );
+    _feedbackTimer = Timer(appMessageDuration, () {
+      if (mounted) setState(() => _scanFeedback = null);
+    });
   }
 
   void _message(String text) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+    showAppMessage(context, text);
   }
 
   Future<void> _toggleOrientation() async {
@@ -1397,9 +1395,7 @@ class _ManualPickupCodePage extends StatelessWidget {
   void _submit(BuildContext context) {
     final code = controller.text.trim();
     if (code.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Digite um código para continuar.')),
-      );
+      showAppMessage(context, 'Digite um código para continuar.');
       return;
     }
     Navigator.of(context).pop(code);

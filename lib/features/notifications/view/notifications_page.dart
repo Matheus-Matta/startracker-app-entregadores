@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import '../../../core/presentation/app_messages.dart';
 
 import '../../../app/app_dependencies.dart';
 import '../../../core/async/debouncer.dart';
@@ -103,9 +104,7 @@ class _NotificationsPageState extends State<NotificationsPage> {
   }
 
   void _message(String message) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text(message)));
+    showAppMessage(context, message);
   }
 
   @override

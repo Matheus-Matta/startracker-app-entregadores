@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import '../../../core/presentation/app_messages.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 
@@ -450,7 +451,7 @@ class _ActiveWavePageState extends State<ActiveWavePage>
   );
 
   void _message(String text) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+    showAppMessage(context, text);
   }
 
   @override
@@ -1756,9 +1757,7 @@ class _FailureSheetState extends State<_FailureSheet> {
 
   void _confirm() {
     if (widget.requireNotes && _notes.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Informe uma observação para continuar.')),
-      );
+      showAppMessage(context, 'Informe uma observação para continuar.');
       return;
     }
     Navigator.of(context).pop(_FailureData(_reason, _notes.text.trim()));
