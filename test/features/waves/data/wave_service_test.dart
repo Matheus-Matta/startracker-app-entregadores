@@ -1,4 +1,10 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:star_tracker/core/network/api_client.dart';
+import 'package:star_tracker/core/storage/session_storage.dart';
 import 'package:star_tracker/features/waves/data/pickup_label_scope.dart';
 import 'package:star_tracker/features/waves/data/wave_service.dart';
 
@@ -17,16 +23,6 @@ void main() {
         PickupLabelScope.fromConfiguration({'label_granularity': 'order'}),
         PickupLabelScope.order,
       );
-      expect(
-        PickupLabelScope.fromConfiguration({'label_scope': 'per_order'}),
-        PickupLabelScope.order,
-      );
-      expect(
-        PickupLabelScope.fromConfiguration({
-          'pickup_label_scope': {'value': 'pedido'},
-        }),
-        PickupLabelScope.order,
-      );
     });
 
     test('usa volume quando a API antiga nao informa a granularidade', () {
@@ -34,22 +30,13 @@ void main() {
         PickupLabelScope.fromConfiguration(const {}),
         PickupLabelScope.volume,
       );
-      expect(
-        PickupLabelScope.fromConfiguration({
-          'label_granularity': 'desconhecido',
-        }),
-        PickupLabelScope.volume,
-      );
     });
   });
 
   group('WaveService.displayStatus', () {
-    test(
-      'prioriza rota iniciada mesmo quando o status da wave esta defasado',
-      () {
-        expect(WaveService.displayStatus('ready', 'started'), 'started');
-      },
-    );
+    test('prioriza rota iniciada mesmo quando a wave esta defasada', () {
+      expect(WaveService.displayStatus('ready', 'started'), 'started');
+    });
 
     test('mantem o status proprio da wave antes da rota ser iniciada', () {
       expect(WaveService.displayStatus('ready', 'released'), 'ready');
@@ -61,12 +48,12 @@ void main() {
   });
 
   group('WaveService.parsePickupProgress', () {
-    test('interpreta a conferencia e os codigos por volume', () {
+    test('usa os codigos e a granularidade devolvidos pelo endpoint', () {
       final progress = WaveService.parsePickupProgress({
         'wave_id': 10,
         'pickup_enabled': true,
         'barcode_source': 'order_number',
-        'label_scope': 'per_order',
+        'label_granularity': 'item',
         'total': 2,
         'picked_up': 0,
         'pending': 2,
@@ -81,7 +68,7 @@ void main() {
                 'code': 'PED-2026-001-1',
                 'scanned_at': '2026-08-22T09:14:00-03:00',
               },
-              {'code': 'PED-2026-001-2', 'scanned_at': null},
+              {'code': 'PED-2026-001-3', 'scanned_at': null},
             ],
             'picked_up_at': null,
           },
@@ -99,18 +86,17 @@ void main() {
 
       expect(progress.waveId, 10);
       expect(progress.total, 2);
-      expect(progress.totalVolumes, 3);
-      expect(progress.scannedVolumes, 1);
-      expect(progress.pendingVolumes, 2);
-      expect(progress.orders.first.totalVolumes, 2);
-      expect(progress.orders.first.scannedVolumes, 1);
+      expect(progress.totalLabels, 3);
+      expect(progress.scannedLabels, 1);
+      expect(progress.pendingLabels, 2);
+      expect(progress.orders.first.totalLabels, 2);
+      expect(progress.orders.first.scannedLabels, 1);
       expect(progress.orders.first.isPickedUp, isFalse);
-      expect(progress.orders.first.codes.last.code, 'PED-2026-001-2');
-      expect(progress.orders.first.codes.last.isScanned, isFalse);
-      expect(progress.labelScope, PickupLabelScope.order);
+      expect(progress.orders.first.codes.last.code, 'PED-2026-001-3');
+      expect(progress.labelGranularity, PickupLabelScope.item);
     });
 
-    test('continua aceitando o payload antigo com code unico', () {
+    test('nao inventa codigo quando orders.codes nao foi devolvido', () {
       final progress = WaveService.parsePickupProgress({
         'pickup_enabled': true,
         'orders': [
@@ -118,182 +104,120 @@ void main() {
             'order_id': 81,
             'order_number': 'PED-81',
             'code': 'PED-81',
-            'picked_up_at': '2026-08-22T09:14:00-03:00',
-          },
-        ],
-      }, 10);
-
-      expect(progress.totalVolumes, 1);
-      expect(progress.scannedVolumes, 1);
-      expect(progress.orders.single.codes.single.code, 'PED-81');
-      expect(progress.orders.single.codes.single.isScanned, isTrue);
-    });
-
-    test('agrupa os volumes por item quando o total confere', () {
-      final progress = WaveService.parsePickupProgress({
-        'pickup_enabled': true,
-        'orders': [
-          {
-            'order_id': 81,
-            'order_number': 'PED-81',
-            'codes': [
-              {'code': 'PED-81-1', 'scanned_at': null},
-              {'code': 'PED-81-2', 'scanned_at': null},
-              {'code': 'PED-81-3', 'scanned_at': null},
-            ],
             'items': [
-              {
-                'id': 15,
-                'name': 'Guarda-roupa',
-                'volumes': [
-                  {'id': 31},
-                  {'id': 32},
-                ],
-              },
-              {
-                'id': 16,
-                'name': 'Colchão',
-                'volumes': [
-                  {'id': 33},
-                ],
-              },
+              {'units': 3},
             ],
+            'picked_up_at': null,
           },
         ],
       }, 10);
 
-      final items = progress.orders.single.items;
-      expect(items.length, 2);
-      expect(items.first.volumeCount, 2);
-      expect(items.first.covers(1), isTrue);
-      expect(items.last.firstVolumeIndex, 2);
-    });
-
-    test('ignora a itemizacao quando ela nao cobre todas as etiquetas', () {
-      final items = WaveService.parsePickupItems([
-        {
-          'id': 15,
-          'volumes': [
-            {'id': 31},
-          ],
-        },
-      ], 3);
-
-      expect(items, isEmpty);
+      expect(progress.totalLabels, 0);
+      expect(progress.orders.single.codes, isEmpty);
     });
   });
 
-  group('PickupOrder.codesForScan', () {
-    PickupOrder buildOrder({DateTime? secondVolumeScannedAt}) => PickupOrder(
+  group('PickupOrder.matchesCode', () {
+    const order = PickupOrder(
       orderId: 81,
       orderNumber: 'PED-81',
       customer: 'Cliente',
       pickedUpAt: null,
       codes: [
-        const PickupCode(code: 'PED-81-1', scannedAt: null),
-        PickupCode(code: 'PED-81-2', scannedAt: secondVolumeScannedAt),
-        const PickupCode(code: 'PED-81-3', scannedAt: null),
-      ],
-      items: const [
-        PickupItemGroup(
-          id: 15,
-          name: 'Guarda-roupa',
-          firstVolumeIndex: 0,
-          volumeCount: 2,
-        ),
-        PickupItemGroup(
-          id: 16,
-          name: 'Colchão',
-          firstVolumeIndex: 2,
-          volumeCount: 1,
-        ),
+        PickupCode(code: 'PED-81-1', scannedAt: null),
+        PickupCode(code: 'EXT ABC', scannedAt: null),
       ],
     );
 
-    test('no escopo de volume confere so a etiqueta lida', () {
-      expect(buildOrder().codesForScan('ped-81-1 ', PickupLabelScope.volume), [
-        'PED-81-1',
-      ]);
+    test('ignora caixa e espacos apenas nas extremidades', () {
+      expect(order.matchesCode(' ped-81-1 '), isTrue);
+      expect(order.matchesCode(' ext abc '), isTrue);
+      expect(order.matchesCode('EXTABC'), isFalse);
     });
 
-    test('no escopo de item confere os volumes daquele item', () {
-      expect(buildOrder().codesForScan('PED-81-1', PickupLabelScope.item), [
-        'PED-81-1',
-        'PED-81-2',
-      ]);
-    });
-
-    test('no escopo de pedido confere todos os volumes pendentes', () {
-      expect(buildOrder().codesForScan('PED-81-1', PickupLabelScope.order), [
-        'PED-81-1',
-        'PED-81-2',
-        'PED-81-3',
-      ]);
-    });
-
-    test('aceita o codigo-base da etiqueta unica por pedido', () {
-      expect(buildOrder().codesForScan('PED-81', PickupLabelScope.order), [
-        'PED-81-1',
-        'PED-81-2',
-        'PED-81-3',
-      ]);
-      expect(
-        buildOrder().matchesScan('PED-81', PickupLabelScope.order),
-        isTrue,
-      );
-      expect(
-        buildOrder().matchesScan('PED-81', PickupLabelScope.volume),
-        isFalse,
-      );
-    });
-
-    test('aceita o codigo-base externo da etiqueta unica por pedido', () {
-      const order = PickupOrder(
-        orderId: 82,
-        orderNumber: 'PED-82',
-        customer: 'Cliente',
-        pickedUpAt: null,
-        codes: [
-          PickupCode(code: 'EXT-ABC-1', scannedAt: null),
-          PickupCode(code: 'EXT-ABC-2', scannedAt: null),
-        ],
-      );
-
-      expect(order.codesForScan('EXT-ABC', PickupLabelScope.order), [
-        'EXT-ABC-1',
-        'EXT-ABC-2',
-      ]);
-    });
-
-    test('nao reenvia volume ja conferido', () {
-      final order = buildOrder(secondVolumeScannedAt: DateTime(2026, 8, 22));
-      expect(order.codesForScan('PED-81-1', PickupLabelScope.order), [
-        'PED-81-1',
-        'PED-81-3',
-      ]);
-    });
-
-    test('sem itemizacao o escopo de item cai no volume lido', () {
-      const order = PickupOrder(
-        orderId: 82,
-        orderNumber: 'PED-82',
-        customer: 'Cliente',
-        pickedUpAt: null,
-        codes: [
-          PickupCode(code: 'PED-82-1', scannedAt: null),
-          PickupCode(code: 'PED-82-2', scannedAt: null),
-        ],
-      );
-
-      expect(order.codesForScan('PED-82-1', PickupLabelScope.item), [
-        'PED-82-1',
-      ]);
-    });
-
-    test('codigo desconhecido segue para a API como veio', () {
-      expect(buildOrder().codesForScan(' OUTRO-1 ', PickupLabelScope.order), [
-        'OUTRO-1',
-      ]);
+    test('nao deduz codigo-base pelo numero do pedido', () {
+      expect(order.matchesCode('PED-81'), isFalse);
     });
   });
+
+  test(
+    'registerPickup envia somente a etiqueta lida em um unico POST',
+    () async {
+      final client = ApiClient(
+        baseUrl: 'https://api.example.test',
+        storage: const _EmptyStorage(),
+      );
+      final adapter = _PickupAdapter();
+      client.dio.httpClientAdapter = adapter;
+      final service = WaveService(client);
+
+      final progress = await service.registerPickup(
+        waveId: 42,
+        code: '  PED 100  ',
+      );
+
+      expect(adapter.requests.length, 1);
+      expect(adapter.requests.single.method, 'POST');
+      expect(
+        adapter.requests.single.path,
+        '/api/v1/delivery/waves/42/retirada/',
+      );
+      expect(adapter.requests.single.data, {'code': 'PED 100'});
+      expect(progress.waveId, 42);
+      expect(progress.labelGranularity, PickupLabelScope.order);
+    },
+  );
+}
+
+class _EmptyStorage extends SessionStorage {
+  const _EmptyStorage();
+
+  @override
+  Future<String?> readToken() async => null;
+
+  @override
+  Future<String?> readRefreshToken() async => null;
+}
+
+class _PickupAdapter implements HttpClientAdapter {
+  final requests = <RequestOptions>[];
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    requests.add(options);
+    return ResponseBody.fromString(
+      jsonEncode({
+        'wave_id': 42,
+        'pickup_enabled': true,
+        'barcode_source': 'order_number',
+        'label_granularity': 'order',
+        'total': 1,
+        'picked_up': 1,
+        'pending': 0,
+        'is_complete': true,
+        'orders': [
+          {
+            'order_id': 81,
+            'order_number': 'PED 100',
+            'customer': 'Cliente',
+            'codes': [
+              {'code': 'PED 100', 'scanned_at': '2026-09-09T10:00:00-03:00'},
+            ],
+            'picked_up_at': '2026-09-09T10:00:00-03:00',
+          },
+        ],
+      }),
+      200,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
 }

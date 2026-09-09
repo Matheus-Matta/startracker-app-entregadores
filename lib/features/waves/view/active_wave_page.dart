@@ -1503,7 +1503,7 @@ class _TransferredPickupNotice extends StatelessWidget {
         const SizedBox(height: 5),
         Text(
           '${progress.pending} pedido${progress.pending == 1 ? '' : 's'} aguardando retirada'
-          '${progress.totalVolumes > 0 ? ' · ${progress.pendingVolumes} volume${progress.pendingVolumes == 1 ? '' : 's'} sem leitura' : ''}.',
+          '${progress.totalLabels > 0 ? ' · ${progress.pendingLabels} etiqueta${progress.pendingLabels == 1 ? '' : 's'} sem leitura' : ''}.',
           style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
         ),
         const SizedBox(height: 10),

@@ -7,10 +7,11 @@ import '../../../core/network/paged_result.dart';
 import '../../../core/presentation/delivery_terminology.dart';
 import 'pickup_label_scope.dart';
 
-/// Normaliza um codigo de etiqueta do mesmo jeito que a API compara: sem
-/// espacos e sem diferenca entre maiusculas e minusculas.
-String normalizePickupCode(String code) =>
-    code.trim().toUpperCase().replaceAll(RegExp(r'\s+'), '');
+/// Normaliza somente o que o contrato da retirada permite ao comparar no app.
+///
+/// Espacos internos fazem parte do codigo. A validacao definitiva continua
+/// sendo feita pela API.
+String normalizePickupCode(String code) => code.trim().toUpperCase();
 
 class WaveListItem {
   const WaveListItem({
@@ -85,7 +86,7 @@ class PickupProgress {
     required this.pending,
     required this.isComplete,
     required this.orders,
-    this.labelScope,
+    this.labelGranularity,
   });
 
   factory PickupProgress.disabled(int waveId) => PickupProgress(
@@ -107,15 +108,15 @@ class PickupProgress {
   final int pending;
   final bool isComplete;
   final List<PickupOrder> orders;
-  final PickupLabelScope? labelScope;
+  final PickupLabelScope? labelGranularity;
 
-  int get totalVolumes =>
-      orders.fold(0, (total, order) => total + order.totalVolumes);
+  int get totalLabels =>
+      orders.fold(0, (total, order) => total + order.totalLabels);
 
-  int get scannedVolumes =>
-      orders.fold(0, (total, order) => total + order.scannedVolumes);
+  int get scannedLabels =>
+      orders.fold(0, (total, order) => total + order.scannedLabels);
 
-  int get pendingVolumes => totalVolumes - scannedVolumes;
+  int get pendingLabels => totalLabels - scannedLabels;
 }
 
 class PickupCode {
@@ -127,29 +128,6 @@ class PickupCode {
   bool get isScanned => scannedAt != null;
 }
 
-/// Faixa de volumes que pertence a um item do pedido.
-///
-/// As etiquetas chegam em uma lista plana, na mesma ordem dos itens e dos
-/// volumes de cada item; a faixa e o que permite conferir um item inteiro a
-/// partir de uma unica leitura.
-class PickupItemGroup {
-  const PickupItemGroup({
-    required this.id,
-    required this.name,
-    required this.firstVolumeIndex,
-    required this.volumeCount,
-  });
-
-  final int id;
-  final String name;
-  final int firstVolumeIndex;
-  final int volumeCount;
-
-  bool covers(int volumeIndex) =>
-      volumeIndex >= firstVolumeIndex &&
-      volumeIndex < firstVolumeIndex + volumeCount;
-}
-
 class PickupOrder {
   const PickupOrder({
     required this.orderId,
@@ -157,7 +135,6 @@ class PickupOrder {
     required this.customer,
     required this.codes,
     required this.pickedUpAt,
-    this.items = const [],
   });
 
   final int orderId;
@@ -165,90 +142,19 @@ class PickupOrder {
   final String customer;
   final List<PickupCode> codes;
   final DateTime? pickedUpAt;
-  final List<PickupItemGroup> items;
 
   bool get isPickedUp => pickedUpAt != null;
 
-  int get totalVolumes => codes.isEmpty ? 1 : codes.length;
+  int get totalLabels => codes.length;
 
-  int get scannedVolumes => codes.isEmpty
-      ? (isPickedUp ? 1 : 0)
-      : codes.where((code) => code.isScanned).length;
+  int get scannedLabels => codes.where((code) => code.isScanned).length;
 
-  int get pendingVolumes => totalVolumes - scannedVolumes;
+  int get pendingLabels => totalLabels - scannedLabels;
 
-  /// Codigos que uma unica leitura confirma no escopo de etiqueta escolhido.
-  ///
-  /// O primeiro elemento e sempre a etiqueta lida — e dela que sai o retorno
-  /// exibido ao entregador. Os demais sao os volumes ainda pendentes cobertos
-  /// pela mesma etiqueta.
-  List<String> codesForScan(String scannedCode, PickupLabelScope scope) {
+  /// Localiza apenas codigos que vieram em `orders[].codes` da API.
+  bool matchesCode(String scannedCode) {
     final key = normalizePickupCode(scannedCode);
-    var index = -1;
-    for (var position = 0; position < codes.length; position++) {
-      if (normalizePickupCode(codes[position].code) == key) {
-        index = position;
-        break;
-      }
-    }
-    if (index < 0) {
-      if (scope == PickupLabelScope.order && matchesScan(scannedCode, scope)) {
-        final pending = codes
-            .where((code) => !code.isScanned)
-            .map((code) => code.code)
-            .toList();
-        if (pending.isNotEmpty) return pending;
-      }
-      return [scannedCode.trim()];
-    }
-    if (scope == PickupLabelScope.volume) return [codes[index].code];
-
-    var start = 0;
-    var end = codes.length;
-    if (scope == PickupLabelScope.item) {
-      final group = _itemAt(index);
-      // Sem itemizacao conhecida, a leitura vale so pelo volume lido.
-      if (group == null) return [codes[index].code];
-      start = group.firstVolumeIndex;
-      end = (group.firstVolumeIndex + group.volumeCount).clamp(0, codes.length);
-    }
-
-    final covered = <String>[codes[index].code];
-    for (var position = start; position < end; position++) {
-      if (position == index || codes[position].isScanned) continue;
-      covered.add(codes[position].code);
-    }
-    return covered;
-  }
-
-  /// Confere tambem o codigo-base impresso quando existe uma etiqueta unica
-  /// para um pedido com varios volumes.
-  bool matchesScan(String scannedCode, PickupLabelScope scope) {
-    final key = normalizePickupCode(scannedCode);
-    if (codes.any((code) => normalizePickupCode(code.code) == key)) return true;
-    if (scope != PickupLabelScope.order) return false;
-    if (normalizePickupCode(orderNumber) == key) return true;
-    if (codes.length < 2) return false;
-
-    String? commonBase;
-    for (final code in codes) {
-      final match = RegExp(
-        r'^(.*)-(\d+)$',
-      ).firstMatch(normalizePickupCode(code.code));
-      if (match == null) return false;
-      final base = match.group(1);
-      if (base == null || base.isEmpty) return false;
-      commonBase ??= base;
-      if (commonBase != base) return false;
-    }
-    return commonBase == key;
-  }
-
-  PickupItemGroup? _itemAt(int volumeIndex) {
-    for (final item in items) {
-      if (item.covers(volumeIndex)) return item;
-    }
-    return null;
+    return codes.any((code) => normalizePickupCode(code.code) == key);
   }
 }
 
@@ -674,12 +580,9 @@ class WaveService {
       final response = await apiClient.dio.get<dynamic>(
         '/api/v1/delivery/waves/$waveId/retirada/',
       );
-      return _withWaveOrders(
-        WaveService.parsePickupProgress(response.data, waveId),
-      );
+      return WaveService.parsePickupProgress(response.data, waveId);
     } on DioException catch (error) {
-      if (error.response?.statusCode == 404 ||
-          error.response?.statusCode == 405) {
+      if (error.response?.statusCode == 405) {
         return PickupProgress.disabled(waveId);
       }
       throw WaveServiceException(_errorMessage(error));
@@ -689,66 +592,24 @@ class WaveService {
   Future<PickupProgress> registerPickup({
     required int waveId,
     required String code,
-    PickupProgress? optimisticProgress,
-  }) => registerPickupCodes(
-    waveId: waveId,
-    codes: [code],
-    optimisticProgress: optimisticProgress,
-  );
-
-  /// Confere uma etiqueta que pode cobrir mais de um volume.
-  ///
-  /// A API aceita um codigo por chamada, entao o escopo de item ou de pedido
-  /// vira uma sequencia de chamadas. So a primeira — a etiqueta que o
-  /// entregador leu — propaga erro: um volume adicional recusado (ja lido ou
-  /// removido da carga) nao invalida a leitura inteira.
-  Future<PickupProgress> registerPickupCodes({
-    required int waveId,
-    required List<String> codes,
-    PickupProgress? optimisticProgress,
   }) async {
-    final pendingCodes = codes
-        .map((code) => code.trim())
-        .where((code) => code.isNotEmpty)
-        .toList();
-    if (pendingCodes.isEmpty) {
+    final scannedCode = code.trim();
+    if (scannedCode.isEmpty) {
       throw const WaveServiceException('Informe ou leia um código válido.');
     }
     try {
-      final result = await apiClient.offlineRequests.execute<PickupProgress>(
-        resourceKey: 'pickup:$waveId',
-        description: 'Conferir retirada',
-        operation: (key) async {
-          dynamic lastPayload;
-          for (var index = 0; index < pendingCodes.length; index++) {
-            try {
-              final response = await apiClient.dio.post<dynamic>(
-                '/api/v1/delivery/waves/$waveId/retirada/',
-                data: {'code': pendingCodes[index]},
-                options: apiClient.offlineRequests.requestOptions(
-                  key,
-                  step: pendingCodes.length == 1 ? null : 'code-$index',
-                ),
-              );
-              lastPayload = response.data;
-            } on DioException catch (error) {
-              if (index == 0 || OfflineRequestQueue.isNetworkFailure(error)) {
-                rethrow;
-              }
-            }
-          }
-          invalidateCache();
-          return _withWaveOrders(
-            WaveService.parsePickupProgress(lastPayload, waveId),
-          );
-        },
+      final response = await apiClient.dio.post<dynamic>(
+        '/api/v1/delivery/waves/$waveId/retirada/',
+        data: {'code': scannedCode},
       );
-      final progress = result.value ?? optimisticProgress;
-      if (progress != null) return progress;
-      throw const WaveServiceException(
-        'A retirada foi salva para envio quando a conexão voltar.',
-      );
+      invalidateCache();
+      return WaveService.parsePickupProgress(response.data, waveId);
     } on DioException catch (error) {
+      if (OfflineRequestQueue.isNetworkFailure(error)) {
+        throw const WaveServiceException(
+          'Sem conexão. A conferência da retirada precisa de internet.',
+        );
+      }
       throw WaveServiceException(_errorMessage(error));
     }
   }
@@ -769,7 +630,7 @@ class WaveService {
       invalidateCache();
       final data = response.data;
       if (data is Map && data['orders'] is List) {
-        return _withWaveOrders(WaveService.parsePickupProgress(data, waveId));
+        return WaveService.parsePickupProgress(data, waveId);
       }
       return getPickupProgress(waveId);
     } on DioException catch (error) {
@@ -947,35 +808,6 @@ class WaveService {
     return 'Não foi possível concluir a operação. Tente novamente.';
   }
 
-  /// Converte os itens de um pedido em faixas de volumes.
-  ///
-  /// Devolve vazio quando a soma dos volumes dos itens nao bate com a lista de
-  /// etiquetas: sem essa correspondencia nao da pra dizer qual etiqueta e de
-  /// qual item, e o escopo por item cai de volta para o volume lido.
-  static List<PickupItemGroup> parsePickupItems(dynamic raw, int codeCount) {
-    if (raw is! List) return const [];
-    final groups = <PickupItemGroup>[];
-    var offset = 0;
-    for (final rawItem in raw.whereType<Map>()) {
-      final item = Map<String, dynamic>.from(rawItem);
-      final rawVolumes = item['volumes'];
-      final volumeCount = rawVolumes is List
-          ? rawVolumes.length
-          : _asInt(item['units']) ?? 0;
-      if (volumeCount <= 0) continue;
-      groups.add(
-        PickupItemGroup(
-          id: _asInt(item['id']) ?? 0,
-          name: item['name']?.toString() ?? 'Item ${groups.length + 1}',
-          firstVolumeIndex: offset,
-          volumeCount: volumeCount,
-        ),
-      );
-      offset += volumeCount;
-    }
-    return offset == codeCount ? groups : const [];
-  }
-
   static PickupProgress parsePickupProgress(dynamic raw, int fallbackWaveId) {
     final data = raw is Map
         ? Map<String, dynamic>.from(raw)
@@ -991,32 +823,18 @@ class WaveService {
         final codes = <PickupCode>[];
         final rawCodes = order['codes'];
         if (rawCodes is List) {
-          for (final rawCode in rawCodes) {
-            if (rawCode is Map) {
-              final codeData = Map<String, dynamic>.from(rawCode);
-              final code = codeData['code']?.toString().trim() ?? '';
-              if (code.isEmpty) continue;
-              codes.add(
-                PickupCode(
-                  code: code,
-                  scannedAt: DateTime.tryParse(
-                    codeData['scanned_at']?.toString() ?? '',
-                  ),
+          for (final rawCode in rawCodes.whereType<Map>()) {
+            final codeData = Map<String, dynamic>.from(rawCode);
+            final code = codeData['code']?.toString().trim() ?? '';
+            if (code.isEmpty) continue;
+            codes.add(
+              PickupCode(
+                code: code,
+                scannedAt: DateTime.tryParse(
+                  codeData['scanned_at']?.toString() ?? '',
                 ),
-              );
-            } else {
-              final code = rawCode?.toString().trim() ?? '';
-              if (code.isNotEmpty) {
-                codes.add(PickupCode(code: code, scannedAt: pickedUpAt));
-              }
-            }
-          }
-        }
-        // Compatibilidade com a versao anterior, que devolvia um unico code.
-        if (codes.isEmpty) {
-          final legacyCode = order['code']?.toString().trim() ?? '';
-          if (legacyCode.isNotEmpty) {
-            codes.add(PickupCode(code: legacyCode, scannedAt: pickedUpAt));
+              ),
+            );
           }
         }
         orders.add(
@@ -1026,7 +844,6 @@ class WaveService {
             customer: order['customer']?.toString() ?? 'Cliente',
             codes: codes,
             pickedUpAt: pickedUpAt,
-            items: parsePickupItems(order['items'], codes.length),
           ),
         );
       }
@@ -1039,115 +856,12 @@ class WaveService {
       pickedUp:
           _asInt(data['picked_up']) ??
           orders.where((order) => order.isPickedUp).length,
-      pending: _asInt(data['pending']) ?? 0,
+      pending:
+          _asInt(data['pending']) ??
+          orders.where((order) => !order.isPickedUp).length,
       isComplete: _asBool(data['is_complete']),
       orders: orders,
-      labelScope: PickupLabelScope.tryFromConfiguration(data),
-    );
-  }
-
-  Future<PickupProgress> _withWaveOrders(PickupProgress progress) async {
-    if (!progress.enabled || progress.total == 0) return progress;
-    try {
-      final results = await Future.wait([
-        _getAllOptional(
-          '/api/v1/delivery/pedidos-wave/',
-          queryParameters: {'wave': progress.waveId},
-        ),
-        _getAll(
-          '/api/v1/delivery/pedidos/',
-          queryParameters: {'wave': progress.waveId},
-        ),
-      ]);
-      final links = results[0];
-      final rawOrders = results[1];
-      final waveLinks = links
-          .where((link) => _relationId(link['wave']) == progress.waveId)
-          .toList();
-      final linkedIds = <int>{};
-      for (final link in waveLinks) {
-        final orderId = _relationId(link['order']);
-        if (orderId != null) linkedIds.add(orderId);
-      }
-
-      final existingById = {
-        for (final order in progress.orders) order.orderId: order,
-      };
-      final merged = <PickupOrder>[];
-      final includedIds = <int>{};
-      for (final order in rawOrders) {
-        final orderId = _asInt(order['id']);
-        if (orderId == null) continue;
-        final linkedWave = _relationId(
-          order['wave'] ?? order['wave_id'] ?? order['delivery_wave'],
-        );
-        if (linkedIds.isNotEmpty && !linkedIds.contains(orderId)) continue;
-        if (linkedIds.isEmpty && linkedWave != progress.waveId) continue;
-        final existing = existingById[orderId];
-        final number = order['order_number']?.toString() ?? '';
-        final externalId = order['external_id']?.toString().trim() ?? '';
-        final barcodeBase =
-            progress.barcodeSource == 'external_id' && externalId.isNotEmpty
-            ? externalId
-            : number;
-        final codes = existing?.codes.isNotEmpty == true
-            ? existing!.codes
-            : _pickupCodes(
-                barcodeBase,
-                _asInt(order['units']) ?? 1,
-                existing?.pickedUpAt,
-              );
-        final items = existing?.items.isNotEmpty == true
-            ? existing!.items
-            : WaveService.parsePickupItems(order['items'], codes.length);
-        merged.add(
-          PickupOrder(
-            orderId: orderId,
-            orderNumber: number,
-            customer:
-                order['customer_name']?.toString() ??
-                existing?.customer ??
-                'Cliente',
-            codes: codes,
-            pickedUpAt: existing?.pickedUpAt,
-            items: items,
-          ),
-        );
-        includedIds.add(orderId);
-      }
-      for (final existing in progress.orders) {
-        if (includedIds.add(existing.orderId)) merged.add(existing);
-      }
-      if (merged.isEmpty) return progress;
-      return PickupProgress(
-        waveId: progress.waveId,
-        enabled: progress.enabled,
-        barcodeSource: progress.barcodeSource,
-        total: progress.total,
-        pickedUp: progress.pickedUp,
-        pending: progress.pending,
-        isComplete: progress.isComplete,
-        orders: merged,
-        labelScope: progress.labelScope,
-      );
-    } on DioException {
-      return progress;
-    }
-  }
-
-  List<PickupCode> _pickupCodes(
-    String base,
-    int volumeCount,
-    DateTime? pickedUpAt,
-  ) {
-    if (base.trim().isEmpty) return const [];
-    final total = volumeCount > 1 ? volumeCount : 1;
-    return List.generate(
-      total,
-      (index) => PickupCode(
-        code: total == 1 ? base : '$base-${index + 1}',
-        scannedAt: pickedUpAt,
-      ),
+      labelGranularity: PickupLabelScope.tryFromConfiguration(data),
     );
   }
 

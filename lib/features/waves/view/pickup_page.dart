@@ -5,8 +5,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
-import '../../../app/app_dependencies.dart';
-import '../../../core/network/offline_request_queue.dart';
 import '../../../core/presentation/app_messages.dart';
 import '../data/pickup_label_scope.dart';
 import '../data/wave_service.dart';
@@ -40,8 +38,7 @@ class _PickupPageState extends State<PickupPage> {
     autoZoom: true,
   );
   late PickupProgress _progress;
-  PickupLabelScope _labelScope = PickupLabelScope.fallback;
-  bool _loadingLabelScope = true;
+  PickupLabelScope _labelGranularity = PickupLabelScope.fallback;
   bool _registering = false;
   bool _markingNotGoing = false;
   bool _landscape = false;
@@ -53,32 +50,13 @@ class _PickupPageState extends State<PickupPage> {
   DateTime? _nextScanAllowedAt;
   _PickupScanFeedback? _scanFeedback;
   Timer? _feedbackTimer;
-  StreamSubscription<OfflineQueueEvent>? _offlineQueueSubscription;
 
   @override
   void initState() {
     super.initState();
     _progress = widget.progress;
-    _labelScope = widget.progress.labelScope ?? PickupLabelScope.fallback;
-    _offlineQueueSubscription = widget.service.apiClient.offlineRequests.events
-        .listen(_onOfflineQueueEvent);
-    unawaited(_loadLabelScope());
-  }
-
-  Future<void> _loadLabelScope() async {
-    try {
-      final config = await AppDependencies.instance.auth.deliveryConfig(
-        refresh: true,
-      );
-      if (!mounted) return;
-      setState(() {
-        _labelScope =
-            PickupLabelScope.tryFromConfiguration(config) ?? _labelScope;
-        _loadingLabelScope = false;
-      });
-    } catch (_) {
-      if (mounted) setState(() => _loadingLabelScope = false);
-    }
+    _labelGranularity =
+        widget.progress.labelGranularity ?? PickupLabelScope.fallback;
   }
 
   @override
@@ -89,17 +67,13 @@ class _PickupPageState extends State<PickupPage> {
       ]),
     );
     _feedbackTimer?.cancel();
-    _offlineQueueSubscription?.cancel();
     _manualCodeController.dispose();
     _scannerController.dispose();
     super.dispose();
   }
 
   Future<void> _onDetect(BarcodeCapture capture) async {
-    if (_loadingLabelScope ||
-        _registering ||
-        _markingNotGoing ||
-        capture.barcodes.isEmpty) {
+    if (_registering || _markingNotGoing || capture.barcodes.isEmpty) {
       return;
     }
     final detectedCodes = capture.barcodes
@@ -149,33 +123,22 @@ class _PickupPageState extends State<PickupPage> {
 
   Future<void> _register(String rawCode) async {
     final code = rawCode.trim();
-    if (_loadingLabelScope ||
-        _registering ||
-        _markingNotGoing ||
-        code.isEmpty) {
+    if (_registering || _markingNotGoing || code.isEmpty) {
       if (code.isEmpty) _message('Informe ou leia um código válido.');
       return;
     }
 
     final knownBefore = _findOrder(_progress, code);
     final knownCodeBefore = _findCode(knownBefore, code);
-    final progressBefore = _progress;
-    final scopedCodes =
-        knownBefore?.codesForScan(code, _labelScope) ?? <String>[code];
-    final optimisticProgress = _optimisticallyRegister(
-      progressBefore,
-      scopedCodes,
-    );
     final scannedBefore = {
       for (final order in _progress.orders)
-        for (final volume in order.codes)
-          if (volume.isScanned) _normalizeCode(volume.code),
+        for (final label in order.codes)
+          if (label.isScanned) _normalizeCode(label.code),
     };
     _nextScanAllowedAt = DateTime.now().add(_postScanDelay);
     setState(() {
       _registering = true;
       _scanFeedback = null;
-      _progress = optimisticProgress;
     });
     try {
       try {
@@ -183,19 +146,17 @@ class _PickupPageState extends State<PickupPage> {
       } catch (_) {
         // A leitura manual pode ocorrer antes de a câmera terminar de iniciar.
       }
-      final updated = await widget.service.registerPickupCodes(
+      final updated = await widget.service.registerPickup(
         waveId: _progress.waveId,
-        codes: scopedCodes,
-        optimisticProgress: optimisticProgress,
+        code: code,
       );
       if (!mounted) return;
       setState(() {
         _progress = updated;
-        _labelScope = updated.labelScope ?? _labelScope;
+        _labelGranularity = updated.labelGranularity ?? _labelGranularity;
         _manualCodeController.clear();
       });
       final newlyScanned = _findNewlyScannedCode(updated, scannedBefore);
-      final newlyScannedCount = _countNewlyScanned(updated, scannedBefore);
       final order =
           _findOrder(updated, code) ?? newlyScanned?.order ?? knownBefore;
       final scannedCode =
@@ -207,13 +168,11 @@ class _PickupPageState extends State<PickupPage> {
               ? 'Carga conferida por completo'
               : order?.isPickedUp == true
               ? 'Pedido conferido com sucesso'
-              : newlyScannedCount > 1
-              ? '$newlyScannedCount volumes conferidos'
-              : 'Volume conferido com sucesso',
+              : 'Etiqueta conferida com sucesso',
           message: updated.isComplete
               ? 'Todos os ${updated.total} pedidos foram retirados.'
-              : order != null && order.totalVolumes > 1
-              ? '${order.scannedVolumes} de ${order.totalVolumes} volumes deste pedido · '
+              : order != null && order.totalLabels > 1
+              ? '${order.scannedLabels} de ${order.totalLabels} etiquetas deste pedido · '
                     '${updated.pending} pedido${updated.pending == 1 ? '' : 's'} pendente${updated.pending == 1 ? '' : 's'}'
               : '${updated.pickedUp} de ${updated.total} pedidos retirados · '
                     '${updated.pending} pendentes',
@@ -224,7 +183,6 @@ class _PickupPageState extends State<PickupPage> {
       );
     } on WaveServiceException catch (error) {
       if (mounted) {
-        setState(() => _progress = progressBefore);
         var displayOrder = knownBefore;
         var displayCode = knownCodeBefore;
         var alreadyScanned = knownCodeBefore?.isScanned == true;
@@ -246,7 +204,7 @@ class _PickupPageState extends State<PickupPage> {
             success: false,
             warning: alreadyScanned,
             title: alreadyScanned
-                ? 'Volume já conferido'
+                ? 'Etiqueta já conferida'
                 : 'Não foi possível conferir',
             message: alreadyScanned
                 ? 'Esta etiqueta já consta na conferência da carga.'
@@ -259,11 +217,10 @@ class _PickupPageState extends State<PickupPage> {
       }
     } catch (_) {
       if (mounted) {
-        setState(() => _progress = progressBefore);
         _showScanFeedback(
           _PickupScanFeedback(
             success: false,
-            title: 'Falha ao conferir o volume',
+            title: 'Falha ao conferir a etiqueta',
             message: 'Verifique a conexão e tente ler o código novamente.',
             orderNumber: knownBefore?.orderNumber ?? '',
             customer: knownBefore?.customer ?? '',
@@ -281,72 +238,6 @@ class _PickupPageState extends State<PickupPage> {
 
   String _normalizeCode(String code) => normalizePickupCode(code);
 
-  PickupProgress _optimisticallyRegister(
-    PickupProgress progress,
-    List<String> rawCodes,
-  ) {
-    final normalized = rawCodes.map(_normalizeCode).toSet();
-    final now = DateTime.now();
-    final orders = progress.orders.map((order) {
-      final matchesOrder = normalized.contains(
-        _normalizeCode(order.orderNumber),
-      );
-      var matchedCode = false;
-      final codes = order.codes.map((code) {
-        if (!normalized.contains(_normalizeCode(code.code))) return code;
-        matchedCode = true;
-        return PickupCode(code: code.code, scannedAt: code.scannedAt ?? now);
-      }).toList();
-      if (!matchesOrder && !matchedCode) return order;
-      final allScanned = codes.isEmpty || codes.every((code) => code.isScanned);
-      return PickupOrder(
-        orderId: order.orderId,
-        orderNumber: order.orderNumber,
-        customer: order.customer,
-        codes: codes,
-        pickedUpAt: order.pickedUpAt ?? (allScanned ? now : null),
-        items: order.items,
-      );
-    }).toList();
-    final pickedUp = orders.where((order) => order.isPickedUp).length;
-    return PickupProgress(
-      waveId: progress.waveId,
-      enabled: progress.enabled,
-      barcodeSource: progress.barcodeSource,
-      total: progress.total,
-      pickedUp: pickedUp,
-      pending: (progress.total - pickedUp).clamp(0, progress.total),
-      isComplete: progress.total > 0 && pickedUp >= progress.total,
-      orders: orders,
-      labelScope: progress.labelScope,
-    );
-  }
-
-  void _onOfflineQueueEvent(OfflineQueueEvent event) {
-    if (event.resourceKey != 'pickup:${_progress.waveId}' || !mounted) return;
-    if (event.type == OfflineQueueEventType.queued) {
-      _message('Sem internet. Conferencia salva para envio automatico.');
-      return;
-    }
-    if (event.type == OfflineQueueEventType.rejected) {
-      _message(
-        'A API recusou a conferencia offline. O estado sera restaurado.',
-      );
-    }
-    unawaited(_refreshAfterQueue());
-  }
-
-  Future<void> _refreshAfterQueue() async {
-    try {
-      final refreshed = await widget.service.getPickupProgress(
-        _progress.waveId,
-      );
-      if (mounted) setState(() => _progress = refreshed);
-    } catch (_) {
-      // O proximo ping ou retorno a tela fara uma nova conciliacao.
-    }
-  }
-
   String _preferredDetectedCode(List<String> detectedCodes) {
     final candidateKey = _candidateKey;
     if (candidateKey != null) {
@@ -356,8 +247,8 @@ class _PickupPageState extends State<PickupPage> {
     }
     for (final code in detectedCodes) {
       final order = _findOrder(_progress, code);
-      final volume = _findCode(order, code);
-      if (volume != null && !volume.isScanned) return code;
+      final label = _findCode(order, code);
+      if (label != null && !label.isScanned) return code;
     }
     for (final code in detectedCodes) {
       if (_findOrder(_progress, code) != null) return code;
@@ -384,7 +275,7 @@ class _PickupPageState extends State<PickupPage> {
 
   PickupOrder? _findOrder(PickupProgress progress, String code) {
     for (final order in progress.orders) {
-      if (order.matchesScan(code, _labelScope)) return order;
+      if (order.matchesCode(code)) return order;
     }
     return null;
   }
@@ -392,23 +283,10 @@ class _PickupPageState extends State<PickupPage> {
   PickupCode? _findCode(PickupOrder? order, String code) {
     if (order == null) return null;
     final key = _normalizeCode(code);
-    for (final volume in order.codes) {
-      if (_normalizeCode(volume.code) == key) return volume;
+    for (final label in order.codes) {
+      if (_normalizeCode(label.code) == key) return label;
     }
     return null;
-  }
-
-  int _countNewlyScanned(PickupProgress progress, Set<String> scannedBefore) {
-    var total = 0;
-    for (final order in progress.orders) {
-      for (final volume in order.codes) {
-        if (volume.isScanned &&
-            !scannedBefore.contains(_normalizeCode(volume.code))) {
-          total++;
-        }
-      }
-    }
-    return total;
   }
 
   _ScannedPickup? _findNewlyScannedCode(
@@ -416,10 +294,10 @@ class _PickupPageState extends State<PickupPage> {
     Set<String> scannedBefore,
   ) {
     for (final order in progress.orders) {
-      for (final volume in order.codes) {
-        if (volume.isScanned &&
-            !scannedBefore.contains(_normalizeCode(volume.code))) {
-          return _ScannedPickup(order, volume);
+      for (final label in order.codes) {
+        if (label.isScanned &&
+            !scannedBefore.contains(_normalizeCode(label.code))) {
+          return _ScannedPickup(order, label);
         }
       }
     }
@@ -560,7 +438,7 @@ class _PickupPageState extends State<PickupPage> {
         builder: (_) => _ManualPickupCodePage(
           controller: _manualCodeController,
           barcodeSource: _progress.barcodeSource,
-          labelScope: _labelScope,
+          labelGranularity: _labelGranularity,
         ),
       ),
     );
@@ -578,11 +456,10 @@ class _PickupPageState extends State<PickupPage> {
     body: _FullscreenScanner(
       controller: _scannerController,
       progress: _progress,
-      labelScope: _labelScope,
-      loadingLabelScope: _loadingLabelScope,
+      labelGranularity: _labelGranularity,
       landscape: _landscape,
       registering: _registering,
-      busy: _loadingLabelScope || _registering || _markingNotGoing,
+      busy: _registering || _markingNotGoing,
       candidateCode: _candidateCode,
       scanFeedback: _scanFeedback,
       onDetect: _onDetect,
@@ -599,8 +476,7 @@ class _FullscreenScanner extends StatelessWidget {
   const _FullscreenScanner({
     required this.controller,
     required this.progress,
-    required this.labelScope,
-    required this.loadingLabelScope,
+    required this.labelGranularity,
     required this.landscape,
     required this.registering,
     required this.busy,
@@ -616,8 +492,7 @@ class _FullscreenScanner extends StatelessWidget {
 
   final MobileScannerController controller;
   final PickupProgress progress;
-  final PickupLabelScope labelScope;
-  final bool loadingLabelScope;
+  final PickupLabelScope labelGranularity;
   final bool landscape;
   final bool registering;
   final bool busy;
@@ -654,7 +529,7 @@ class _FullscreenScanner extends StatelessWidget {
                   children: [
                     _ScannerProgressPill(progress: progress),
                     const SizedBox(height: 6),
-                    _LabelScopePill(scope: labelScope),
+                    _LabelScopePill(scope: labelGranularity),
                   ],
                 ),
               ),
@@ -757,9 +632,7 @@ class _FullscreenScanner extends StatelessWidget {
                 const SizedBox(height: 16),
                 Text(
                   registering
-                      ? 'Conferindo volume...'
-                      : loadingLabelScope
-                      ? 'Carregando configuração...'
+                      ? 'Conferindo etiqueta...'
                       : 'Atualizando a carga...',
                   style: const TextStyle(
                     color: Colors.white,
@@ -988,8 +861,8 @@ class _ScannerProgressPill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final label = progress.totalVolumes > 0
-        ? '${progress.scannedVolumes}/${progress.totalVolumes} volumes'
+    final label = progress.totalLabels > 0
+        ? '${progress.scannedLabels}/${progress.totalLabels} etiquetas'
         : '${progress.pickedUp}/${progress.total} pedidos';
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -1097,7 +970,7 @@ class _PickupOrdersPage extends StatelessWidget {
       children: [
         Text(
           '${progress.pickedUp} de ${progress.total} pedidos retirados · '
-          '${progress.scannedVolumes} de ${progress.totalVolumes} volumes',
+          '${progress.scannedLabels} de ${progress.totalLabels} etiquetas',
           style: const TextStyle(color: _muted, fontSize: 12),
         ),
         const SizedBox(height: 14),
@@ -1176,7 +1049,7 @@ class _PickupOrderCard extends StatelessWidget {
             Text(
               order.isPickedUp
                   ? 'Retirado'
-                  : '${order.scannedVolumes}/${order.totalVolumes} volumes',
+                  : '${order.scannedLabels}/${order.totalLabels} etiquetas',
               style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w900),
             ),
           ],
@@ -1242,12 +1115,12 @@ class _ManualPickupCodePage extends StatelessWidget {
   const _ManualPickupCodePage({
     required this.controller,
     required this.barcodeSource,
-    required this.labelScope,
+    required this.labelGranularity,
   });
 
   final TextEditingController controller;
   final String barcodeSource;
-  final PickupLabelScope labelScope;
+  final PickupLabelScope labelGranularity;
 
   void _submit(BuildContext context) {
     final code = controller.text.trim();
@@ -1289,7 +1162,7 @@ class _ManualPickupCodePage extends StatelessWidget {
                     child: _ManualCodeCard(
                       controller: controller,
                       barcodeSource: barcodeSource,
-                      labelScope: labelScope,
+                      labelGranularity: labelGranularity,
                       registering: false,
                       onSubmit: () => _submit(context),
                     ),
@@ -1331,14 +1204,14 @@ class _ManualCodeCard extends StatelessWidget {
   const _ManualCodeCard({
     required this.controller,
     required this.barcodeSource,
-    required this.labelScope,
+    required this.labelGranularity,
     required this.registering,
     required this.onSubmit,
   });
 
   final TextEditingController controller;
   final String barcodeSource;
-  final PickupLabelScope labelScope;
+  final PickupLabelScope labelGranularity;
   final bool registering;
   final VoidCallback onSubmit;
 
@@ -1376,17 +1249,17 @@ class _ManualCodeCard extends StatelessWidget {
         Center(
           child: Text(
             barcodeSource == 'external_id'
-                ? 'Use o código externo da etiqueta deste volume.'
-                : 'Use o código completo da etiqueta deste volume.',
+                ? 'Use o código externo exatamente como aparece na etiqueta.'
+                : 'Use o código completo exatamente como aparece na etiqueta.',
             textAlign: TextAlign.center,
             style: const TextStyle(color: _muted, fontSize: 12),
           ),
         ),
-        if (labelScope != PickupLabelScope.volume) ...[
+        if (labelGranularity != PickupLabelScope.volume) ...[
           const SizedBox(height: 6),
           Center(
             child: Text(
-              labelScope.description,
+              labelGranularity.description,
               textAlign: TextAlign.center,
               style: const TextStyle(
                 color: _ink,
@@ -1408,8 +1281,8 @@ class _ManualCodeCard extends StatelessWidget {
           style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900),
           decoration: InputDecoration(
             hintText: barcodeSource == 'external_id'
-                ? 'Código externo do volume'
-                : 'Código do volume',
+                ? 'Código externo da etiqueta'
+                : 'Código da etiqueta',
             filled: true,
             fillColor: _cream,
             border: OutlineInputBorder(

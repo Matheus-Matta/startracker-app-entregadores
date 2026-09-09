@@ -551,7 +551,7 @@ class _PickupProgressCard extends StatelessWidget {
                         const SizedBox(height: 2),
                         Text(
                           '${progress.pickedUp} de ${progress.total} pedidos · '
-                          '${progress.scannedVolumes} de ${progress.totalVolumes} volumes',
+                          '${progress.scannedLabels} de ${progress.totalLabels} etiquetas',
                           style: const TextStyle(color: _muted, fontSize: 10),
                         ),
                       ],
@@ -829,8 +829,8 @@ class _OrderCard extends StatelessWidget {
                                     order.stopStatus
                               : pickup!.isPickedUp
                               ? 'Retirado'
-                              : pickup!.scannedVolumes > 0
-                              ? '${pickup!.scannedVolumes}/${pickup!.totalVolumes} volumes'
+                              : pickup!.scannedLabels > 0
+                              ? '${pickup!.scannedLabels}/${pickup!.totalLabels} etiquetas'
                               : 'Aguardando retirada',
                         ),
                       ],

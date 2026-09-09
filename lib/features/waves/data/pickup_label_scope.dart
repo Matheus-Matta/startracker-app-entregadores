@@ -1,27 +1,27 @@
 /// Granularidade da etiqueta impressa para a conferencia de retirada.
 ///
-/// A API sempre valida um codigo por volume (`POST waves/{id}/retirada/`). O
-/// escopo diz quantos volumes uma unica etiqueta representa no armazem: ao ler
-/// uma etiqueta de item ou de pedido, o aplicativo confirma de uma vez todos os
-/// volumes que ela cobre.
+/// A granularidade define quantas etiquetas a API exige para cada pedido.
+///
+/// O aplicativo nunca expande uma leitura: ele envia exatamente o codigo lido
+/// e usa `orders[].codes` como fonte de verdade para as etiquetas obrigatorias.
 enum PickupLabelScope {
   volume(
     apiValue: 'volume',
     label: 'Etiqueta por volume',
     shortLabel: 'Volume',
-    description: 'Cada etiqueta confere um volume do pedido.',
+    description: 'A API exige uma etiqueta para cada volume do pedido.',
   ),
   item(
     apiValue: 'item',
     label: 'Etiqueta por item',
     shortLabel: 'Item',
-    description: 'Uma etiqueta confere todos os volumes do item.',
+    description: 'A API exige uma etiqueta para cada item do pedido.',
   ),
   order(
     apiValue: 'order',
     label: 'Etiqueta por pedido',
     shortLabel: 'Pedido',
-    description: 'Uma etiqueta confere todos os volumes do pedido.',
+    description: 'A API exige uma unica etiqueta para o pedido.',
   );
 
   const PickupLabelScope({
