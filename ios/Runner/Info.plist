@@ -32,6 +32,8 @@
 	<string>A câmera é usada para ler etiquetas, QR Codes e códigos de barras e registrar comprovantes de entrega.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Sua localização é usada durante a entrega para exibir a rota e registrar o local da confirmação.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Sua localização é usada durante uma rota ativa para acompanhar o trajeto e registrar o local das confirmações de entrega.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>O acesso às fotos permite selecionar imagens usadas nos comprovantes de entrega.</string>
 	<key>UIApplicationSceneManifest</key>
