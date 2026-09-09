@@ -246,7 +246,6 @@ jobs:
           issuer-id: ${{ env.APPSTORE_ISSUER_ID }}
           api-key-id: ${{ env.APPSTORE_API_KEY_ID }}
           api-private-key: ${{ env.APPSTORE_API_PRIVATE_KEY }}
-          uses-non-exempt-encryption: 'false'
           wait-for-processing: 'true'
 
       - name: Apagar credenciais temporarias

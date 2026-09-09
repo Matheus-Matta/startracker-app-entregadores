@@ -139,8 +139,8 @@ Nao e necessario criar outros secrets ou environments.
 Primeiro envie as alteracoes do projeto para o GitHub. Depois crie uma tag simples com a nova versao:
 
 ```powershell
-git tag -a "v1.0.38" -m "Release 1.0.38"
-git push origin "v1.0.38"
+git tag -a "v1.0.39" -m "Release 1.0.39"
+git push origin "v1.0.39"
 ```
 
 O workflow gera automaticamente um numero interno crescente para o Android e o iOS.
