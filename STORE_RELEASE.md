@@ -136,12 +136,14 @@ Nao e necessario criar outros secrets ou environments.
 
 ## Passo 5 — Publicar
 
-Primeiro envie as alteracoes do projeto para o GitHub. Depois crie uma tag usando uma versao e um build maior que o anterior:
+Primeiro envie as alteracoes do projeto para o GitHub. Depois crie uma tag simples com a nova versao:
 
 ```powershell
-git tag -a "v1.0.36+9" -m "Release 1.0.36 build 9"
-git push origin "v1.0.36+9"
+git tag -a "v1.0.38" -m "Release 1.0.38"
+git push origin "v1.0.38"
 ```
+
+O workflow gera automaticamente um numero interno crescente para o Android e o iOS.
 
 O GitHub Actions vai automaticamente:
 
