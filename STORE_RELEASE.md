@@ -74,7 +74,7 @@ Importante: antes da primeira publicacao automatica, crie o aplicativo `com.star
 No Apple Developer/App Store Connect, o aplicativo deve usar este Bundle ID:
 
 ```env
-IOS_BUNDLE_ID=br.dev.star.tracker.entrega
+IOS_BUNDLE_ID=br.dev.star.tracker.entregas
 ```
 
 Preencha no `.env`:

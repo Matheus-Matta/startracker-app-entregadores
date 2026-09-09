@@ -6,7 +6,7 @@
 	<string>app-store-connect</string>
 	<key>provisioningProfiles</key>
 	<dict>
-		<key>br.dev.star.tracker.entrega</key>
+		<key>br.dev.star.tracker.entregas</key>
 		<string>AppStore br.dev.star.tracker.entrega</string>
 	</dict>
 	<key>signingStyle</key>
