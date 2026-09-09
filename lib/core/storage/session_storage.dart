@@ -15,7 +15,6 @@ class SessionStorage {
   static const _routeChangeNotificationsKey = 'notification_route_changes';
   static const _orderUpdateNotificationsKey = 'notification_order_updates';
   static const _pendingDeliveryCaptureKey = 'pending_delivery_capture';
-  static const _pickupLabelScopeKey = 'pickup_label_scope';
   static String? _cachedAccessToken;
   static String? _cachedRefreshToken;
   static bool _accessTokenLoaded = false;
@@ -132,15 +131,6 @@ class SessionStorage {
 
   Future<void> clearPendingDeliveryCapture() =>
       _storage.delete(key: _pendingDeliveryCaptureKey);
-
-  /// Escopo da etiqueta usado na conferencia de retirada.
-  ///
-  /// Guardado como texto porque a enumeracao vive na camada de entregas.
-  Future<void> savePickupLabelScope(String scope) =>
-      _storage.write(key: _pickupLabelScopeKey, value: scope);
-
-  Future<String?> readPickupLabelScope() =>
-      _storage.read(key: _pickupLabelScopeKey);
 
   Future<NotificationPreferences> readNotificationPreferences() async {
     final values = await Future.wait([

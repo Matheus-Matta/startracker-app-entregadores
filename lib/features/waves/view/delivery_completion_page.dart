@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import '../../../core/presentation/app_messages.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
@@ -263,7 +264,7 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
   }
 
   void _message(String text) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+    showAppMessage(context, text);
   }
 
   @override
@@ -979,9 +980,7 @@ class _SignatureCapturePageState extends State<_SignatureCapturePage> {
   Future<void> _confirm() async {
     if (_exporting) return;
     if (!(_signatureKey.currentState?.hasSignature ?? false)) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Faça a assinatura para confirmar.')),
-      );
+      showAppMessage(context, 'Faça a assinatura para confirmar.');
       return;
     }
     setState(() => _exporting = true);

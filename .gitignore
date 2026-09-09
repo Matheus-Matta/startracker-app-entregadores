@@ -38,6 +38,8 @@ migrate_working_dir/
 .env.prod
 .env.production
 .env.staging
+.release.env
+.release/
 
 # Symbolication related
 app.*.symbols
@@ -53,6 +55,14 @@ app.*.map.json
 *.jks
 *.keystore
 
-# APKs gerados localmente (o workflow por tag publica os oficiais)
+# Binarios gerados localmente (o workflow por tag publica os oficiais)
 *.apk
 *.apk.sha256
+*.aab
+*.ipa
+
+service-account.json
+*.p8
+*.p12
+*.cer
+*.certSigningRequest

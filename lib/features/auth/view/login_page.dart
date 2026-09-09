@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../../../core/presentation/app_messages.dart';
 
 import '../../../app/app_dependencies.dart';
 import '../../delivery/view/delivery_page.dart';
@@ -63,9 +64,7 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   void _showUnavailableMessage(String message) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text(message)));
+    showAppMessage(context, message);
   }
 
   @override
