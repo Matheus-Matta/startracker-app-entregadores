@@ -255,17 +255,28 @@ jobs:
 
   github-release:
     name: Criar release no GitHub
-    needs: [prepare, android, ios]
+    needs: [prepare, quality, android, ios]
+    if: ${{ always() && !cancelled() && needs.prepare.result == 'success' && needs.quality.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v8
+      - name: Baixar artefatos disponiveis
+        uses: actions/download-artifact@v8
+        continue-on-error: true
         with:
           pattern: '*-${{ needs.prepare.outputs.safe_tag }}'
           path: release-assets
           merge-multiple: true
-      - uses: softprops/action-gh-release@v3
+
+      - name: Criar release mesmo se uma loja falhar
+        if: ${{ always() }}
+        uses: softprops/action-gh-release@v3
         with:
           name: StarTracker Entregas ${{ github.ref_name }}
+          body: |
+            Resultado dos jobs de publicacao:
+            - Google Play: ${{ needs.android.result }}
+            - App Store/TestFlight: ${{ needs.ios.result }}
           generate_release_notes: true
           make_latest: true
           files: release-assets/*
+          fail_on_unmatched_files: false

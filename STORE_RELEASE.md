@@ -167,3 +167,5 @@ PLAY_TRACK=production
 Atualize o secret `RELEASE_ENV_FILE` no GitHub com o novo conteúdo e crie uma nova tag.
 
 No iPhone, o workflow envia para o TestFlight. A liberacao publica ainda precisa ser enviada para revisao pelo App Store Connect.
+
+A release do GitHub e criada mesmo se a publicacao no Google Play, no TestFlight ou em ambos falhar. Os artefatos que tiverem sido gerados sao anexados; se nenhum pacote estiver disponivel, a release ainda e publicada sem arquivos e informa o resultado de cada job.
