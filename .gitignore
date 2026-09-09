@@ -35,6 +35,9 @@ migrate_working_dir/
 /android/.kotlin/
 /coverage/
 .env
+.env.*
+!.env.example
+!.env.*.example
 .env.prod
 .env.production
 .env.staging
@@ -62,7 +65,14 @@ app.*.map.json
 *.ipa
 
 service-account.json
+service-account*.json
+play-service-account*.json
 *.p8
 *.p12
 *.cer
 *.certSigningRequest
+*.csr
+*.pem
+*.key
+*.mobileprovision
+*.provisionprofile

@@ -55,6 +55,7 @@ jobs:
           cache: true
       - run: flutter pub get
       - run: python -m py_compile tool/prepare_release_env.py
+      - run: python tool/check_repository_secrets.py --history
       - run: flutter analyze
       - run: flutter test
 
