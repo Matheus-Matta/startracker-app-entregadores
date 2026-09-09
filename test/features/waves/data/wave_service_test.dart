@@ -3,6 +3,46 @@ import 'package:star_tracker/features/waves/data/pickup_label_scope.dart';
 import 'package:star_tracker/features/waves/data/wave_service.dart';
 
 void main() {
+  group('PickupLabelScope.fromConfiguration', () {
+    test('usa a granularidade devolvida pela configuracao da API', () {
+      expect(
+        PickupLabelScope.fromConfiguration({'label_granularity': 'volume'}),
+        PickupLabelScope.volume,
+      );
+      expect(
+        PickupLabelScope.fromConfiguration({'label_granularity': 'item'}),
+        PickupLabelScope.item,
+      );
+      expect(
+        PickupLabelScope.fromConfiguration({'label_granularity': 'order'}),
+        PickupLabelScope.order,
+      );
+      expect(
+        PickupLabelScope.fromConfiguration({'label_scope': 'per_order'}),
+        PickupLabelScope.order,
+      );
+      expect(
+        PickupLabelScope.fromConfiguration({
+          'pickup_label_scope': {'value': 'pedido'},
+        }),
+        PickupLabelScope.order,
+      );
+    });
+
+    test('usa volume quando a API antiga nao informa a granularidade', () {
+      expect(
+        PickupLabelScope.fromConfiguration(const {}),
+        PickupLabelScope.volume,
+      );
+      expect(
+        PickupLabelScope.fromConfiguration({
+          'label_granularity': 'desconhecido',
+        }),
+        PickupLabelScope.volume,
+      );
+    });
+  });
+
   group('WaveService.displayStatus', () {
     test(
       'prioriza rota iniciada mesmo quando o status da wave esta defasado',
@@ -26,6 +66,7 @@ void main() {
         'wave_id': 10,
         'pickup_enabled': true,
         'barcode_source': 'order_number',
+        'label_scope': 'per_order',
         'total': 2,
         'picked_up': 0,
         'pending': 2,
@@ -66,6 +107,7 @@ void main() {
       expect(progress.orders.first.isPickedUp, isFalse);
       expect(progress.orders.first.codes.last.code, 'PED-2026-001-2');
       expect(progress.orders.first.codes.last.isScanned, isFalse);
+      expect(progress.labelScope, PickupLabelScope.order);
     });
 
     test('continua aceitando o payload antigo com code unico', () {
@@ -186,6 +228,40 @@ void main() {
         'PED-81-1',
         'PED-81-2',
         'PED-81-3',
+      ]);
+    });
+
+    test('aceita o codigo-base da etiqueta unica por pedido', () {
+      expect(buildOrder().codesForScan('PED-81', PickupLabelScope.order), [
+        'PED-81-1',
+        'PED-81-2',
+        'PED-81-3',
+      ]);
+      expect(
+        buildOrder().matchesScan('PED-81', PickupLabelScope.order),
+        isTrue,
+      );
+      expect(
+        buildOrder().matchesScan('PED-81', PickupLabelScope.volume),
+        isFalse,
+      );
+    });
+
+    test('aceita o codigo-base externo da etiqueta unica por pedido', () {
+      const order = PickupOrder(
+        orderId: 82,
+        orderNumber: 'PED-82',
+        customer: 'Cliente',
+        pickedUpAt: null,
+        codes: [
+          PickupCode(code: 'EXT-ABC-1', scannedAt: null),
+          PickupCode(code: 'EXT-ABC-2', scannedAt: null),
+        ],
+      );
+
+      expect(order.codesForScan('EXT-ABC', PickupLabelScope.order), [
+        'EXT-ABC-1',
+        'EXT-ABC-2',
       ]);
     });
 

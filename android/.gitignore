@@ -12,3 +12,9 @@ GeneratedPluginRegistrant.java
 key.properties
 **/*.keystore
 **/*.jks
+
+service-account.json
+*.p8
+*.p12
+*.cer
+*.certSigningRequest

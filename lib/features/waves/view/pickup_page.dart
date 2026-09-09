@@ -27,15 +27,21 @@ class PickupPage extends StatefulWidget {
 }
 
 class _PickupPageState extends State<PickupPage> {
-  static const _stabilizationDuration = Duration(milliseconds: 900);
+  static const _stabilizationDuration = Duration(seconds: 1);
+  static const _postScanDelay = Duration(seconds: 1);
   static const _maximumDetectionGap = Duration(milliseconds: 450);
 
   final _manualCodeController = TextEditingController();
   final _scannerController = MobileScannerController(
+    cameraResolution: const Size(1280, 720),
     detectionSpeed: DetectionSpeed.normal,
+    detectionTimeoutMs: 200,
+    formats: const [BarcodeFormat.qrCode, BarcodeFormat.code128],
+    autoZoom: true,
   );
   late PickupProgress _progress;
   PickupLabelScope _labelScope = PickupLabelScope.fallback;
+  bool _loadingLabelScope = true;
   bool _registering = false;
   bool _markingNotGoing = false;
   bool _landscape = false;
@@ -44,8 +50,7 @@ class _PickupPageState extends State<PickupPage> {
   DateTime? _candidateSince;
   DateTime? _candidateLastSeen;
   int _candidateReads = 0;
-  String? _lastHandledKey;
-  DateTime? _ignoreLastCodeUntil;
+  DateTime? _nextScanAllowedAt;
   _PickupScanFeedback? _scanFeedback;
   Timer? _feedbackTimer;
   StreamSubscription<OfflineQueueEvent>? _offlineQueueSubscription;
@@ -54,16 +59,26 @@ class _PickupPageState extends State<PickupPage> {
   void initState() {
     super.initState();
     _progress = widget.progress;
+    _labelScope = widget.progress.labelScope ?? PickupLabelScope.fallback;
     _offlineQueueSubscription = widget.service.apiClient.offlineRequests.events
         .listen(_onOfflineQueueEvent);
     unawaited(_loadLabelScope());
   }
 
   Future<void> _loadLabelScope() async {
-    final stored = await AppDependencies.instance.storage
-        .readPickupLabelScope();
-    if (!mounted) return;
-    setState(() => _labelScope = PickupLabelScope.fromStorage(stored));
+    try {
+      final config = await AppDependencies.instance.auth.deliveryConfig(
+        refresh: true,
+      );
+      if (!mounted) return;
+      setState(() {
+        _labelScope =
+            PickupLabelScope.tryFromConfiguration(config) ?? _labelScope;
+        _loadingLabelScope = false;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _loadingLabelScope = false);
+    }
   }
 
   @override
@@ -81,7 +96,12 @@ class _PickupPageState extends State<PickupPage> {
   }
 
   Future<void> _onDetect(BarcodeCapture capture) async {
-    if (_registering || _markingNotGoing || capture.barcodes.isEmpty) return;
+    if (_loadingLabelScope ||
+        _registering ||
+        _markingNotGoing ||
+        capture.barcodes.isEmpty) {
+      return;
+    }
     final detectedCodes = capture.barcodes
         .map((barcode) => barcode.rawValue?.trim() ?? '')
         .where((code) => code.isNotEmpty)
@@ -90,12 +110,10 @@ class _PickupPageState extends State<PickupPage> {
     final code = _preferredDetectedCode(detectedCodes);
 
     final now = DateTime.now();
-    final key = _normalizeCode(code);
-    if (_lastHandledKey == key &&
-        _ignoreLastCodeUntil != null &&
-        now.isBefore(_ignoreLastCodeUntil!)) {
+    if (_nextScanAllowedAt != null && now.isBefore(_nextScanAllowedAt!)) {
       return;
     }
+    final key = _normalizeCode(code);
 
     final lostCandidate =
         _candidateLastSeen == null ||
@@ -125,14 +143,16 @@ class _PickupPageState extends State<PickupPage> {
       _candidateLastSeen = null;
       _candidateReads = 0;
     });
-    _lastHandledKey = key;
-    _ignoreLastCodeUntil = now.add(const Duration(seconds: 2));
+    _nextScanAllowedAt = now.add(_postScanDelay);
     await _register(code);
   }
 
   Future<void> _register(String rawCode) async {
     final code = rawCode.trim();
-    if (_registering || _markingNotGoing || code.isEmpty) {
+    if (_loadingLabelScope ||
+        _registering ||
+        _markingNotGoing ||
+        code.isEmpty) {
       if (code.isEmpty) _message('Informe ou leia um código válido.');
       return;
     }
@@ -151,8 +171,7 @@ class _PickupPageState extends State<PickupPage> {
         for (final volume in order.codes)
           if (volume.isScanned) _normalizeCode(volume.code),
     };
-    _lastHandledKey = _normalizeCode(code);
-    _ignoreLastCodeUntil = DateTime.now().add(const Duration(seconds: 2));
+    _nextScanAllowedAt = DateTime.now().add(_postScanDelay);
     setState(() {
       _registering = true;
       _scanFeedback = null;
@@ -172,6 +191,7 @@ class _PickupPageState extends State<PickupPage> {
       if (!mounted) return;
       setState(() {
         _progress = updated;
+        _labelScope = updated.labelScope ?? _labelScope;
         _manualCodeController.clear();
       });
       final newlyScanned = _findNewlyScannedCode(updated, scannedBefore);
@@ -254,13 +274,7 @@ class _PickupPageState extends State<PickupPage> {
     } finally {
       if (mounted) {
         setState(() => _registering = false);
-        if (!_progress.isComplete) {
-          try {
-            await _scannerController.start();
-          } catch (_) {
-            // A entrada manual continua disponível se a câmera não iniciar.
-          }
-        }
+        await _resumeScanner();
       }
     }
   }
@@ -304,6 +318,7 @@ class _PickupPageState extends State<PickupPage> {
       pending: (progress.total - pickedUp).clamp(0, progress.total),
       isComplete: progress.total > 0 && pickedUp >= progress.total,
       orders: orders,
+      labelScope: progress.labelScope,
     );
   }
 
@@ -333,6 +348,12 @@ class _PickupPageState extends State<PickupPage> {
   }
 
   String _preferredDetectedCode(List<String> detectedCodes) {
+    final candidateKey = _candidateKey;
+    if (candidateKey != null) {
+      for (final code in detectedCodes) {
+        if (_normalizeCode(code) == candidateKey) return code;
+      }
+    }
     for (final code in detectedCodes) {
       final order = _findOrder(_progress, code);
       final volume = _findCode(order, code);
@@ -362,12 +383,8 @@ class _PickupPageState extends State<PickupPage> {
   }
 
   PickupOrder? _findOrder(PickupProgress progress, String code) {
-    final key = _normalizeCode(code);
     for (final order in progress.orders) {
-      if (_findCode(order, key) != null) return order;
-      if (order.codes.isEmpty && _normalizeCode(order.orderNumber) == key) {
-        return order;
-      }
+      if (order.matchesScan(code, _labelScope)) return order;
     }
     return null;
   }
@@ -445,31 +462,17 @@ class _PickupPageState extends State<PickupPage> {
 
   Future<void> _resumeScanner() async {
     if (_progress.isComplete) return;
+    final nextScanAllowedAt = _nextScanAllowedAt;
+    if (nextScanAllowedAt != null) {
+      final remaining = nextScanAllowedAt.difference(DateTime.now());
+      if (!remaining.isNegative) await Future<void>.delayed(remaining);
+    }
+    if (!mounted || _progress.isComplete) return;
     try {
       await _scannerController.start();
     } catch (_) {
       // As acoes manuais continuam disponiveis se a camera nao reiniciar.
     }
-  }
-
-  Future<void> _openLabelScope() async {
-    await _pauseScanner();
-    if (!mounted) return;
-    final scope = await showModalBottomSheet<PickupLabelScope>(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (_) => _LabelScopeSheet(selected: _labelScope),
-    );
-    if (!mounted) return;
-    if (scope != null && scope != _labelScope) {
-      setState(() => _labelScope = scope);
-      await AppDependencies.instance.storage.savePickupLabelScope(
-        scope.storageValue,
-      );
-      if (!mounted) return;
-      _message('${scope.label}. ${scope.description}');
-    }
-    await _resumeScanner();
   }
 
   Future<void> _openOrders() async {
@@ -576,15 +579,15 @@ class _PickupPageState extends State<PickupPage> {
       controller: _scannerController,
       progress: _progress,
       labelScope: _labelScope,
+      loadingLabelScope: _loadingLabelScope,
       landscape: _landscape,
       registering: _registering,
-      busy: _registering || _markingNotGoing,
+      busy: _loadingLabelScope || _registering || _markingNotGoing,
       candidateCode: _candidateCode,
       scanFeedback: _scanFeedback,
       onDetect: _onDetect,
       onClose: () => Navigator.of(context).pop(false),
       onRotate: _toggleOrientation,
-      onLabelScope: _openLabelScope,
       onOrders: _openOrders,
       onManualCode: _openManualCode,
       onComplete: () => Navigator.of(context).pop(true),
@@ -597,6 +600,7 @@ class _FullscreenScanner extends StatelessWidget {
     required this.controller,
     required this.progress,
     required this.labelScope,
+    required this.loadingLabelScope,
     required this.landscape,
     required this.registering,
     required this.busy,
@@ -605,7 +609,6 @@ class _FullscreenScanner extends StatelessWidget {
     required this.onDetect,
     required this.onClose,
     required this.onRotate,
-    required this.onLabelScope,
     required this.onOrders,
     required this.onManualCode,
     required this.onComplete,
@@ -614,6 +617,7 @@ class _FullscreenScanner extends StatelessWidget {
   final MobileScannerController controller;
   final PickupProgress progress;
   final PickupLabelScope labelScope;
+  final bool loadingLabelScope;
   final bool landscape;
   final bool registering;
   final bool busy;
@@ -622,7 +626,6 @@ class _FullscreenScanner extends StatelessWidget {
   final ValueChanged<BarcodeCapture> onDetect;
   final VoidCallback onClose;
   final VoidCallback onRotate;
-  final VoidCallback onLabelScope;
   final VoidCallback onOrders;
   final VoidCallback onManualCode;
   final VoidCallback onComplete;
@@ -630,178 +633,144 @@ class _FullscreenScanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) => ColoredBox(
     color: Colors.black,
-    child: LayoutBuilder(
-      builder: (context, constraints) {
-        final frameWidth = (constraints.maxWidth * .72).clamp(230.0, 440.0);
-        final frameHeight = (frameWidth * .38).clamp(92.0, 155.0);
-        final scanWindow = Rect.fromCenter(
-          center: constraints.biggest.center(Offset.zero),
-          width: frameWidth,
-          height: frameHeight,
-        );
-        return Stack(
-          fit: StackFit.expand,
-          children: [
-            MobileScanner(
-              controller: controller,
-              onDetect: onDetect,
-              scanWindow: scanWindow,
-            ),
-            if (!progress.isComplete)
-              Center(
-                child: Container(
-                  width: frameWidth,
-                  height: frameHeight,
-                  decoration: BoxDecoration(
-                    border: Border.all(color: _yellow, width: 3),
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                ),
-              ),
-            if (!progress.isComplete)
-              Center(
-                child: Transform.translate(
-                  offset: Offset(0, frameHeight / 2 + 42),
-                  child: _ScannerStabilityHint(candidateCode: candidateCode),
-                ),
-              ),
-            SafeArea(
-              child: Stack(
-                children: [
-                  Positioned(
-                    left: 12,
-                    top: 8,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        _ScannerProgressPill(progress: progress),
-                        const SizedBox(height: 6),
-                        _LabelScopePill(scope: labelScope, onTap: onLabelScope),
-                      ],
-                    ),
-                  ),
-                  Positioned(
-                    right: 12,
-                    top: 8,
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        _CameraFloatingButton(
-                          tooltip: 'Fechar retirada',
-                          icon: Icons.close_rounded,
-                          onPressed: registering ? null : onClose,
-                        ),
-                        const SizedBox(height: 8),
-                        _CameraFloatingButton(
-                          tooltip: 'Ligar ou desligar flash',
-                          icon: Icons.flashlight_on_rounded,
-                          onPressed: registering || progress.isComplete
-                              ? null
-                              : controller.toggleTorch,
-                        ),
-                        const SizedBox(height: 8),
-                        _CameraFloatingButton(
-                          tooltip: landscape
-                              ? 'Usar tela em pé'
-                              : 'Virar a tela',
-                          icon: landscape
-                              ? Icons.stay_current_portrait_rounded
-                              : Icons.screen_rotation_alt_rounded,
-                          onPressed: registering ? null : onRotate,
-                        ),
-                        const SizedBox(height: 8),
-                        _CameraFloatingButton(
-                          tooltip: 'Escopo da etiqueta',
-                          icon: Icons.label_outline_rounded,
-                          onPressed: busy ? null : onLabelScope,
-                        ),
-                        const SizedBox(height: 8),
-                        _CameraFloatingButton(
-                          tooltip: 'Pedidos da carga',
-                          icon: Icons.fact_check_outlined,
-                          onPressed: busy ? null : onOrders,
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            if (progress.isComplete)
-              Container(
-                color: Colors.black.withValues(alpha: .66),
-                alignment: Alignment.center,
-                child: const Column(
+    child: Stack(
+      fit: StackFit.expand,
+      children: [
+        MobileScanner(controller: controller, onDetect: onDetect),
+        if (!progress.isComplete)
+          Align(
+            alignment: const Alignment(0, .28),
+            child: _ScannerStabilityHint(candidateCode: candidateCode),
+          ),
+        SafeArea(
+          child: Stack(
+            children: [
+              Positioned(
+                left: 12,
+                top: 8,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.check_circle_rounded, size: 68, color: _yellow),
-                    SizedBox(height: 10),
-                    Text(
-                      'Carga conferida',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 22,
-                        fontWeight: FontWeight.w900,
-                      ),
-                    ),
+                    _ScannerProgressPill(progress: progress),
+                    const SizedBox(height: 6),
+                    _LabelScopePill(scope: labelScope),
                   ],
                 ),
               ),
-            if (scanFeedback != null && !busy)
-              SafeArea(
-                child: Align(
-                  alignment: Alignment.bottomCenter,
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(14, 0, 14, 82),
-                    child: _PickupScanFeedbackCard(feedback: scanFeedback!),
-                  ),
-                ),
-              ),
-            SafeArea(
-              child: Align(
-                alignment: Alignment.bottomCenter,
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
-                  child: progress.isComplete
-                      ? _ScannerBottomButton(
-                          icon: Icons.check_circle_rounded,
-                          label: 'Concluir retirada',
-                          onPressed: onComplete,
-                        )
-                      : _ScannerBottomButton(
-                          icon: Icons.keyboard_rounded,
-                          label: 'Digitar código manualmente',
-                          onPressed: busy ? null : onManualCode,
-                        ),
-                ),
-              ),
-            ),
-            if (busy)
-              Container(
-                color: Colors.black.withValues(alpha: .58),
-                alignment: Alignment.center,
+              Positioned(
+                right: 12,
+                top: 8,
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const CircularProgressIndicator(color: _yellow),
-                    const SizedBox(height: 16),
-                    Text(
-                      registering
-                          ? 'Conferindo volume...'
-                          : 'Atualizando a carga...',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w800,
-                      ),
+                    _CameraFloatingButton(
+                      tooltip: 'Fechar retirada',
+                      icon: Icons.close_rounded,
+                      onPressed: registering ? null : onClose,
+                    ),
+                    const SizedBox(height: 8),
+                    _CameraFloatingButton(
+                      tooltip: 'Ligar ou desligar flash',
+                      icon: Icons.flashlight_on_rounded,
+                      onPressed: registering || progress.isComplete
+                          ? null
+                          : controller.toggleTorch,
+                    ),
+                    const SizedBox(height: 8),
+                    _CameraFloatingButton(
+                      tooltip: landscape ? 'Usar tela em pé' : 'Virar a tela',
+                      icon: landscape
+                          ? Icons.stay_current_portrait_rounded
+                          : Icons.screen_rotation_alt_rounded,
+                      onPressed: registering ? null : onRotate,
+                    ),
+                    const SizedBox(height: 8),
+                    _CameraFloatingButton(
+                      tooltip: 'Pedidos da carga',
+                      icon: Icons.fact_check_outlined,
+                      onPressed: busy ? null : onOrders,
                     ),
                   ],
                 ),
               ),
-          ],
-        );
-      },
+            ],
+          ),
+        ),
+        if (progress.isComplete)
+          Container(
+            color: Colors.black.withValues(alpha: .66),
+            alignment: Alignment.center,
+            child: const Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.check_circle_rounded, size: 68, color: _yellow),
+                SizedBox(height: 10),
+                Text(
+                  'Carga conferida',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 22,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        if (scanFeedback != null && !busy)
+          SafeArea(
+            child: Align(
+              alignment: Alignment.bottomCenter,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(14, 0, 14, 82),
+                child: _PickupScanFeedbackCard(feedback: scanFeedback!),
+              ),
+            ),
+          ),
+        SafeArea(
+          child: Align(
+            alignment: Alignment.bottomCenter,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+              child: progress.isComplete
+                  ? _ScannerBottomButton(
+                      icon: Icons.check_circle_rounded,
+                      label: 'Concluir retirada',
+                      onPressed: onComplete,
+                    )
+                  : _ScannerBottomButton(
+                      icon: Icons.keyboard_rounded,
+                      label: 'Digitar código manualmente',
+                      onPressed: busy ? null : onManualCode,
+                    ),
+            ),
+          ),
+        ),
+        if (busy)
+          Container(
+            color: Colors.black.withValues(alpha: .58),
+            alignment: Alignment.center,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const CircularProgressIndicator(color: _yellow),
+                const SizedBox(height: 16),
+                Text(
+                  registering
+                      ? 'Conferindo volume...'
+                      : loadingLabelScope
+                      ? 'Carregando configuração...'
+                      : 'Atualizando a carga...',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
     ),
   );
 }
@@ -852,7 +821,9 @@ class _ScannerStabilityHint extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           Icon(
-            reading ? Icons.center_focus_strong_rounded : Icons.qr_code_rounded,
+            reading
+                ? Icons.center_focus_strong_rounded
+                : Icons.qr_code_scanner_rounded,
             size: 19,
             color: _yellow,
           ),
@@ -860,8 +831,8 @@ class _ScannerStabilityHint extends StatelessWidget {
           Flexible(
             child: Text(
               reading
-                  ? 'Mantenha parado · $candidateCode'
-                  : 'Centralize o código e mantenha parado',
+                  ? 'Mantenha parado por 1 segundo · $candidateCode'
+                  : 'Leia QR Code ou código de barras em toda a tela',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(
@@ -1035,145 +1006,31 @@ class _ScannerProgressPill extends StatelessWidget {
 }
 
 class _LabelScopePill extends StatelessWidget {
-  const _LabelScopePill({required this.scope, required this.onTap});
+  const _LabelScopePill({required this.scope});
 
   final PickupLabelScope scope;
-  final VoidCallback onTap;
 
   @override
-  Widget build(BuildContext context) => Material(
-    color: Colors.black.withValues(alpha: .72),
-    borderRadius: BorderRadius.circular(14),
-    child: InkWell(
-      onTap: onTap,
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+    decoration: BoxDecoration(
+      color: Colors.black.withValues(alpha: .72),
       borderRadius: BorderRadius.circular(14),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.label_outline_rounded, size: 15, color: _yellow),
-            const SizedBox(width: 6),
-            Text(
-              'Etiqueta: ${scope.shortLabel}',
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 11,
-                fontWeight: FontWeight.w800,
-              ),
-            ),
-          ],
-        ),
-      ),
     ),
-  );
-}
-
-class _LabelScopeSheet extends StatelessWidget {
-  const _LabelScopeSheet({required this.selected});
-
-  final PickupLabelScope selected;
-
-  @override
-  Widget build(BuildContext context) => SafeArea(
-    top: false,
-    child: Container(
-      margin: const EdgeInsets.all(12),
-      padding: const EdgeInsets.fromLTRB(18, 16, 18, 18),
-      decoration: BoxDecoration(
-        color: _cream,
-        borderRadius: BorderRadius.circular(22),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            'Escopo da etiqueta',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900),
-          ),
-          const SizedBox(height: 4),
-          const Text(
-            'Escolha o que uma leitura confirma, conforme a etiqueta que o '
-            'armazém imprime.',
-            style: TextStyle(color: _muted, fontSize: 12),
-          ),
-          const SizedBox(height: 14),
-          ...PickupLabelScope.values.map(
-            (scope) => Padding(
-              padding: const EdgeInsets.only(bottom: 8),
-              child: _LabelScopeOption(
-                scope: scope,
-                selected: scope == selected,
-                onTap: () => Navigator.of(context).pop(scope),
-              ),
-            ),
-          ),
-        ],
-      ),
-    ),
-  );
-}
-
-class _LabelScopeOption extends StatelessWidget {
-  const _LabelScopeOption({
-    required this.scope,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final PickupLabelScope scope;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) => Material(
-    color: Colors.white,
-    borderRadius: BorderRadius.circular(16),
-    child: InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(16),
-      child: Ink(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(
-            color: selected ? _ink : const Color(0xFFE4E1D8),
-            width: selected ? 2 : 1,
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const Icon(Icons.label_outline_rounded, size: 15, color: _yellow),
+        const SizedBox(width: 6),
+        Text(
+          'Etiqueta: ${scope.shortLabel}',
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 11,
+            fontWeight: FontWeight.w800,
           ),
         ),
-        padding: const EdgeInsets.all(14),
-        child: Row(
-          children: [
-            Icon(
-              selected
-                  ? Icons.radio_button_checked_rounded
-                  : Icons.radio_button_unchecked_rounded,
-              size: 20,
-              color: selected ? _ink : _muted,
-            ),
-            const SizedBox(width: 11),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    scope.label,
-                    style: const TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w900,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    scope.description,
-                    style: const TextStyle(color: _muted, fontSize: 11),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
+      ],
     ),
   );
 }

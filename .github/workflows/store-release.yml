@@ -1,0 +1,269 @@
+name: Publicar apps por tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: store-release
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Ler versao da tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      build: ${{ steps.tag.outputs.build }}
+      safe_tag: ${{ steps.tag.outputs.safe_tag }}
+    steps:
+      - name: Validar tag
+        id: tag
+        shell: bash
+        run: |
+          value="${GITHUB_REF_NAME#v}"
+          if [[ "$value" =~ ^([0-9]+\.[0-9]+\.[0-9]+)(\+([0-9]+)|-build([0-9]+))?$ ]]; then
+            version="${BASH_REMATCH[1]}"
+            build="${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+          else
+            echo "Use uma tag como v1.0.36+9"
+            exit 1
+          fi
+          [[ -n "$build" ]] || build="$GITHUB_RUN_NUMBER"
+          safe_tag="$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9._-' '-')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "safe_tag=$safe_tag" >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: Testar aplicativo
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.4'
+          channel: stable
+          cache: true
+      - run: flutter pub get
+      - run: python -m py_compile tool/prepare_release_env.py
+      - run: flutter analyze
+      - run: flutter test
+
+  android:
+    name: Publicar no Google Play
+    needs: [prepare, quality]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RELEASE_ENV_FILE: ${{ secrets.RELEASE_ENV_FILE }}
+    steps:
+      - name: Baixar codigo da tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Ler o unico .env
+        shell: bash
+        run: |
+          printf '%s\n' "$RELEASE_ENV_FILE" > .release.env
+          python tool/prepare_release_env.py android
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.4'
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Gerar AAB e APK assinados
+        shell: bash
+        run: |
+          flutter build appbundle --release \
+            --build-name="${{ needs.prepare.outputs.version }}" \
+            --build-number="${{ needs.prepare.outputs.build }}" \
+            --dart-define-from-file=.env.production
+          flutter build apk --release \
+            --build-name="${{ needs.prepare.outputs.version }}" \
+            --build-number="${{ needs.prepare.outputs.build }}" \
+            --dart-define-from-file=.env.production
+
+      - name: Preparar arquivos Android
+        shell: bash
+        run: |
+          mkdir -p dist/android
+          cp build/app/outputs/bundle/release/app-release.aab "dist/android/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}.aab"
+          cp build/app/outputs/flutter-apk/app-release.apk "dist/android/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}.apk"
+          cd dist/android
+          sha256sum * > SHA256SUMS-android.txt
+
+      - name: Guardar arquivos Android
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-${{ needs.prepare.outputs.safe_tag }}
+          path: dist/android/*
+          if-no-files-found: error
+
+      - name: Enviar AAB para o Google Play
+        uses: r0adkll/upload-google-play@v1.1.5
+        with:
+          serviceAccountJson: .release/play-service-account.json
+          packageName: com.startracker.star_tracker
+          releaseFiles: dist/android/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}.aab
+          tracks: ${{ env.PLAY_TRACK }}
+          status: ${{ env.PLAY_RELEASE_STATUS }}
+          releaseName: StarTracker Entregas ${{ github.ref_name }}
+
+      - name: Apagar credenciais temporarias
+        if: always()
+        shell: bash
+        run: rm -rf .release .release.env .env.production android/key.properties android/upload-keystore.jks
+
+  ios:
+    name: Publicar no TestFlight
+    needs: [prepare, quality]
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      RELEASE_ENV_FILE: ${{ secrets.RELEASE_ENV_FILE }}
+    steps:
+      - name: Baixar codigo da tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Ler o unico .env
+        shell: bash
+        run: |
+          printf '%s\n' "$RELEASE_ENV_FILE" > .release.env
+          python3 tool/prepare_release_env.py ios
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '~26.4.0'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.4'
+          channel: stable
+          cache: true
+
+      - name: Preparar projeto iOS
+        shell: bash
+        run: |
+          flutter pub get
+          flutter build ios --release --no-codesign \
+            --build-name="${{ needs.prepare.outputs.version }}" \
+            --build-number="${{ needs.prepare.outputs.build }}" \
+            --dart-define-from-file=.env.production
+
+      - name: Importar certificado Apple
+        uses: Apple-Actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ env.APPSTORE_CERTIFICATES_FILE_BASE64 }}
+          p12-password: ${{ env.APPSTORE_CERTIFICATES_PASSWORD }}
+
+      - name: Baixar provisioning profile
+        uses: Apple-Actions/download-provisioning-profiles@v6
+        with:
+          bundle-id: ${{ env.IOS_BUNDLE_ID }}
+          profile-type: IOS_APP_STORE
+          issuer-id: ${{ env.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ env.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ env.APPSTORE_API_PRIVATE_KEY }}
+
+      - name: Configurar assinatura
+        shell: bash
+        run: |
+          /usr/libexec/PlistBuddy -c 'Delete :provisioningProfiles' ios/ExportOptions.plist
+          /usr/libexec/PlistBuddy -c 'Add :provisioningProfiles dict' ios/ExportOptions.plist
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:$IOS_BUNDLE_ID string $IOS_PROVISIONING_PROFILE_NAME" ios/ExportOptions.plist
+          /usr/libexec/PlistBuddy -c "Set :teamID $IOS_TEAM_ID" ios/ExportOptions.plist
+
+      - name: Gerar IPA assinado
+        id: build_ios
+        uses: Apple-Actions/xcodebuild@v1
+        with:
+          workspace: ios/Runner.xcworkspace
+          scheme: Runner
+          configuration: Release
+          sdk: iphoneos
+          destination: generic/platform=iOS
+          action: archive
+          archive-path: .build/Archives/Runner.xcarchive
+          export-options-plist: ios/ExportOptions.plist
+          export-path: .build/Artifacts/Runner.ipa
+          build-number: ${{ needs.prepare.outputs.build }}
+          disable-automatic-package-resolution: false
+          build-settings: |
+            DEVELOPMENT_TEAM=${{ env.IOS_TEAM_ID }}
+            CODE_SIGN_STYLE=Manual
+            CODE_SIGN_IDENTITY=Apple Distribution
+            PROVISIONING_PROFILE_SPECIFIER=${{ env.IOS_PROVISIONING_PROFILE_NAME }}
+            PRODUCT_BUNDLE_IDENTIFIER=${{ env.IOS_BUNDLE_ID }}
+            FLUTTER_BUILD_NAME=${{ needs.prepare.outputs.version }}
+            FLUTTER_BUILD_NUMBER=${{ needs.prepare.outputs.build }}
+
+      - name: Preparar arquivo iOS
+        shell: bash
+        env:
+          IPA_SOURCE: ${{ steps.build_ios.outputs.ipa-path }}
+        run: |
+          mkdir -p dist/ios
+          cp "$IPA_SOURCE" "dist/ios/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}.ipa"
+          cd dist/ios
+          shasum -a 256 *.ipa > SHA256SUMS-ios.txt
+
+      - name: Guardar arquivo iOS
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-${{ needs.prepare.outputs.safe_tag }}
+          path: dist/ios/*
+          if-no-files-found: error
+
+      - name: Enviar IPA para o TestFlight
+        uses: Apple-Actions/upload-testflight-build@v5
+        with:
+          app-path: dist/ios/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}.ipa
+          issuer-id: ${{ env.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ env.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ env.APPSTORE_API_PRIVATE_KEY }}
+          uses-non-exempt-encryption: 'false'
+          wait-for-processing: 'true'
+
+      - name: Apagar credenciais temporarias
+        if: always()
+        shell: bash
+        run: rm -rf .release .release.env .env.production
+
+  github-release:
+    name: Criar release no GitHub
+    needs: [prepare, android, ios]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: '*-${{ needs.prepare.outputs.safe_tag }}'
+          path: release-assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
+        with:
+          name: StarTracker Entregas ${{ github.ref_name }}
+          generate_release_notes: true
+          make_latest: true
+          files: release-assets/*

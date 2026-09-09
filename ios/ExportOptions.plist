@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>method</key>
+	<string>app-store-connect</string>
+	<key>provisioningProfiles</key>
+	<dict>
+		<key>br.dev.star.tracker.entrega</key>
+		<string>AppStore br.dev.star.tracker.entrega</string>
+	</dict>
+	<key>signingStyle</key>
+	<string>manual</string>
+	<key>teamID</key>
+	<string>GITHUB_IOS_TEAM_ID</string>
+</dict>
+</plist>

@@ -85,6 +85,7 @@ class PickupProgress {
     required this.pending,
     required this.isComplete,
     required this.orders,
+    this.labelScope,
   });
 
   factory PickupProgress.disabled(int waveId) => PickupProgress(
@@ -106,6 +107,7 @@ class PickupProgress {
   final int pending;
   final bool isComplete;
   final List<PickupOrder> orders;
+  final PickupLabelScope? labelScope;
 
   int get totalVolumes =>
       orders.fold(0, (total, order) => total + order.totalVolumes);
@@ -189,7 +191,16 @@ class PickupOrder {
         break;
       }
     }
-    if (index < 0) return [scannedCode.trim()];
+    if (index < 0) {
+      if (scope == PickupLabelScope.order && matchesScan(scannedCode, scope)) {
+        final pending = codes
+            .where((code) => !code.isScanned)
+            .map((code) => code.code)
+            .toList();
+        if (pending.isNotEmpty) return pending;
+      }
+      return [scannedCode.trim()];
+    }
     if (scope == PickupLabelScope.volume) return [codes[index].code];
 
     var start = 0;
@@ -208,6 +219,29 @@ class PickupOrder {
       covered.add(codes[position].code);
     }
     return covered;
+  }
+
+  /// Confere tambem o codigo-base impresso quando existe uma etiqueta unica
+  /// para um pedido com varios volumes.
+  bool matchesScan(String scannedCode, PickupLabelScope scope) {
+    final key = normalizePickupCode(scannedCode);
+    if (codes.any((code) => normalizePickupCode(code.code) == key)) return true;
+    if (scope != PickupLabelScope.order) return false;
+    if (normalizePickupCode(orderNumber) == key) return true;
+    if (codes.length < 2) return false;
+
+    String? commonBase;
+    for (final code in codes) {
+      final match = RegExp(
+        r'^(.*)-(\d+)$',
+      ).firstMatch(normalizePickupCode(code.code));
+      if (match == null) return false;
+      final base = match.group(1);
+      if (base == null || base.isEmpty) return false;
+      commonBase ??= base;
+      if (commonBase != base) return false;
+    }
+    return commonBase == key;
   }
 
   PickupItemGroup? _itemAt(int volumeIndex) {
@@ -894,18 +928,22 @@ class WaveService {
 
   String _errorMessage(DioException error) {
     final data = error.response?.data;
-    if (data is List && data.isNotEmpty) {
-      return useDeliveryTerminology(data.first.toString());
-    }
     if (data is Map) {
-      final detail = data['detail'] ?? data['non_field_errors'];
-      if (detail is String && detail.isNotEmpty) {
-        return useDeliveryTerminology(detail);
-      }
-      if (detail is List && detail.isNotEmpty) {
-        return useDeliveryTerminology(detail.first.toString());
+      for (final key in const [
+        'detail',
+        'non_field_errors',
+        'code',
+        'barcode',
+        'label',
+        'message',
+        'error',
+      ]) {
+        final message = _firstApiError(data[key]);
+        if (message != null) return useDeliveryTerminology(message);
       }
     }
+    final message = _firstApiError(data);
+    if (message != null) return useDeliveryTerminology(message);
     return 'Não foi possível concluir a operação. Tente novamente.';
   }
 
@@ -1004,6 +1042,7 @@ class WaveService {
       pending: _asInt(data['pending']) ?? 0,
       isComplete: _asBool(data['is_complete']),
       orders: orders,
+      labelScope: PickupLabelScope.tryFromConfiguration(data),
     );
   }
 
@@ -1089,6 +1128,7 @@ class WaveService {
         pending: progress.pending,
         isComplete: progress.isComplete,
         orders: merged,
+        labelScope: progress.labelScope,
       );
     } on DioException {
       return progress;
@@ -1130,4 +1170,21 @@ class WaveService {
     String text => const {'true', '1', 'yes'}.contains(text.toLowerCase()),
     _ => false,
   };
+}
+
+String? _firstApiError(dynamic value) {
+  if (value is String && value.trim().isNotEmpty) return value.trim();
+  if (value is List) {
+    for (final item in value) {
+      final message = _firstApiError(item);
+      if (message != null) return message;
+    }
+  }
+  if (value is Map) {
+    for (final item in value.values) {
+      final message = _firstApiError(item);
+      if (message != null) return message;
+    }
+  }
+  return null;
 }

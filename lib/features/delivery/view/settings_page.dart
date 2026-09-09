@@ -6,7 +6,6 @@ import '../../../core/notifications/notification_preferences.dart';
 import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../../auth/data/profile_service.dart';
 import '../../auth/view/login_page.dart';
-import '../../waves/data/pickup_label_scope.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
@@ -20,7 +19,6 @@ class _SettingsPageState extends State<SettingsPage> {
   NotificationPreferences _notificationPreferences =
       NotificationPreferences.defaults;
   bool _loadingNotificationPreferences = true;
-  PickupLabelScope _labelScope = PickupLabelScope.fallback;
 
   @override
   void initState() {
@@ -28,21 +26,6 @@ class _SettingsPageState extends State<SettingsPage> {
     final dependencies = AppDependencies.instance;
     _profile = dependencies.profile.getProfile();
     _loadNotificationPreferences();
-    _loadLabelScope();
-  }
-
-  Future<void> _loadLabelScope() async {
-    final stored = await AppDependencies.instance.storage
-        .readPickupLabelScope();
-    if (!mounted) return;
-    setState(() => _labelScope = PickupLabelScope.fromStorage(stored));
-  }
-
-  Future<void> _updateLabelScope(PickupLabelScope scope) async {
-    setState(() => _labelScope = scope);
-    await AppDependencies.instance.storage.savePickupLabelScope(
-      scope.storageValue,
-    );
   }
 
   Future<void> _loadNotificationPreferences() async {
@@ -197,31 +180,6 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ),
         const SizedBox(height: 14),
-        _Panel(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Retirada',
-                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w900),
-              ),
-              const SizedBox(height: 2),
-              const Text(
-                'O que uma leitura confirma na conferência da carga',
-                style: TextStyle(color: Color(0xFF858279), fontSize: 12),
-              ),
-              const SizedBox(height: 8),
-              ...PickupLabelScope.values.map(
-                (scope) => _LabelScopeTile(
-                  scope: scope,
-                  selected: scope == _labelScope,
-                  onTap: () => _updateLabelScope(scope),
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 14),
         OutlinedButton.icon(
           onPressed: _logout,
           icon: const Icon(Icons.logout_rounded),
@@ -283,38 +241,6 @@ class _ProfileRow extends StatelessWidget {
         ),
       ),
     ],
-  );
-}
-
-class _LabelScopeTile extends StatelessWidget {
-  const _LabelScopeTile({
-    required this.scope,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final PickupLabelScope scope;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) => ListTile(
-    onTap: onTap,
-    contentPadding: EdgeInsets.zero,
-    leading: Icon(
-      selected
-          ? Icons.radio_button_checked_rounded
-          : Icons.radio_button_unchecked_rounded,
-      color: selected ? const Color(0xFF171713) : const Color(0xFF858279),
-    ),
-    title: Text(
-      scope.label,
-      style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
-    ),
-    subtitle: Text(
-      scope.description,
-      style: const TextStyle(color: Color(0xFF858279), fontSize: 12),
-    ),
   );
 }
 

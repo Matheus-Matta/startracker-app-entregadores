@@ -63,6 +63,25 @@ class AuthService {
     }
   }
 
+  /// Busca a configuracao vigente da conta e conserva a ultima copia valida
+  /// para que preferencias operacionais continuem disponiveis sem rede.
+  Future<Map<String, dynamic>> deliveryConfig({bool refresh = false}) async {
+    final cached = await storage.readDeliveryConfig();
+    if (!refresh) return cached;
+
+    try {
+      final response = await apiClient.dio.get<Map<String, dynamic>>(
+        '/api/v1/auth/entregadores/configuracao/',
+      );
+      final config = _deliveryConfigFrom(response.data ?? const {});
+      if (config.isEmpty) return cached;
+      await storage.saveDeliveryConfig(config);
+      return config;
+    } on DioException {
+      return cached;
+    }
+  }
+
   Future<bool> _refreshSession() async {
     final access = await apiClient.refreshAccessToken();
     if (access == null || access.isEmpty) {
@@ -76,15 +95,6 @@ class AuthService {
   }
 
   Map<String, dynamic> _deliveryConfigFrom(Map<String, dynamic> data) {
-    dynamic raw = data['delivery_config'];
-    if (raw is! Map && data['account'] is Map) {
-      raw = (data['account'] as Map)['delivery_config'];
-    }
-    if (raw is! Map && data['delivery'] is Map) {
-      raw = (data['delivery'] as Map)['config'];
-    }
-    if (raw is! Map) return const {};
-
     const acceptedKeys = {
       'require_photo',
       'minimum_photos',
@@ -96,8 +106,32 @@ class AuthService {
       'capture_timestamp',
       'pickup_enabled',
       'pickup_barcode_source',
+      'label_scope',
+      'pickup_label_scope',
+      'label_granularity',
+      'pickup_label_granularity',
+      'label_print_scope',
+      'label_code_format',
+      'label_width_mm',
+      'label_height_mm',
       'version',
     };
+    dynamic raw = data['delivery_config'];
+    if (raw is! Map && data['account'] is Map) {
+      final account = data['account'] as Map;
+      raw = account['delivery_config'] ?? account['config'];
+    }
+    if (raw is! Map && data['delivery'] is Map) {
+      raw = (data['delivery'] as Map)['config'];
+    }
+    if (raw is! Map && data['config'] is Map) {
+      raw = data['config'];
+    }
+    if (raw is! Map && data.keys.any(acceptedKeys.contains)) {
+      raw = data;
+    }
+    if (raw is! Map) return const {};
+
     final config = Map<String, dynamic>.from(raw);
     config.removeWhere((key, _) => !acceptedKeys.contains(key));
     return config;
