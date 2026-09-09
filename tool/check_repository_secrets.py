@@ -143,14 +143,44 @@ def content_problems(content: bytes) -> set[str]:
 
 
 def current_files() -> Iterable[tuple[str, bytes]]:
-    tracked = git("ls-files", "-z")
-    for raw_path in tracked.split("\0"):
-        if not raw_path:
+    index = subprocess.run(
+        ("git", "ls-files", "--stage", "-z"),
+        cwd=ROOT,
+        capture_output=True,
+        check=True,
+    ).stdout
+    entries: list[tuple[str, str]] = []
+    for record in index.split(b"\0"):
+        if not record:
             continue
-        path = normalize(raw_path)
-        file_path = ROOT / Path(path)
-        if file_path.is_file():
-            yield path, file_path.read_bytes()
+        metadata, separator, raw_path = record.partition(b"\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3 or fields[2] != b"0":
+            continue
+        path = normalize(raw_path.decode("utf-8", errors="surrogateescape"))
+        entries.append((fields[1].decode("ascii"), path))
+
+    if not entries:
+        return
+
+    response = subprocess.run(
+        ("git", "cat-file", "--batch"),
+        cwd=ROOT,
+        input="".join(f"{object_id}\n" for object_id, _ in entries).encode("ascii"),
+        capture_output=True,
+        check=True,
+    ).stdout
+    position = 0
+    for (_, path) in entries:
+        header_end = response.index(b"\n", position)
+        header = response[position:header_end].split()
+        if len(header) != 3 or header[1] != b"blob":
+            raise RuntimeError(f"Objeto inesperado no indice: {path}")
+        size = int(header[2])
+        start = header_end + 1
+        end = start + size
+        yield path, response[start:end]
+        position = end + 1
 
 
 def historical_paths() -> set[str]:
