@@ -441,7 +441,11 @@ class ActiveRouteService {
       ]);
       final deliveryConfig = results[0] as Map<String, dynamic>;
       final stops = (results[1] as List<Map<String, dynamic>>)
-          .where((item) => _asInt(item['route']) == routeId)
+          .where(
+            (item) =>
+                _asInt(item['route']) == routeId &&
+                item['status']?.toString() != 'cancelled',
+          )
           .toList();
       final orders = {
         for (final item in results[2] as List<Map<String, dynamic>>)
@@ -785,6 +789,14 @@ class ActiveRouteService {
       'capture_timestamp',
       'pickup_enabled',
       'pickup_barcode_source',
+      'label_scope',
+      'pickup_label_scope',
+      'label_granularity',
+      'pickup_label_granularity',
+      'label_print_scope',
+      'label_code_format',
+      'label_width_mm',
+      'label_height_mm',
     };
     final result = Map<String, dynamic>.from(raw);
     result.removeWhere((key, _) => !keys.contains(key));

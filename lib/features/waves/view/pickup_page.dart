@@ -5,7 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
+import '../../../core/async/debouncer.dart';
 import '../../../core/presentation/app_messages.dart';
+import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../data/pickup_label_scope.dart';
 import '../data/wave_service.dart';
 
@@ -41,6 +43,8 @@ class _PickupPageState extends State<PickupPage> {
   PickupLabelScope _labelGranularity = PickupLabelScope.fallback;
   bool _registering = false;
   bool _markingNotGoing = false;
+  bool _refreshing = false;
+  bool _refreshPending = false;
   bool _landscape = false;
   String? _candidateCode;
   String? _candidateKey;
@@ -50,6 +54,10 @@ class _PickupPageState extends State<PickupPage> {
   DateTime? _nextScanAllowedAt;
   _PickupScanFeedback? _scanFeedback;
   Timer? _feedbackTimer;
+  StreamSubscription<FleetRealtimeEvent>? _realtimeSubscription;
+  final Debouncer _realtimeDebouncer = Debouncer(
+    const Duration(milliseconds: 200),
+  );
 
   @override
   void initState() {
@@ -57,6 +65,10 @@ class _PickupPageState extends State<PickupPage> {
     _progress = widget.progress;
     _labelGranularity =
         widget.progress.labelGranularity ?? PickupLabelScope.fallback;
+    _realtimeSubscription = FleetRealtimeChannel.instance.events.listen(
+      _onRealtimeEvent,
+    );
+    unawaited(_refreshProgress(showError: true));
   }
 
   @override
@@ -66,6 +78,8 @@ class _PickupPageState extends State<PickupPage> {
         DeviceOrientation.portraitUp,
       ]),
     );
+    _realtimeDebouncer.dispose();
+    _realtimeSubscription?.cancel();
     _feedbackTimer?.cancel();
     _manualCodeController.dispose();
     _scannerController.dispose();
@@ -73,7 +87,11 @@ class _PickupPageState extends State<PickupPage> {
   }
 
   Future<void> _onDetect(BarcodeCapture capture) async {
-    if (_registering || _markingNotGoing || capture.barcodes.isEmpty) {
+    if (_registering ||
+        _markingNotGoing ||
+        _refreshing ||
+        _progress.isComplete ||
+        capture.barcodes.isEmpty) {
       return;
     }
     final detectedCodes = capture.barcodes
@@ -123,8 +141,8 @@ class _PickupPageState extends State<PickupPage> {
 
   Future<void> _register(String rawCode) async {
     final code = rawCode.trim();
-    if (_registering || _markingNotGoing || code.isEmpty) {
-      if (code.isEmpty) _message('Informe ou leia um código válido.');
+    if (_registering || _markingNotGoing || _refreshing || code.isEmpty) {
+      if (code.isEmpty) _message('Informe o código da etiqueta.');
       return;
     }
 
@@ -232,8 +250,59 @@ class _PickupPageState extends State<PickupPage> {
       if (mounted) {
         setState(() => _registering = false);
         await _resumeScanner();
+        _drainPendingRefresh();
       }
     }
+  }
+
+  void _onRealtimeEvent(FleetRealtimeEvent event) {
+    if (!event.isConnected && !event.isOrderChange && !event.isRouteChange) {
+      return;
+    }
+    _realtimeDebouncer.run(() {
+      if (mounted) unawaited(_refreshProgress());
+    });
+  }
+
+  Future<void> _refreshProgress({bool showError = false}) async {
+    if (_refreshing || _registering || _markingNotGoing) {
+      _refreshPending = true;
+      return;
+    }
+    setState(() => _refreshing = true);
+    final wasComplete = _progress.isComplete;
+    try {
+      final updated = await widget.service.getPickupProgress(_progress.waveId);
+      if (!mounted) return;
+      setState(() {
+        _progress = updated;
+        _labelGranularity = updated.labelGranularity ?? _labelGranularity;
+      });
+      if (updated.isComplete) {
+        try {
+          await _scannerController.stop();
+        } catch (_) {
+          // A tela pode terminar a retirada antes de a camera iniciar.
+        }
+      } else if (wasComplete) {
+        await _resumeScanner();
+      }
+    } on WaveServiceException catch (error) {
+      if (mounted && showError) _message(error.message);
+    } finally {
+      if (mounted) {
+        setState(() => _refreshing = false);
+        _drainPendingRefresh();
+      }
+    }
+  }
+
+  void _drainPendingRefresh() {
+    if (!_refreshPending || _refreshing || _registering || _markingNotGoing) {
+      return;
+    }
+    _refreshPending = false;
+    unawaited(_refreshProgress());
   }
 
   String _normalizeCode(String code) => normalizePickupCode(code);
@@ -421,7 +490,10 @@ class _PickupPageState extends State<PickupPage> {
         ),
       );
     } finally {
-      if (mounted) setState(() => _markingNotGoing = false);
+      if (mounted) {
+        setState(() => _markingNotGoing = false);
+        _drainPendingRefresh();
+      }
     }
   }
 
@@ -459,13 +531,14 @@ class _PickupPageState extends State<PickupPage> {
       labelGranularity: _labelGranularity,
       landscape: _landscape,
       registering: _registering,
-      busy: _registering || _markingNotGoing,
+      busy: _registering || _markingNotGoing || _refreshing,
       candidateCode: _candidateCode,
       scanFeedback: _scanFeedback,
       onDetect: _onDetect,
       onClose: () => Navigator.of(context).pop(false),
       onRotate: _toggleOrientation,
       onOrders: _openOrders,
+      onRefresh: () => unawaited(_refreshProgress(showError: true)),
       onManualCode: _openManualCode,
       onComplete: () => Navigator.of(context).pop(true),
     ),
@@ -486,6 +559,7 @@ class _FullscreenScanner extends StatelessWidget {
     required this.onClose,
     required this.onRotate,
     required this.onOrders,
+    required this.onRefresh,
     required this.onManualCode,
     required this.onComplete,
   });
@@ -502,6 +576,7 @@ class _FullscreenScanner extends StatelessWidget {
   final VoidCallback onClose;
   final VoidCallback onRotate;
   final VoidCallback onOrders;
+  final VoidCallback onRefresh;
   final VoidCallback onManualCode;
   final VoidCallback onComplete;
 
@@ -566,6 +641,12 @@ class _FullscreenScanner extends StatelessWidget {
                       icon: Icons.fact_check_outlined,
                       onPressed: busy ? null : onOrders,
                     ),
+                    const SizedBox(height: 8),
+                    _CameraFloatingButton(
+                      tooltip: 'Atualizar carga',
+                      icon: Icons.refresh_rounded,
+                      onPressed: busy ? null : onRefresh,
+                    ),
                   ],
                 ),
               ),
@@ -576,14 +657,20 @@ class _FullscreenScanner extends StatelessWidget {
           Container(
             color: Colors.black.withValues(alpha: .66),
             alignment: Alignment.center,
-            child: const Column(
+            child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(Icons.check_circle_rounded, size: 68, color: _yellow),
-                SizedBox(height: 10),
+                const Icon(
+                  Icons.check_circle_rounded,
+                  size: 68,
+                  color: _yellow,
+                ),
+                const SizedBox(height: 10),
                 Text(
-                  'Carga conferida',
-                  style: TextStyle(
+                  progress.total == 0
+                      ? 'Nenhum pedido nesta carga'
+                      : 'Carga conferida',
+                  style: const TextStyle(
                     color: Colors.white,
                     fontSize: 22,
                     fontWeight: FontWeight.w900,

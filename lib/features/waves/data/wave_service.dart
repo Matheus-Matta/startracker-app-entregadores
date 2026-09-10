@@ -415,18 +415,30 @@ class WaveService {
 
   Future<WaveDetails> getWaveDetails(WaveListItem wave) async {
     final routeId = wave.routeId;
+    final refreshToken = DateTime.now().microsecondsSinceEpoch;
+    final freshQuery = {'_detail_refresh': refreshToken};
+    final noCache = Options(
+      headers: const {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'},
+    );
     final pickup = await getPickupProgress(wave.waveId);
     final waveData = await _getOptionalMap(
       '/api/v1/delivery/waves/${wave.waveId}/',
+      queryParameters: freshQuery,
+      options: noCache,
     );
     final route = routeId == null
         ? const <String, dynamic>{}
-        : await _getOptionalMap('/api/v1/delivery/rotas/$routeId/');
+        : await _getOptionalMap(
+            '/api/v1/delivery/rotas/$routeId/',
+            queryParameters: freshQuery,
+            options: noCache,
+          );
     final stops = routeId == null
         ? const <Map<String, dynamic>>[]
         : await _getAll(
             '/api/v1/delivery/paradas/',
-            queryParameters: {'route': routeId},
+            queryParameters: {'route': routeId, ...freshQuery},
+            options: noCache,
           );
     final routeStops = stops
         .where((item) => _asInt(item['route']) == routeId)
@@ -435,10 +447,16 @@ class WaveService {
     // WaveOrder existe desde a criação da wave, antes das RouteStops.
     final links = await _getAllOptional(
       '/api/v1/delivery/pedidos-wave/',
-      queryParameters: {'wave': wave.waveId},
+      queryParameters: {'wave': wave.waveId, ...freshQuery},
+      options: noCache,
     );
     final waveLinks =
-        links.where((item) => _relationId(item['wave']) == wave.waveId).toList()
+        links
+            .where(
+              (item) =>
+                  _relationId(item['wave'] ?? item['wave_id']) == wave.waveId,
+            )
+            .toList()
           ..sort((first, second) {
             final firstDate = DateTime.tryParse(
               first['added_at']?.toString() ?? '',
@@ -457,12 +475,24 @@ class WaveService {
 
     final orders = await _getAll(
       '/api/v1/delivery/pedidos/',
-      queryParameters: {'wave': wave.waveId},
+      queryParameters: {'wave': wave.waveId, ...freshQuery},
+      options: noCache,
     );
     final ordersById = <int, Map<String, dynamic>>{};
+    final currentOrderIds = <int>{};
     for (final order in orders) {
       final id = _asInt(order['id']);
-      if (id != null) ordersById[id] = order;
+      if (id == null) continue;
+      ordersById[id] = order;
+      final waveRelation =
+          order['wave'] ?? order['wave_id'] ?? order['delivery_wave'];
+      final linkedWave = _relationId(waveRelation);
+      // O endpoint foi consultado com ?wave=<id>. APIs que nao repetem o
+      // relacionamento no serializer ainda assim devolvem somente membros da
+      // carga; uma relacao explicita com outra carga, porem, nunca e aceita.
+      if (waveRelation == null || linkedWave == wave.waveId) {
+        currentOrderIds.add(id);
+      }
     }
 
     // Aceita também endpoints que devolvam os pedidos aninhados na wave/link.
@@ -475,15 +505,22 @@ class WaveService {
         final nested = item['order'] is Map
             ? Map<String, dynamic>.from(item['order'] as Map)
             : item;
-        final id = _asInt(nested['id']) ?? _relationId(item['order']);
-        if (id != null && nested.length > 1) ordersById[id] = nested;
+        final id = item.containsKey('order')
+            ? _relationId(item['order']) ?? _asInt(nested['id'])
+            : _asInt(nested['id']);
+        if (id != null) {
+          currentOrderIds.add(id);
+          if (nested.length > 1) ordersById[id] = nested;
+        }
       }
     }
     for (final link in waveLinks) {
-      if (link['order'] is! Map) continue;
-      final nested = Map<String, dynamic>.from(link['order'] as Map);
-      final id = _asInt(nested['id']);
-      if (id != null) ordersById[id] = nested;
+      final id = _relationId(link['order'] ?? link['order_id']);
+      if (id == null) continue;
+      currentOrderIds.add(id);
+      if (link['order'] is Map) {
+        ordersById[id] = Map<String, dynamic>.from(link['order'] as Map);
+      }
     }
 
     final stopsByOrder = <int, Map<String, dynamic>>{
@@ -502,10 +539,14 @@ class WaveService {
         ),
       );
     for (final stop in sortedStops) {
-      addOrderId(_relationId(stop['order']));
+      final orderId = _relationId(stop['order']);
+      if (stop['status']?.toString() != 'cancelled' &&
+          currentOrderIds.contains(orderId)) {
+        addOrderId(orderId);
+      }
     }
     for (final link in waveLinks) {
-      addOrderId(_relationId(link['order']));
+      addOrderId(_relationId(link['order'] ?? link['order_id']));
     }
     for (final raw in [waveData['orders'], waveData['wave_orders']]) {
       if (raw is! List) continue;
@@ -518,10 +559,8 @@ class WaveService {
       }
     }
     for (final order in orders) {
-      final linkedWave = _relationId(
-        order['wave'] ?? order['wave_id'] ?? order['delivery_wave'],
-      );
-      if (linkedWave == wave.waveId) addOrderId(_asInt(order['id']));
+      final orderId = _asInt(order['id']);
+      if (currentOrderIds.contains(orderId)) addOrderId(orderId);
     }
 
     final waveOrders = <WaveOrderItem>[];
@@ -579,6 +618,12 @@ class WaveService {
     try {
       final response = await apiClient.dio.get<dynamic>(
         '/api/v1/delivery/waves/$waveId/retirada/',
+        queryParameters: {
+          '_detail_refresh': DateTime.now().microsecondsSinceEpoch,
+        },
+        options: Options(
+          headers: const {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'},
+        ),
       );
       return WaveService.parsePickupProgress(response.data, waveId);
     } on DioException catch (error) {
@@ -595,7 +640,7 @@ class WaveService {
   }) async {
     final scannedCode = code.trim();
     if (scannedCode.isEmpty) {
-      throw const WaveServiceException('Informe ou leia um código válido.');
+      throw const WaveServiceException('Informe o código da etiqueta.');
     }
     try {
       final response = await apiClient.dio.post<dynamic>(
@@ -644,9 +689,17 @@ class WaveService {
     }
   }
 
-  Future<Map<String, dynamic>> _getOptionalMap(String path) async {
+  Future<Map<String, dynamic>> _getOptionalMap(
+    String path, {
+    Map<String, dynamic>? queryParameters,
+    Options? options,
+  }) async {
     try {
-      final response = await apiClient.dio.get<dynamic>(path);
+      final response = await apiClient.dio.get<dynamic>(
+        path,
+        queryParameters: queryParameters,
+        options: options,
+      );
       return response.data is Map
           ? Map<String, dynamic>.from(response.data as Map)
           : const {};
@@ -662,9 +715,14 @@ class WaveService {
   Future<List<Map<String, dynamic>>> _getAllOptional(
     String path, {
     Map<String, dynamic>? queryParameters,
+    Options? options,
   }) async {
     try {
-      return await _getAll(path, queryParameters: queryParameters);
+      return await _getAll(
+        path,
+        queryParameters: queryParameters,
+        options: options,
+      );
     } on DioException catch (error) {
       if (error.response?.statusCode == 403 ||
           error.response?.statusCode == 404) {
@@ -785,7 +843,12 @@ class WaveService {
   Future<List<Map<String, dynamic>>> _getAll(
     String path, {
     Map<String, dynamic>? queryParameters,
-  }) => apiClient.getAllPages(path, queryParameters: queryParameters);
+    Options? options,
+  }) => apiClient.getAllPages(
+    path,
+    queryParameters: queryParameters,
+    options: options,
+  );
 
   String _errorMessage(DioException error) {
     final data = error.response?.data;

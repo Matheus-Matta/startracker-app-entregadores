@@ -3,8 +3,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../../../app/app_dependencies.dart';
+import '../../../core/async/debouncer.dart';
 import '../../../core/network/offline_request_queue.dart';
 import '../../../core/presentation/app_messages.dart';
+import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../../orders/view/order_detail_page.dart';
 import '../data/wave_service.dart';
 import 'active_wave_page.dart';
@@ -31,7 +33,12 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
   late String _currentStatus;
   PickupProgress? _pickupProgress;
   bool _startingRoute = false;
+  int _detailsGeneration = 0;
+  StreamSubscription<FleetRealtimeEvent>? _realtimeSubscription;
   StreamSubscription<OfflineQueueEvent>? _offlineQueueSubscription;
+  final Debouncer _realtimeDebouncer = Debouncer(
+    const Duration(milliseconds: 200),
+  );
 
   static const _statusLabels = <String, String>{
     'collecting': 'Carga em montagem',
@@ -56,6 +63,9 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
     _currentWave = widget.wave;
     _currentStatus = _currentWave.status;
     _details = _loadDetails();
+    _realtimeSubscription = FleetRealtimeChannel.instance.events.listen(
+      _onRealtimeEvent,
+    );
     _offlineQueueSubscription = AppDependencies
         .instance
         .apiClient
@@ -66,14 +76,17 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
 
   @override
   void dispose() {
+    _realtimeDebouncer.dispose();
+    _realtimeSubscription?.cancel();
     _offlineQueueSubscription?.cancel();
     super.dispose();
   }
 
   Future<WaveDetails> _loadDetails() {
+    final generation = ++_detailsGeneration;
     final request = _service.getWaveDetails(_currentWave);
     request.then<void>((details) {
-      if (mounted) {
+      if (mounted && generation == _detailsGeneration) {
         setState(() {
           _currentStatus = details.status;
           _pickupProgress = details.pickup;
@@ -81,6 +94,21 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
       }
     }, onError: (Object _, StackTrace _) {});
     return request;
+  }
+
+  void _onRealtimeEvent(FleetRealtimeEvent event) {
+    final affectsCurrentRoute =
+        event.isRouteChange &&
+        (event.routeId == null || event.routeId == _currentWave.routeId);
+    // Um pedido transferido para dentro da carga ainda nao existe na tela; por
+    // isso qualquer alteracao de pedido do tenant precisa reconciliar o REST.
+    if (!event.isConnected && !event.isOrderChange && !affectsCurrentRoute) {
+      return;
+    }
+    _service.invalidateCache();
+    _realtimeDebouncer.run(() {
+      if (mounted) unawaited(_refresh());
+    });
   }
 
   Future<void> _refresh() async {

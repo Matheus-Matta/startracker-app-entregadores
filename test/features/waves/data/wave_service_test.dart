@@ -167,6 +167,62 @@ void main() {
       expect(progress.labelGranularity, PickupLabelScope.order);
     },
   );
+
+  test(
+    'registerPickup rejeita codigo vazio com a mensagem do contrato',
+    () async {
+      final client = ApiClient(
+        baseUrl: 'https://api.example.test',
+        storage: const _EmptyStorage(),
+      );
+      final service = WaveService(client);
+
+      await expectLater(
+        service.registerPickup(waveId: 42, code: '   '),
+        throwsA(
+          isA<WaveServiceException>().having(
+            (error) => error.message,
+            'message',
+            'Informe o código da etiqueta.',
+          ),
+        ),
+      );
+    },
+  );
+
+  test(
+    'detalhe nao restaura pedido transferido a partir de parada cancelada',
+    () async {
+      final client = ApiClient(
+        baseUrl: 'https://api.example.test',
+        storage: const _EmptyStorage(),
+      );
+      final adapter = _TransferredOrderAdapter();
+      client.dio.httpClientAdapter = adapter;
+      final service = WaveService(client);
+
+      final details = await service.getWaveDetails(
+        WaveListItem(
+          waveId: 10,
+          routeId: 20,
+          routeNumber: 'Rota 20',
+          status: 'released',
+          plannedDistanceMeters: 0,
+          plannedStart: null,
+          createdAt: null,
+        ),
+      );
+
+      expect(details.orders, isEmpty);
+      expect(details.pickup.total, 0);
+      expect(
+        adapter.requests.every(
+          (request) => request.queryParameters.containsKey('_detail_refresh'),
+        ),
+        isTrue,
+      );
+    },
+  );
 }
 
 class _EmptyStorage extends SessionStorage {
@@ -211,6 +267,65 @@ class _PickupAdapter implements HttpClientAdapter {
           },
         ],
       }),
+      200,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+class _TransferredOrderAdapter implements HttpClientAdapter {
+  final requests = <RequestOptions>[];
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    requests.add(options);
+    final data = switch (options.path) {
+      '/api/v1/delivery/waves/10/retirada/' => {
+        'wave_id': 10,
+        'pickup_enabled': true,
+        'total': 0,
+        'picked_up': 0,
+        'pending': 0,
+        'is_complete': true,
+        'orders': <dynamic>[],
+      },
+      '/api/v1/delivery/waves/10/' => {
+        'id': 10,
+        'status': 'released',
+        'orders': <dynamic>[],
+      },
+      '/api/v1/delivery/rotas/20/' => {
+        'id': 20,
+        'wave': 10,
+        'status': 'released',
+      },
+      '/api/v1/delivery/paradas/' => {
+        'results': [
+          {
+            'id': 30,
+            'route': 20,
+            'order': 81,
+            'sequence': 1,
+            'status': 'cancelled',
+          },
+        ],
+        'next': null,
+      },
+      '/api/v1/delivery/pedidos-wave/' ||
+      '/api/v1/delivery/pedidos/' => {'results': <dynamic>[], 'next': null},
+      _ => <String, dynamic>{},
+    };
+    return ResponseBody.fromString(
+      jsonEncode(data),
       200,
       headers: {
         Headers.contentTypeHeader: [Headers.jsonContentType],

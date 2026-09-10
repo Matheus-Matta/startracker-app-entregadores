@@ -1,4 +1,10 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:star_tracker/core/network/api_client.dart';
+import 'package:star_tracker/core/storage/session_storage.dart';
 import 'package:star_tracker/features/waves/data/active_route_service.dart';
 
 void main() {
@@ -34,6 +40,20 @@ void main() {
     expect(warehouse?.coordinate.latitude, -22.8298);
     expect(warehouse?.coordinate.longitude, -43.0027);
   });
+
+  test('remove da rota ativa a parada cancelada por transferencia', () async {
+    final client = ApiClient(
+      baseUrl: 'https://api.example.test',
+      storage: const _EmptyStorage(),
+    );
+    client.dio.httpClientAdapter = _CancelledStopAdapter();
+    final service = ActiveRouteService(client, storage: const _EmptyStorage());
+
+    final route = await service.getRoute(20);
+
+    expect(route.stops, isEmpty);
+    expect(route.currentStop, isNull);
+  });
 }
 
 ActiveRouteStop _stop({
@@ -66,3 +86,56 @@ ActiveRouteStop _stop({
   existingRecipientDocument: '',
   existingNotes: '',
 );
+
+class _EmptyStorage extends SessionStorage {
+  const _EmptyStorage();
+
+  @override
+  Future<String?> readToken() async => null;
+
+  @override
+  Future<Map<String, dynamic>> readDeliveryConfig() async => const {};
+}
+
+class _CancelledStopAdapter implements HttpClientAdapter {
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final data = switch (options.path) {
+      '/api/v1/delivery/rotas/20/' => {
+        'id': 20,
+        'wave': 10,
+        'route_number': 'Rota 20',
+        'status': 'started',
+        'path_geometry': <dynamic>[],
+        'planned_waypoints': <dynamic>[],
+      },
+      '/api/v1/delivery/paradas/' => {
+        'results': [
+          {
+            'id': 30,
+            'route': 20,
+            'order': 81,
+            'sequence': 1,
+            'status': 'cancelled',
+          },
+        ],
+        'next': null,
+      },
+      _ => {'results': <dynamic>[], 'next': null},
+    };
+    return ResponseBody.fromString(
+      jsonEncode(data),
+      200,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
