@@ -54,7 +54,8 @@ jobs:
           channel: stable
           cache: true
       - run: flutter pub get
-      - run: python -m py_compile tool/prepare_release_env.py
+      - run: python -m py_compile tool/prepare_release_env.py tool/test_prepare_release_env.py
+      - run: python -m unittest tool/test_prepare_release_env.py
       - run: python tool/check_repository_secrets.py --history
       - run: flutter analyze
       - run: flutter test
@@ -72,11 +73,11 @@ jobs:
         with:
           ref: ${{ github.ref }}
 
-      - name: Ler o unico .env
+      - name: Preparar build Android
         shell: bash
         run: |
           printf '%s\n' "$RELEASE_ENV_FILE" > .release.env
-          python tool/prepare_release_env.py android
+          python tool/prepare_release_env.py android-build
 
       - uses: actions/setup-java@v5
         with:
@@ -119,6 +120,10 @@ jobs:
           name: android-${{ needs.prepare.outputs.safe_tag }}
           path: dist/android/*
           if-no-files-found: error
+
+      - name: Preparar credencial do Google Play
+        shell: bash
+        run: python tool/prepare_release_env.py google-play
 
       - name: Enviar AAB para o Google Play
         uses: r0adkll/upload-google-play@v1.1.5

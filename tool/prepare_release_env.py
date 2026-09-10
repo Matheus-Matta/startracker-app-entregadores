@@ -109,19 +109,47 @@ def escape_java_property(value: str) -> str:
     return escaped
 
 
+def validate_play_configuration(values: dict[str, str]) -> None:
+    require(values, PLAY_KEYS)
+    if values["PLAY_TRACK"] not in {"internal", "alpha", "beta", "production"}:
+        raise ValueError("PLAY_TRACK deve ser internal, alpha, beta ou production")
+    if values["PLAY_RELEASE_STATUS"] not in {
+        "completed",
+        "inProgress",
+        "halted",
+        "draft",
+    }:
+        raise ValueError("PLAY_RELEASE_STATUS invalido")
+
+
+def prepare_google_play(values: dict[str, str]) -> None:
+    validate_play_configuration(values)
+    RELEASE_DIR.mkdir(exist_ok=True)
+    service_account_bytes = decode_base64(
+        values,
+        "PLAY_SERVICE_ACCOUNT_JSON_BASE64",
+    )
+    try:
+        service_account = json.loads(service_account_bytes.decode("utf-8"))
+    except Exception as error:
+        raise ValueError(
+            "PLAY_SERVICE_ACCOUNT_JSON_BASE64 nao contem um JSON valido"
+        ) from error
+    if not service_account.get("client_email") or not service_account.get(
+        "private_key"
+    ):
+        raise ValueError("O JSON da service account do Google esta incompleto")
+    (RELEASE_DIR / "play-service-account.json").write_text(
+        json.dumps(service_account),
+        encoding="utf-8",
+    )
+    export_to_github(values, ("PLAY_TRACK", "PLAY_RELEASE_STATUS"))
+
+
 def prepare_android(values: dict[str, str], *, with_play: bool = True) -> None:
     require(values, APP_KEYS + ANDROID_SIGNING_KEYS)
     if with_play:
-        require(values, PLAY_KEYS)
-        if values["PLAY_TRACK"] not in {"internal", "alpha", "beta", "production"}:
-            raise ValueError("PLAY_TRACK deve ser internal, alpha, beta ou production")
-        if values["PLAY_RELEASE_STATUS"] not in {
-            "completed",
-            "inProgress",
-            "halted",
-            "draft",
-        }:
-            raise ValueError("PLAY_RELEASE_STATUS invalido")
+        validate_play_configuration(values)
     write_app_env(values)
 
     keystore = decode_base64(values, "ANDROID_KEYSTORE_BASE64")
@@ -143,26 +171,7 @@ def prepare_android(values: dict[str, str], *, with_play: bool = True) -> None:
         encoding="utf-8",
     )
     if with_play:
-        RELEASE_DIR.mkdir(exist_ok=True)
-        service_account_bytes = decode_base64(
-            values,
-            "PLAY_SERVICE_ACCOUNT_JSON_BASE64",
-        )
-        try:
-            service_account = json.loads(service_account_bytes.decode("utf-8"))
-        except Exception as error:
-            raise ValueError(
-                "PLAY_SERVICE_ACCOUNT_JSON_BASE64 nao contem um JSON valido"
-            ) from error
-        if not service_account.get("client_email") or not service_account.get(
-            "private_key"
-        ):
-            raise ValueError("O JSON da service account do Google esta incompleto")
-        (RELEASE_DIR / "play-service-account.json").write_text(
-            json.dumps(service_account),
-            encoding="utf-8",
-        )
-        export_to_github(values, ("PLAY_TRACK", "PLAY_RELEASE_STATUS"))
+        prepare_google_play(values)
 
 
 def prepare_ios(values: dict[str, str]) -> None:
@@ -227,10 +236,12 @@ def main() -> int:
     if len(sys.argv) != 2 or sys.argv[1] not in {
         "android",
         "android-build",
+        "google-play",
         "ios",
     }:
         print(
-            "Uso: python tool/prepare_release_env.py android|android-build|ios",
+            "Uso: python tool/prepare_release_env.py "
+            "android|android-build|google-play|ios",
             file=sys.stderr,
         )
         return 2
@@ -240,6 +251,8 @@ def main() -> int:
             prepare_android(values)
         elif sys.argv[1] == "android-build":
             prepare_android(values, with_play=False)
+        elif sys.argv[1] == "google-play":
+            prepare_google_play(values)
         else:
             prepare_ios(values)
     except (UnicodeDecodeError, ValueError) as error:

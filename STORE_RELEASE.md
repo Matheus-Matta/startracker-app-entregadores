@@ -149,10 +149,11 @@ O GitHub Actions vai automaticamente:
 
 1. testar o aplicativo;
 2. gerar APK e AAB assinados;
-3. enviar o AAB ao teste interno do Google Play;
-4. gerar o IPA assinado;
-5. enviar o IPA ao TestFlight;
-6. criar a release da tag no GitHub.
+3. guardar o APK e o AAB antes de tentar acessar o Google Play;
+4. enviar o AAB ao teste interno do Google Play;
+5. gerar o IPA assinado;
+6. enviar o IPA ao TestFlight;
+7. criar a release da tag no GitHub.
 
 Para acompanhar, abra a aba **Actions** do repositorio no GitHub.
 
@@ -168,4 +169,4 @@ Atualize o secret `RELEASE_ENV_FILE` no GitHub com o novo conteúdo e crie uma n
 
 No iPhone, o workflow envia para o TestFlight. A liberacao publica ainda precisa ser enviada para revisao pelo App Store Connect.
 
-A release do GitHub e criada mesmo se a publicacao no Google Play, no TestFlight ou em ambos falhar. Os artefatos que tiverem sido gerados sao anexados; se nenhum pacote estiver disponivel, a release ainda e publicada sem arquivos e informa o resultado de cada job.
+A release do GitHub e criada mesmo se a publicacao no Google Play, no TestFlight ou em ambos falhar. O APK e o AAB sao guardados antes da validacao da service account do Google Play; assim, uma falha nessa credencial ou no envio para a loja nao remove os pacotes Android da release. A assinatura Android ainda precisa estar valida para que esses pacotes possam ser gerados. Se nenhum pacote estiver disponivel, a release ainda e publicada sem arquivos e informa o resultado de cada job.

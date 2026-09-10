@@ -84,17 +84,16 @@ e o horário da conclusão são sempre controlados pelo servidor.
 
 ## APK automático por tag
 
-O workflow `.github/workflows/android-apk.yml` valida, testa, compila e publica
-o APK como artefato e GitHub Release sempre que uma tag `v*` é enviada:
+O workflow `.github/workflows/store-release.yml` valida, testa, compila e
+publica o APK como artefato e GitHub Release sempre que uma tag `v*` é enviada:
 
 ```powershell
 git tag v1.0.1-build5
 git push origin v1.0.1-build5
 ```
 
-Também são aceitas tags `v1.0.1` e `v1.0.1+5`. Configure a variável opcional
-`BACKEND_URL` no repositório para substituir `https://tracker.star.dev.br`.
-Para gerar um release assinado, configure os Secrets
-`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD` e
-`ANDROID_STORE_PASSWORD`. Sem os quatro Secrets, o workflow gera um APK demo
-com assinatura debug.
+Também são aceitas tags `v1.0.1` e `v1.0.1+5`. As configurações e credenciais
+ficam no Secret `RELEASE_ENV_FILE`, conforme `STORE_RELEASE.md`. O APK e o AAB
+são guardados antes da tentativa de envio ao Google Play, então continuam na
+GitHub Release se a service account ou a publicação na loja falhar. A chave de
+assinatura Android precisa estar válida para gerar os pacotes.
