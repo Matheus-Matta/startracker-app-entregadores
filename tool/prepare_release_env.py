@@ -146,11 +146,16 @@ def prepare_google_play(values: dict[str, str]) -> None:
     export_to_github(values, ("PLAY_TRACK", "PLAY_RELEASE_STATUS"))
 
 
+def prepare_app(values: dict[str, str]) -> None:
+    require(values, APP_KEYS)
+    write_app_env(values)
+
+
 def prepare_android(values: dict[str, str], *, with_play: bool = True) -> None:
-    require(values, APP_KEYS + ANDROID_SIGNING_KEYS)
+    prepare_app(values)
+    require(values, ANDROID_SIGNING_KEYS)
     if with_play:
         validate_play_configuration(values)
-    write_app_env(values)
 
     keystore = decode_base64(values, "ANDROID_KEYSTORE_BASE64")
     if not keystore:
@@ -234,6 +239,7 @@ def export_to_github(
 
 def main() -> int:
     if len(sys.argv) != 2 or sys.argv[1] not in {
+        "app-build",
         "android",
         "android-build",
         "google-play",
@@ -241,13 +247,15 @@ def main() -> int:
     }:
         print(
             "Uso: python tool/prepare_release_env.py "
-            "android|android-build|google-play|ios",
+            "app-build|android|android-build|google-play|ios",
             file=sys.stderr,
         )
         return 2
     try:
         values = load_env(SOURCE_FILE)
-        if sys.argv[1] == "android":
+        if sys.argv[1] == "app-build":
+            prepare_app(values)
+        elif sys.argv[1] == "android":
             prepare_android(values)
         elif sys.argv[1] == "android-build":
             prepare_android(values, with_play=False)

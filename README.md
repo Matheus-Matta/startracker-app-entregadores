@@ -93,7 +93,9 @@ git push origin v1.0.1-build5
 ```
 
 Também são aceitas tags `v1.0.1` e `v1.0.1+5`. As configurações e credenciais
-ficam no Secret `RELEASE_ENV_FILE`, conforme `STORE_RELEASE.md`. O APK e o AAB
-são guardados antes da tentativa de envio ao Google Play, então continuam na
-GitHub Release se a service account ou a publicação na loja falhar. A chave de
-assinatura Android precisa estar válida para gerar os pacotes.
+ficam no Secret `RELEASE_ENV_FILE`, conforme `STORE_RELEASE.md`. Um APK de
+contingência, assinado para depuração e claramente identificado por `-debug`, é
+guardado antes da validação da assinatura oficial. Ele é instalável manualmente,
+mas não serve para o Google Play nem para atualizar uma instalação oficial. Com
+a chave Android válida, o workflow também gera o APK e o AAB oficiais antes da
+tentativa de envio ao Google Play.

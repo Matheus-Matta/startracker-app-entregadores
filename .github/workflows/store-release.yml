@@ -73,11 +73,11 @@ jobs:
         with:
           ref: ${{ github.ref }}
 
-      - name: Preparar build Android
+      - name: Preparar configuracao do aplicativo
         shell: bash
         run: |
           printf '%s\n' "$RELEASE_ENV_FILE" > .release.env
-          python tool/prepare_release_env.py android-build
+          python tool/prepare_release_env.py app-build
 
       - uses: actions/setup-java@v5
         with:
@@ -92,6 +92,29 @@ jobs:
           cache: true
 
       - run: flutter pub get
+
+      - name: Gerar APK instalavel de contingencia
+        shell: bash
+        run: |
+          flutter build apk --debug \
+            --build-name="${{ needs.prepare.outputs.version }}" \
+            --build-number="${{ needs.prepare.outputs.build }}" \
+            --dart-define-from-file=.env.production
+          mkdir -p dist/android-debug
+          cp build/app/outputs/flutter-apk/app-debug.apk "dist/android-debug/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}-debug.apk"
+          cd dist/android-debug
+          sha256sum * > SHA256SUMS-android-debug.txt
+
+      - name: Guardar APK instalavel de contingencia
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-debug-${{ needs.prepare.outputs.safe_tag }}
+          path: dist/android-debug/*
+          if-no-files-found: error
+
+      - name: Preparar assinatura Android oficial
+        shell: bash
+        run: python tool/prepare_release_env.py android-build
 
       - name: Gerar AAB e APK assinados
         shell: bash

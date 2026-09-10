@@ -52,6 +52,24 @@ class PrepareReleaseEnvTest(unittest.TestCase):
         )
         self.assertFalse((self.release_directory / "play-service-account.json").exists())
 
+    def test_app_build_does_not_require_android_or_google_credentials(self):
+        values = {
+            "BACKEND_URL": "https://example.com",
+            "NOTIFICATIONS_ENABLED": "true",
+            "FLEET_WEBSOCKET_PATH": "/ws/fleet/",
+            "NOTIFICATIONS_WEBSOCKET_PATH": "/ws/notifications/",
+            "NOTIFICATION_CHANNEL_ID": "delivery_updates",
+            "NOTIFICATION_CHANNEL_NAME": "Delivery updates",
+            "NOTIFICATION_CHANNEL_DESCRIPTION": "Delivery status updates",
+        }
+
+        with self.paths():
+            release.prepare_app(values)
+
+        self.assertTrue((self.root / ".env.production").is_file())
+        self.assertFalse((self.root / "android" / "key.properties").exists())
+        self.assertFalse((self.root / "android" / "upload-keystore.jks").exists())
+
     def test_google_play_preparation_does_not_require_android_build_values(self):
         service_account = {
             "type": "service_account",
