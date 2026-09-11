@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:image_picker/image_picker.dart';
 
+import '../../../app/app_dependencies.dart';
 import '../data/active_route_service.dart';
 import '../data/delivery_photo_recovery.dart';
 
@@ -162,8 +163,9 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
 
     setState(() => _submitting = true);
     try {
-      final position = await _positionIfAvailable();
-      await widget.service.complete(
+      final location = await _locationForConfirmation();
+      if (!location.proceed) return;
+      final result = await widget.service.complete(
         DeliveryProofSubmission(
           stop: widget.stop,
           recipientName: _recipientController.text,
@@ -178,8 +180,8 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
               )
               .toList(),
           signatureBytes: _signatureBytes,
-          latitude: position?.latitude,
-          longitude: position?.longitude,
+          latitude: location.position?.latitude,
+          longitude: location.position?.longitude,
           itemResults: _itemStates
               .map(
                 (state) => DeliveryItemResult(
@@ -195,9 +197,38 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
         ),
       );
       if (!mounted) return;
+      if (result.queued) {
+        await showDialog<void>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Entrega salva'),
+            content: const Text(
+              'Você está sem conexão. A confirmação ficou na fila e será enviada automaticamente.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('Entendi'),
+              ),
+            ],
+          ),
+        );
+      } else if (result.value case final audit? when audit.hasData) {
+        await _showAuditResult(audit);
+      }
+      if (!mounted) return;
       Navigator.of(context).pop(true);
     } on ActiveRouteException catch (error) {
-      if (mounted) _message(error.message);
+      if (error.statusCode == 403 || error.statusCode == 404) {
+        widget.service.invalidateCache();
+        await AppDependencies.instance.auth.deliveryConfig(refresh: true);
+        if (mounted) {
+          _message('${error.message} As rotas serão sincronizadas.');
+          Navigator.of(context).pop(false);
+        }
+      } else if (mounted) {
+        _message(error.message);
+      }
     } catch (_) {
       if (mounted) _message('Não foi possível finalizar esta entrega.');
     } finally {
@@ -242,26 +273,115 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
     return null;
   }
 
-  Future<Position?> _positionIfAvailable() async {
+  Future<({bool proceed, Position? position})>
+  _locationForConfirmation() async {
+    final policy = widget.stop.confirmationLocation;
+    if (!policy.enabled) {
+      return (proceed: true, position: null);
+    }
+    if (!policy.canRequestLocation) {
+      _message(
+        'A configuração de localização está incompleta. Atualize os dados da rota.',
+      );
+      return (proceed: false, position: null);
+    }
+    if (!policy.requestFreshLocation && !policy.required) {
+      return (proceed: true, position: null);
+    }
+
     try {
-      var permission = await Geolocator.checkPermission();
-      if (permission == LocationPermission.denied) {
-        permission = await Geolocator.requestPermission();
-      }
-      if (permission == LocationPermission.denied ||
-          permission == LocationPermission.deniedForever) {
-        return null;
-      }
-      return Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          timeLimit: Duration(seconds: 10),
-        ),
+      final position = await AppDependencies.instance.location.currentPosition(
+        timeout: const Duration(seconds: 10),
+      );
+      return (proceed: true, position: position);
+    } on PermissionDeniedException {
+      return _confirmWithoutLocation(
+        'A permissão de localização foi negada. Não foi possível registrar a posição do celular.',
+      );
+    } on LocationServiceDisabledException {
+      return _confirmWithoutLocation(
+        'O GPS está desativado. Ative a localização do aparelho para registrar onde a entrega foi confirmada.',
+      );
+    } on TimeoutException {
+      return _confirmWithoutLocation(
+        'O GPS não encontrou uma posição nova dentro do tempo esperado.',
       );
     } catch (_) {
-      return null;
+      return _confirmWithoutLocation(
+        'Não foi possível obter uma posição nova do celular.',
+      );
     }
   }
+
+  Future<({bool proceed, Position? position})> _confirmWithoutLocation(
+    String message,
+  ) async {
+    final required = widget.stop.confirmationLocation.required;
+    final proceed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: !required,
+      builder: (context) => AlertDialog(
+        title: const Text('Localização indisponível'),
+        content: Text(
+          required
+              ? '$message A localização é obrigatória para concluir esta entrega.'
+              : '$message Você pode tentar novamente ou continuar sem localização.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: Text(required ? 'Voltar' : 'Tentar novamente'),
+          ),
+          if (!required)
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Continuar sem localização'),
+            ),
+        ],
+      ),
+    );
+    return (proceed: proceed == true, position: null);
+  }
+
+  Future<void> _showAuditResult(DeliveryAuditResult audit) => showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (context) => AlertDialog(
+      title: const Text('Entrega confirmada'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (audit.trackerValidationLabel.isNotEmpty)
+            _AuditRow(
+              label: 'Validação do rastreador',
+              value: audit.trackerValidationLabel,
+            ),
+          if (audit.deliveryActualAddress.isNotEmpty)
+            _AuditRow(
+              label: 'Local da confirmação',
+              value: audit.deliveryActualAddress,
+            ),
+          if (audit.deliveryDistanceFromPlannedM case final distance?)
+            _AuditRow(
+              label: 'Distância do destino',
+              value: '${distance.toStringAsFixed(0)} m',
+            ),
+          if (audit.trackerDistanceM case final distance?)
+            _AuditRow(
+              label: 'Distância do rastreador',
+              value: '${distance.toStringAsFixed(0)} m',
+            ),
+        ],
+      ),
+      actions: [
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Concluir'),
+        ),
+      ],
+    ),
+  );
 
   void _message(String text) {
     showAppMessage(context, text);
@@ -442,6 +562,26 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
     focusedBorder: OutlineInputBorder(
       borderRadius: BorderRadius.circular(16),
       borderSide: const BorderSide(color: _ink, width: 1.5),
+    ),
+  );
+}
+
+class _AuditRow extends StatelessWidget {
+  const _AuditRow({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.only(bottom: 12),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(color: _muted, fontSize: 11)),
+        const SizedBox(height: 2),
+        Text(value, style: const TextStyle(fontWeight: FontWeight.w800)),
+      ],
     ),
   );
 }

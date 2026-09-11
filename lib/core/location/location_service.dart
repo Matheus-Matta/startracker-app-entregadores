@@ -1,7 +1,9 @@
 import 'package:geolocator/geolocator.dart';
 
 class LocationService {
-  Future<Position> currentPosition() async {
+  Future<Position> currentPosition({
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
     if (!await Geolocator.isLocationServiceEnabled()) {
       throw const LocationServiceDisabledException();
     }
@@ -15,7 +17,14 @@ class LocationService {
       throw const PermissionDeniedException('Permissão de localização negada.');
     }
 
-    return Geolocator.getCurrentPosition();
+    // getCurrentPosition solicita uma leitura nova; getLastKnownPosition nao e
+    // usado aqui para que uma confirmacao nunca reaproveite cache antigo.
+    return Geolocator.getCurrentPosition(
+      locationSettings: LocationSettings(
+        accuracy: LocationAccuracy.best,
+        timeLimit: timeout,
+      ),
+    );
   }
 
   Stream<Position> watchPosition() => Geolocator.getPositionStream(

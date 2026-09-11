@@ -65,7 +65,12 @@ class _DeliveryPageState extends State<DeliveryPage>
   }
 
   Future<void> _startRealtime() async {
-    await AppDependencies.instance.apiClient.offlineRequests.retryNow();
+    final dependencies = AppDependencies.instance;
+    await Future.wait([
+      dependencies.apiClient.offlineRequests.retryNow(),
+      dependencies.auth.deliveryConfig(refresh: true),
+    ]);
+    dependencies.activeRoutes.invalidateCache();
     // O gerenciador assina o canal de frota antes da conexao para nao perder a
     // mensagem `connected`, usada como gatilho de reconciliacao REST.
     await AppNotificationManager.instance.start();
@@ -93,7 +98,7 @@ class _DeliveryPageState extends State<DeliveryPage>
       1 => WavesPage(isActive: isActive, onOpenHome: () => _selectTab(0)),
       2 => OrdersPage(isActive: isActive, onOpenHome: () => _selectTab(0)),
       3 => NotificationsPage(isActive: isActive),
-      _ => const SettingsPage(),
+      _ => SettingsPage(isActive: isActive),
     };
   }
 

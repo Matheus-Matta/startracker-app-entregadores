@@ -27,6 +27,7 @@ class _AuthGateState extends State<AuthGate> {
   Future<_AuthBootstrap> _restoreSafely(AuthService authService) async {
     try {
       final loggedIn = await authService.restoreSession();
+      if (loggedIn) await authService.deliveryConfig(refresh: true);
       final recovery = await DeliveryPhotoRecovery(
         AppDependencies.instance.storage,
       ).recoverLostCapture();

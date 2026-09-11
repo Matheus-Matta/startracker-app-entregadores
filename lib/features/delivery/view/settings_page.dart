@@ -5,10 +5,14 @@ import '../../../core/notifications/app_notification_manager.dart';
 import '../../../core/notifications/notification_preferences.dart';
 import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../../auth/data/profile_service.dart';
+import '../../auth/data/auth_service.dart';
+import '../../auth/data/delivery_configuration.dart';
 import '../../auth/view/login_page.dart';
 
 class SettingsPage extends StatefulWidget {
-  const SettingsPage({super.key});
+  const SettingsPage({this.isActive = true, super.key});
+
+  final bool isActive;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -19,6 +23,9 @@ class _SettingsPageState extends State<SettingsPage> {
   NotificationPreferences _notificationPreferences =
       NotificationPreferences.defaults;
   bool _loadingNotificationPreferences = true;
+  DriverAvailability? _availability;
+  bool _loadingAvailability = false;
+  String? _availabilityError;
 
   @override
   void initState() {
@@ -26,6 +33,59 @@ class _SettingsPageState extends State<SettingsPage> {
     final dependencies = AppDependencies.instance;
     _profile = dependencies.profile.getProfile();
     _loadNotificationPreferences();
+    _refreshAvailability();
+  }
+
+  @override
+  void didUpdateWidget(covariant SettingsPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!oldWidget.isActive && widget.isActive) _refreshAvailability();
+  }
+
+  Future<void> _refreshAvailability() async {
+    if (_loadingAvailability) return;
+    setState(() {
+      _loadingAvailability = true;
+      _availabilityError = null;
+    });
+    try {
+      final config = await AppDependencies.instance.auth.deliveryConfig(
+        refresh: true,
+      );
+      if (!mounted) return;
+      setState(() {
+        _availability = DriverAvailability.fromConfiguration(config);
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _availabilityError =
+              'Não foi possível atualizar sua disponibilidade.';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _loadingAvailability = false);
+    }
+  }
+
+  Future<void> _updateAvailability(String value) async {
+    final availability = _availability;
+    if (availability == null || _loadingAvailability) return;
+    setState(() {
+      _loadingAvailability = true;
+      _availabilityError = null;
+    });
+    try {
+      final updated = await AppDependencies.instance.auth.updateAvailability(
+        availability,
+        value,
+      );
+      if (mounted) setState(() => _availability = updated);
+    } on AuthException catch (error) {
+      if (mounted) setState(() => _availabilityError = error.message);
+    } finally {
+      if (mounted) setState(() => _loadingAvailability = false);
+    }
   }
 
   Future<void> _loadNotificationPreferences() async {
@@ -136,6 +196,78 @@ class _SettingsPageState extends State<SettingsPage> {
             );
           },
         ),
+        if (_availability?.canEdit == true) ...[
+          const SizedBox(height: 14),
+          _Panel(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Disponibilidade',
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w900),
+                ),
+                const SizedBox(height: 5),
+                const Text(
+                  'Defina se você pode receber novas cargas automáticas.',
+                  style: TextStyle(color: Color(0xFF858279), fontSize: 11),
+                ),
+                const SizedBox(height: 14),
+                DropdownButtonFormField<String>(
+                  key: ValueKey(_availability?.value),
+                  initialValue:
+                      _availability!.options.any(
+                        (option) => option.value == _availability!.value,
+                      )
+                      ? _availability!.value
+                      : null,
+                  isExpanded: true,
+                  decoration: InputDecoration(
+                    filled: true,
+                    fillColor: const Color(0xFFF5F3ED),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide.none,
+                    ),
+                    suffixIcon: _loadingAvailability
+                        ? const Padding(
+                            padding: EdgeInsets.all(14),
+                            child: SizedBox.square(
+                              dimension: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          )
+                        : null,
+                  ),
+                  items: [
+                    for (final option in _availability!.options)
+                      DropdownMenuItem(
+                        value: option.value,
+                        child: Text(option.label),
+                      ),
+                  ],
+                  onChanged:
+                      _loadingAvailability || !_availability!.canBeChanged
+                      ? null
+                      : (value) {
+                          if (value != null && value != _availability!.value) {
+                            _updateAvailability(value);
+                          }
+                        },
+                ),
+                if (_availabilityError case final error?) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    error,
+                    style: const TextStyle(
+                      color: Color(0xFFB42318),
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
         const SizedBox(height: 14),
         _Panel(
           child: Column(

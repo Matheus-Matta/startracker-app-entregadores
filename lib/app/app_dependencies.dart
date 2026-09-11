@@ -1,5 +1,6 @@
 import '../core/config/app_config.dart';
 import '../core/network/api_client.dart';
+import '../core/location/location_service.dart';
 import '../core/storage/session_storage.dart';
 import '../features/auth/data/auth_service.dart';
 import '../features/auth/data/profile_service.dart';
@@ -14,6 +15,10 @@ class AppDependencies {
   AppDependencies._() {
     apiClient = ApiClient(baseUrl: AppConfig.backendUrl, storage: storage);
     auth = AuthService(apiClient: apiClient, storage: storage);
+    apiClient.onSessionRenewed = () async {
+      await auth.deliveryConfig(refresh: true);
+      activeRoutes.invalidateCache();
+    };
     profile = ProfileService(apiClient);
     orders = OrderService(apiClient);
     waves = WaveService(apiClient);
@@ -21,6 +26,7 @@ class AppDependencies {
     activeWave = ActiveWaveService(apiClient);
     driverOverview = DriverOverviewService(apiClient, profileService: profile);
     notifications = NotificationService(apiClient);
+    location = LocationService();
   }
 
   static final AppDependencies instance = AppDependencies._();
@@ -35,6 +41,7 @@ class AppDependencies {
   late final ActiveWaveService activeWave;
   late final DriverOverviewService driverOverview;
   late final NotificationService notifications;
+  late final LocationService location;
 
   void clearSessionCaches() {
     apiClient.offlineRequests.clear();

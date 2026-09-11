@@ -65,6 +65,7 @@ class ApiClient {
   }
 
   Future<String?>? _refreshOperation;
+  Future<void> Function()? onSessionRenewed;
 
   final SessionStorage _storage;
   final Dio _refreshClient;
@@ -84,13 +85,23 @@ class ApiClient {
 
     final operation = _requestNewAccessToken();
     _refreshOperation = operation;
+    String? access;
     try {
-      return await operation;
+      access = await operation;
     } finally {
       if (identical(_refreshOperation, operation)) {
         _refreshOperation = null;
       }
     }
+    if (access != null) {
+      try {
+        await onSessionRenewed?.call();
+      } catch (_) {
+        // A renovacao do token continua valida mesmo se a sincronizacao da
+        // configuracao estiver temporariamente indisponivel.
+      }
+    }
+    return access;
   }
 
   /// Renova o access token para clientes autenticados que não passam pelo

@@ -30,6 +30,40 @@ void main() {
     expect(storage.deliveryConfig['label_granularity'], 'item');
   });
 
+  test('preserva disponibilidade e localizacao do contrato v6', () async {
+    final storage = _AuthStorage();
+    final client = ApiClient(
+      baseUrl: 'https://api.example.test',
+      storage: storage,
+    );
+    client.dio.httpClientAdapter = _JsonAdapter({
+      'delivery_config': {
+        'version': 6,
+        'availability': {
+          'can_edit': true,
+          'value': 'available',
+          'options': [
+            {'value': 'available', 'label': 'Disponível'},
+          ],
+          'update_url': '/api/v1/delivery/entregadores/7/disponibilidade/',
+          'method': 'POST',
+        },
+        'confirmation_location': {
+          'enabled': true,
+          'latitude_field': 'delivery_actual_lat',
+          'longitude_field': 'delivery_actual_lng',
+        },
+      },
+    });
+    final auth = AuthService(apiClient: client, storage: storage);
+
+    final config = await auth.deliveryConfig(refresh: true);
+
+    expect(config['version'], 6);
+    expect(config['availability'], isA<Map>());
+    expect(config['confirmation_location'], isA<Map>());
+  });
+
   test('usa a ultima configuracao salva quando a atualizacao falha', () async {
     final storage = _AuthStorage()
       ..deliveryConfig = {'label_granularity': 'order'};

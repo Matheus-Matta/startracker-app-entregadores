@@ -3,6 +3,7 @@ import 'package:dio/dio.dart';
 import '../../../core/network/api_client.dart';
 import '../../../core/network/offline_request_queue.dart';
 import '../../../core/storage/session_storage.dart';
+import 'delivery_configuration.dart';
 
 class AuthService {
   const AuthService({required this.apiClient, required this.storage});
@@ -14,11 +15,16 @@ class AuthService {
     required String identifier,
     required String password,
     required bool rememberSession,
+    int? accountId,
   }) async {
     try {
       final response = await apiClient.dio.post<Map<String, dynamic>>(
         '/api/v1/auth/entregadores/token/',
-        data: {'identifier': identifier, 'password': password},
+        data: {
+          'identifier': identifier,
+          'password': password,
+          'account_id': ?accountId,
+        },
       );
       final data = response.data;
       final access = data?['access'] as String?;
@@ -37,7 +43,10 @@ class AuthService {
       }
       await storage.saveRememberSession(rememberSession);
     } on DioException catch (error) {
-      throw AuthException(_messageFrom(error));
+      throw AuthException(
+        _messageFrom(error),
+        accounts: _accountsFrom(error.response?.data),
+      );
     }
   }
 
@@ -82,6 +91,42 @@ class AuthService {
     }
   }
 
+  Future<DriverAvailability> updateAvailability(
+    DriverAvailability availability,
+    String value,
+  ) async {
+    if (!availability.canBeChanged ||
+        !availability.options.any((option) => option.value == value)) {
+      throw const AuthException('Disponibilidade inválida. Atualize o perfil.');
+    }
+    final uri = Uri.tryParse(availability.updateUrl);
+    if (uri == null || uri.isAbsolute || !uri.path.startsWith('/api/')) {
+      throw const AuthException(
+        'Endpoint de disponibilidade inválido. Atualize o perfil.',
+      );
+    }
+    if (!const {'POST', 'PUT', 'PATCH'}.contains(availability.method)) {
+      throw const AuthException(
+        'Método de disponibilidade inválido. Atualize o perfil.',
+      );
+    }
+
+    try {
+      final response = await apiClient.dio.request<dynamic>(
+        availability.updateUrl,
+        data: {'availability': value},
+        options: Options(method: availability.method),
+      );
+      final updated = availability.withApiResponse(response.data);
+      final config = await storage.readDeliveryConfig();
+      config['availability'] = updated.toJson();
+      await storage.saveDeliveryConfig(config);
+      return updated;
+    } on DioException catch (error) {
+      throw AuthException(_messageFrom(error));
+    }
+  }
+
   Future<bool> _refreshSession() async {
     final access = await apiClient.refreshAccessToken();
     if (access == null || access.isEmpty) {
@@ -95,46 +140,7 @@ class AuthService {
   }
 
   Map<String, dynamic> _deliveryConfigFrom(Map<String, dynamic> data) {
-    const acceptedKeys = {
-      'require_photo',
-      'minimum_photos',
-      'maximum_photos',
-      'require_signature',
-      'require_recipient_name',
-      'require_document',
-      'require_note_on_failure',
-      'capture_timestamp',
-      'pickup_enabled',
-      'pickup_barcode_source',
-      'label_scope',
-      'pickup_label_scope',
-      'label_granularity',
-      'pickup_label_granularity',
-      'label_print_scope',
-      'label_code_format',
-      'label_width_mm',
-      'label_height_mm',
-      'version',
-    };
-    dynamic raw = data['delivery_config'];
-    if (raw is! Map && data['account'] is Map) {
-      final account = data['account'] as Map;
-      raw = account['delivery_config'] ?? account['config'];
-    }
-    if (raw is! Map && data['delivery'] is Map) {
-      raw = (data['delivery'] as Map)['config'];
-    }
-    if (raw is! Map && data['config'] is Map) {
-      raw = data['config'];
-    }
-    if (raw is! Map && data.keys.any(acceptedKeys.contains)) {
-      raw = data;
-    }
-    if (raw is! Map) return const {};
-
-    final config = Map<String, dynamic>.from(raw);
-    config.removeWhere((key, _) => !acceptedKeys.contains(key));
-    return config;
+    return deliveryConfigurationFromResponse(data);
   }
 
   String _messageFrom(DioException error) {
@@ -162,9 +168,41 @@ class AuthService {
     }
     return 'Não foi possível entrar. Tente novamente.';
   }
+
+  List<LoginAccount> _accountsFrom(dynamic response) {
+    if (response is! Map) return const [];
+    final raw =
+        response['accounts'] ??
+        response['available_accounts'] ??
+        response['allowed_accounts'];
+    if (raw is! List) return const [];
+    return raw
+        .whereType<Map>()
+        .map((item) {
+          final data = Map<String, dynamic>.from(item);
+          final id = data['id'] is num
+              ? (data['id'] as num).toInt()
+              : int.tryParse(data['id']?.toString() ?? '');
+          if (id == null) return null;
+          return LoginAccount(
+            id: id,
+            name: data['name']?.toString() ?? 'Conta $id',
+          );
+        })
+        .whereType<LoginAccount>()
+        .toList(growable: false);
+  }
 }
 
 class AuthException implements Exception {
-  const AuthException(this.message);
+  const AuthException(this.message, {this.accounts = const []});
   final String message;
+  final List<LoginAccount> accounts;
+}
+
+class LoginAccount {
+  const LoginAccount({required this.id, required this.name});
+
+  final int id;
+  final String name;
 }

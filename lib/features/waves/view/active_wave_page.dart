@@ -339,7 +339,11 @@ class _ActiveWavePageState extends State<ActiveWavePage>
         ),
       ),
     );
-    if (!mounted || completed != true) return;
+    if (!mounted) return;
+    if (completed != true) {
+      await _loadRoute();
+      return;
+    }
     setState(() => _route = _withStopStatus(stop.stopId, 'completed'));
     _message('Entrega finalizada com sucesso.');
     await _loadRoute();

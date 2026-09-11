@@ -22,6 +22,8 @@ class _LoginPageState extends State<LoginPage> {
   bool _rememberMe = true;
   bool _isLoading = false;
   String? _errorMessage;
+  List<LoginAccount> _accounts = const [];
+  int? _selectedAccountId;
 
   @override
   void initState() {
@@ -50,6 +52,7 @@ class _LoginPageState extends State<LoginPage> {
         identifier: _userController.text.trim(),
         password: _passwordController.text,
         rememberSession: _rememberMe,
+        accountId: _selectedAccountId,
       );
       AppDependencies.instance.clearSessionCaches();
       if (!mounted) return;
@@ -57,7 +60,17 @@ class _LoginPageState extends State<LoginPage> {
         MaterialPageRoute<void>(builder: (_) => const DeliveryPage()),
       );
     } on AuthException catch (error) {
-      if (mounted) setState(() => _errorMessage = error.message);
+      if (mounted) {
+        setState(() {
+          _errorMessage = error.message;
+          if (error.accounts.isNotEmpty) {
+            _accounts = error.accounts;
+            _selectedAccountId = error.accounts.length == 1
+                ? error.accounts.first.id
+                : null;
+          }
+        });
+      }
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
@@ -132,6 +145,36 @@ class _LoginPageState extends State<LoginPage> {
                             : null,
                       ),
                       const SizedBox(height: 20),
+                      if (_accounts.isNotEmpty) ...[
+                        DropdownButtonFormField<int>(
+                          initialValue: _selectedAccountId,
+                          isExpanded: true,
+                          decoration: InputDecoration(
+                            labelText: 'Conta',
+                            filled: true,
+                            fillColor: Colors.white,
+                            enabledBorder: _loginBorder(
+                              const Color(0xFFDDE4EC),
+                            ),
+                            focusedBorder: _loginBorder(
+                              const Color(0xFF7183A1),
+                            ),
+                          ),
+                          items: [
+                            for (final account in _accounts)
+                              DropdownMenuItem(
+                                value: account.id,
+                                child: Text(account.name),
+                              ),
+                          ],
+                          onChanged: (value) =>
+                              setState(() => _selectedAccountId = value),
+                          validator: (value) => value == null
+                              ? 'Selecione a conta para continuar'
+                              : null,
+                        ),
+                        const SizedBox(height: 20),
+                      ],
                       _LoginField(
                         controller: _passwordController,
                         focusNode: _passwordFocusNode,
@@ -254,6 +297,11 @@ class _LoginPageState extends State<LoginPage> {
     );
   }
 }
+
+OutlineInputBorder _loginBorder(Color color) => OutlineInputBorder(
+  borderRadius: BorderRadius.circular(11),
+  borderSide: BorderSide(color: color),
+);
 
 class _BrandHeader extends StatelessWidget {
   const _BrandHeader();

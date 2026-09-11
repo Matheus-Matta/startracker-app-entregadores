@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:star_tracker/core/network/api_client.dart';
 import 'package:star_tracker/core/storage/session_storage.dart';
 import 'package:star_tracker/features/waves/data/active_route_service.dart';
+import 'package:star_tracker/features/auth/data/delivery_configuration.dart';
 
 void main() {
   test('currentStop respeita a sequencia depois de adiar uma parada', () {
@@ -54,6 +55,85 @@ void main() {
     expect(route.stops, isEmpty);
     expect(route.currentStop, isNull);
   });
+
+  test(
+    'conclui usando URL, metodo e campos publicados no contrato v6',
+    () async {
+      final client = ApiClient(
+        baseUrl: 'https://api.example.test',
+        storage: const _EmptyStorage(),
+      );
+      final adapter = _CompletionAdapter();
+      client.dio.httpClientAdapter = adapter;
+      final service = ActiveRouteService(
+        client,
+        storage: const _EmptyStorage(),
+      );
+      final stop = _stop(id: 42, sequence: 1, status: 'delivering').copyWith();
+      final configuredStop = ActiveRouteStop(
+        stopId: stop.stopId,
+        orderId: stop.orderId,
+        sequence: stop.sequence,
+        status: stop.status,
+        orderStatus: stop.orderStatus,
+        isManual: stop.isManual,
+        plannedEta: stop.plannedEta,
+        orderNumber: stop.orderNumber,
+        customerName: stop.customerName,
+        customerPhone: stop.customerPhone,
+        fullAddress: stop.fullAddress,
+        latitude: stop.latitude,
+        longitude: stop.longitude,
+        units: stop.units,
+        weightGrams: stop.weightGrams,
+        contents: stop.contents,
+        proofOverrides: stop.proofOverrides,
+        policy: stop.policy,
+        existingProofId: stop.existingProofId,
+        existingPhotoCount: stop.existingPhotoCount,
+        hasSignature: stop.hasSignature,
+        existingRecipientName: stop.existingRecipientName,
+        existingRecipientDocument: stop.existingRecipientDocument,
+        existingNotes: stop.existingNotes,
+        confirmationLocation: ConfirmationLocationPolicy.fromConfiguration(
+          const {
+            'confirmation_location': {
+              'enabled': true,
+              'request_fresh_location': true,
+              'complete_url_template': '/api/v1/custom/stops/{stop_id}/finish/',
+              'method': 'PATCH',
+              'latitude_field': 'mobile_lat',
+              'longitude_field': 'mobile_lng',
+            },
+          },
+        ),
+      );
+
+      final result = await service.complete(
+        DeliveryProofSubmission(
+          stop: configuredStop,
+          recipientName: 'Maria',
+          recipientDocument: '',
+          notes: '',
+          photos: const [],
+          signatureBytes: null,
+          latitude: -22.8301,
+          longitude: -43.0402,
+          itemResults: const [DeliveryItemResult(id: 9, status: 'delivered')],
+        ),
+      );
+
+      expect(result.queued, isFalse);
+      expect(result.value?.trackerValidationLabel, 'Compatível');
+      expect(adapter.completionMethod, 'PATCH');
+      expect(adapter.completionData?['mobile_lat'], -22.8301);
+      expect(adapter.completionData?['mobile_lng'], -43.0402);
+      expect(adapter.completionData, contains('item_results'));
+      expect(adapter.completionData, isNot(contains('items')));
+      expect(adapter.proofFields, isNot(contains('lat')));
+      expect(adapter.proofFields, isNot(contains('lon')));
+    },
+  );
 }
 
 ActiveRouteStop _stop({
@@ -129,6 +209,47 @@ class _CancelledStopAdapter implements HttpClientAdapter {
     };
     return ResponseBody.fromString(
       jsonEncode(data),
+      200,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+class _CompletionAdapter implements HttpClientAdapter {
+  String? completionMethod;
+  Map<String, dynamic>? completionData;
+  final Set<String> proofFields = {};
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    late final Map<String, dynamic> response;
+    if (options.path == '/api/v1/delivery/comprovantes/') {
+      final form = options.data as FormData;
+      proofFields.addAll(form.fields.map((entry) => entry.key));
+      response = {'id': 15};
+    } else if (options.path == '/api/v1/custom/stops/42/finish/') {
+      completionMethod = options.method;
+      completionData = Map<String, dynamic>.from(options.data as Map);
+      response = {
+        'proof': {
+          'tracker_validation_status': 'MATCH',
+          'tracker_validation_label': 'Compatível',
+        },
+      };
+    } else {
+      response = {};
+    }
+    return ResponseBody.fromString(
+      jsonEncode(response),
       200,
       headers: {
         Headers.contentTypeHeader: [Headers.jsonContentType],

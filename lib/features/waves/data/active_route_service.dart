@@ -7,6 +7,7 @@ import '../../../core/network/api_collection.dart';
 import '../../../core/network/api_client.dart';
 import '../../../core/network/offline_request_queue.dart';
 import '../../../core/storage/session_storage.dart';
+import '../../auth/data/delivery_configuration.dart';
 
 class ActiveRoute {
   const ActiveRoute({
@@ -110,6 +111,7 @@ class ActiveRouteStop {
     required this.existingRecipientName,
     required this.existingRecipientDocument,
     required this.existingNotes,
+    this.confirmationLocation = ConfirmationLocationPolicy.disabled,
   });
 
   final int stopId;
@@ -136,11 +138,15 @@ class ActiveRouteStop {
   final String existingRecipientName;
   final String existingRecipientDocument;
   final String existingNotes;
+  final ConfirmationLocationPolicy confirmationLocation;
 
   bool get isTerminal =>
       const {'completed', 'failed', 'skipped', 'cancelled'}.contains(status);
 
-  ActiveRouteStop withPolicy(CompletionPolicy nextPolicy) => ActiveRouteStop(
+  ActiveRouteStop withPolicy(
+    CompletionPolicy nextPolicy, {
+    ConfirmationLocationPolicy? confirmationLocation,
+  }) => ActiveRouteStop(
     stopId: stopId,
     orderId: orderId,
     sequence: sequence,
@@ -165,6 +171,7 @@ class ActiveRouteStop {
     existingRecipientName: existingRecipientName,
     existingRecipientDocument: existingRecipientDocument,
     existingNotes: existingNotes,
+    confirmationLocation: confirmationLocation ?? this.confirmationLocation,
   );
 
   ActiveRouteStop copyWith({String? status, String? orderStatus}) =>
@@ -193,6 +200,7 @@ class ActiveRouteStop {
         existingRecipientName: existingRecipientName,
         existingRecipientDocument: existingRecipientDocument,
         existingNotes: existingNotes,
+        confirmationLocation: confirmationLocation,
       );
 }
 
@@ -320,9 +328,75 @@ class DeliveryProofSubmission {
   final List<DeliveryItemResult> itemResults;
 }
 
+class DeliveryAuditResult {
+  const DeliveryAuditResult({
+    required this.deliveryActualLat,
+    required this.deliveryActualLng,
+    required this.deliveryActualAddress,
+    required this.deliveryDistanceFromPlannedM,
+    required this.deliveryWithinPlannedRadius,
+    required this.trackerLat,
+    required this.trackerLng,
+    required this.trackerPositionAt,
+    required this.trackerDistanceM,
+    required this.trackerValidationStatus,
+    required this.trackerValidationLabel,
+  });
+
+  final double? deliveryActualLat;
+  final double? deliveryActualLng;
+  final String deliveryActualAddress;
+  final double? deliveryDistanceFromPlannedM;
+  final bool? deliveryWithinPlannedRadius;
+  final double? trackerLat;
+  final double? trackerLng;
+  final DateTime? trackerPositionAt;
+  final double? trackerDistanceM;
+  final String trackerValidationStatus;
+  final String trackerValidationLabel;
+
+  bool get hasData =>
+      trackerValidationLabel.isNotEmpty ||
+      deliveryActualLat != null ||
+      deliveryActualAddress.isNotEmpty;
+
+  factory DeliveryAuditResult.fromResponse(dynamic response) {
+    final data = _map(response);
+    final proof = _map(data['proof']);
+    final source = proof.isEmpty ? data : proof;
+    return DeliveryAuditResult(
+      deliveryActualLat: _asDouble(source['delivery_actual_lat']),
+      deliveryActualLng: _asDouble(source['delivery_actual_lng']),
+      deliveryActualAddress:
+          source['delivery_actual_address']?.toString() ?? '',
+      deliveryDistanceFromPlannedM: _asDouble(
+        source['delivery_distance_from_planned_m'],
+      ),
+      deliveryWithinPlannedRadius: _asNullableBool(
+        source['delivery_within_planned_radius'],
+      ),
+      trackerLat: _asDouble(source['tracker_lat']),
+      trackerLng: _asDouble(source['tracker_lng']),
+      trackerPositionAt: DateTime.tryParse(
+        source['tracker_position_at']?.toString() ?? '',
+      ),
+      trackerDistanceM: _asDouble(source['tracker_distance_m']),
+      trackerValidationStatus:
+          source['tracker_validation_status']?.toString() ?? '',
+      trackerValidationLabel:
+          source['tracker_validation_label']?.toString() ?? '',
+    );
+  }
+
+  static Map<String, dynamic> _map(dynamic value) => value is Map
+      ? Map<String, dynamic>.from(value)
+      : const <String, dynamic>{};
+}
+
 class ActiveRouteException implements Exception {
-  const ActiveRouteException(this.message);
+  const ActiveRouteException(this.message, {this.statusCode});
   final String message;
+  final int? statusCode;
 }
 
 class ActiveRouteService {
@@ -404,6 +478,9 @@ class ActiveRouteService {
       CompletionPolicy.fromConfiguration(
         configuration,
         overrides: stop.proofOverrides,
+      ),
+      confirmationLocation: ConfirmationLocationPolicy.fromConfiguration(
+        configuration,
       ),
     );
   }
@@ -511,6 +588,9 @@ class ActiveRouteService {
             existingRecipientDocument:
                 proof?['recipient_document']?.toString() ?? '',
             existingNotes: proof?['notes']?.toString() ?? '',
+            confirmationLocation: ConfirmationLocationPolicy.fromConfiguration(
+              deliveryConfig,
+            ),
           ),
         );
       }
@@ -551,7 +631,10 @@ class ActiveRouteService {
         stops: activeStops,
       );
     } on DioException catch (error) {
-      throw ActiveRouteException(_errorMessage(error));
+      throw ActiveRouteException(
+        _errorMessage(error),
+        statusCode: error.response?.statusCode,
+      );
     }
   }
 
@@ -610,27 +693,61 @@ class ActiveRouteService {
     }
   }
 
-  Future<OfflineMutationResult<void>> complete(
+  Future<OfflineMutationResult<DeliveryAuditResult>> complete(
     DeliveryProofSubmission submission,
   ) async {
+    final hasLatitude = submission.latitude != null;
+    final hasLongitude = submission.longitude != null;
+    if (hasLatitude != hasLongitude) {
+      throw const ActiveRouteException(
+        'Latitude e longitude devem ser registradas juntas.',
+      );
+    }
+    if (submission.latitude case final latitude?
+        when !latitude.isFinite || latitude < -90 || latitude > 90) {
+      throw const ActiveRouteException('Latitude da entrega inválida.');
+    }
+    if (submission.longitude case final longitude?
+        when !longitude.isFinite || longitude < -180 || longitude > 180) {
+      throw const ActiveRouteException('Longitude da entrega inválida.');
+    }
+    var firstAttempt = true;
     try {
-      return await apiClient.offlineRequests.execute<void>(
+      return await apiClient.offlineRequests.execute<DeliveryAuditResult>(
         resourceKey: 'stop:${submission.stop.stopId}',
         description: 'Finalizar entrega',
-        operation: (key) => _completeRequest(submission, key),
+        operation: (key) async {
+          if (!firstAttempt) {
+            final completed = await _completedResultOrNull(
+              submission.stop.stopId,
+            );
+            if (completed != null) return completed;
+          }
+          firstAttempt = false;
+          return _completeRequest(submission, key);
+        },
       );
     } on ActiveRouteException {
       rethrow;
     } on DioException catch (error) {
-      throw ActiveRouteException(_errorMessage(error));
+      throw ActiveRouteException(
+        _errorMessage(error),
+        statusCode: error.response?.statusCode,
+      );
     }
   }
 
-  Future<void> _completeRequest(
+  Future<DeliveryAuditResult> _completeRequest(
     DeliveryProofSubmission submission,
     String idempotencyKey,
   ) async {
     try {
+      final locationPolicy = submission.stop.confirmationLocation;
+      final endpoint = _completionEndpoint(
+        locationPolicy,
+        submission.stop.stopId,
+      );
+      final method = _completionMethod(locationPolicy);
       final proofData = <String, dynamic>{
         // items e completed_at são resultados geridos pelo complete/.
         // Nunca devem fazer parte do multipart do comprovante.
@@ -638,8 +755,6 @@ class ActiveRouteService {
         'recipient_name': submission.recipientName.trim(),
         'recipient_document': submission.recipientDocument.trim(),
         'notes': submission.notes.trim(),
-        if (submission.latitude != null) 'lat': submission.latitude,
-        if (submission.longitude != null) 'lon': submission.longitude,
         if (submission.signatureBytes != null)
           'signature_file': MultipartFile.fromBytes(
             submission.signatureBytes!,
@@ -695,25 +810,74 @@ class ActiveRouteService {
         );
       }
 
-      await apiClient.dio.post<dynamic>(
-        '/api/v1/delivery/paradas/${submission.stop.stopId}/complete/',
-        data: submission.itemResults.isEmpty
-            ? null
-            : {
-                'items': submission.itemResults
-                    .map((result) => result.toJson())
-                    .toList(),
-              },
-        options: apiClient.offlineRequests.requestOptions(
-          idempotencyKey,
-          step: 'complete',
-        ),
+      final completionData = <String, dynamic>{
+        if (submission.itemResults.isNotEmpty)
+          'item_results': submission.itemResults
+              .map((result) => result.toJson())
+              .toList(),
+        if (locationPolicy.canRequestLocation &&
+            submission.latitude != null &&
+            submission.longitude != null) ...{
+          locationPolicy.latitudeField: submission.latitude,
+          locationPolicy.longitudeField: submission.longitude,
+        },
+      };
+      final response = await apiClient.dio.request<dynamic>(
+        endpoint,
+        data: completionData.isEmpty ? null : completionData,
+        options: apiClient.offlineRequests
+            .requestOptions(idempotencyKey, step: 'complete')
+            .copyWith(method: method),
       );
+      return DeliveryAuditResult.fromResponse(response.data);
     } on ActiveRouteException {
       rethrow;
     } on DioException {
       rethrow;
     }
+  }
+
+  Future<DeliveryAuditResult?> _completedResultOrNull(int stopId) async {
+    final response = await apiClient.dio.get<dynamic>(
+      '/api/v1/delivery/paradas/$stopId/',
+      options: Options(
+        headers: const {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'},
+      ),
+    );
+    final data = _asMap(response.data);
+    if (data['status']?.toString() != 'completed') return null;
+    return DeliveryAuditResult.fromResponse(data);
+  }
+
+  static String _completionEndpoint(
+    ConfirmationLocationPolicy policy,
+    int stopId,
+  ) {
+    if (policy.completeUrlTemplate.isEmpty) {
+      // Compatibilidade com configuracoes anteriores ao contrato v6.
+      return '/api/v1/delivery/paradas/$stopId/complete/';
+    }
+    final endpoint = policy.completionUrl(stopId);
+    final uri = Uri.tryParse(endpoint);
+    if (uri == null ||
+        uri.isAbsolute ||
+        !uri.path.startsWith('/api/') ||
+        endpoint.contains('{stop_id}')) {
+      throw const ActiveRouteException(
+        'Endpoint de conclusão inválido. Atualize a configuração.',
+      );
+    }
+    return endpoint;
+  }
+
+  static String _completionMethod(ConfirmationLocationPolicy policy) {
+    if (policy.method.isEmpty) return 'POST';
+    if (!const {'POST', 'PUT', 'PATCH'}.contains(policy.method)) {
+      throw const ActiveRouteException(
+        'Método de conclusão inválido. Atualize a configuração.',
+      );
+    }
+    return policy.method;
   }
 
   Future<OfflineMutationResult<void>> _stopAction(
@@ -769,38 +933,7 @@ class ActiveRouteService {
   }
 
   static Map<String, dynamic> _configurationFromResponse(dynamic data) {
-    dynamic raw = data;
-    if (data is Map) {
-      raw = data['delivery_config'] ?? data['config'] ?? data;
-      if (data['results'] is List && (data['results'] as List).isNotEmpty) {
-        raw = (data['results'] as List).first;
-      }
-    }
-    if (raw is! Map) return const {};
-    const keys = {
-      'version',
-      'require_photo',
-      'minimum_photos',
-      'maximum_photos',
-      'require_signature',
-      'require_recipient_name',
-      'require_document',
-      'require_note_on_failure',
-      'capture_timestamp',
-      'pickup_enabled',
-      'pickup_barcode_source',
-      'label_scope',
-      'pickup_label_scope',
-      'label_granularity',
-      'pickup_label_granularity',
-      'label_print_scope',
-      'label_code_format',
-      'label_width_mm',
-      'label_height_mm',
-    };
-    final result = Map<String, dynamic>.from(raw);
-    result.removeWhere((key, _) => !keys.contains(key));
-    return result;
+    return deliveryConfigurationFromResponse(data);
   }
 
   Future<List<Map<String, dynamic>>> _getAll(
@@ -941,17 +1074,23 @@ class ActiveRouteService {
 
   static String _errorMessage(DioException error) {
     final data = error.response?.data;
-    if (data is List && data.isNotEmpty) return data.first.toString();
-    if (data is Map) {
-      final detail = data['detail'] ?? data['non_field_errors'];
-      if (detail is String && detail.isNotEmpty) return detail;
-      if (detail is List && detail.isNotEmpty) return detail.first.toString();
-      for (final value in data.values) {
-        if (value is List && value.isNotEmpty) return value.first.toString();
-        if (value is String && value.isNotEmpty) return value;
+    final messages = _validationMessages(data).toSet().take(4).toList();
+    if (messages.isNotEmpty) return messages.join('\n');
+    return 'Não foi possível concluir a operação. Tente novamente.';
+  }
+
+  static Iterable<String> _validationMessages(dynamic value) sync* {
+    if (value is String && value.trim().isNotEmpty) {
+      yield value.trim();
+    } else if (value is Iterable) {
+      for (final item in value) {
+        yield* _validationMessages(item);
+      }
+    } else if (value is Map) {
+      for (final item in value.values) {
+        yield* _validationMessages(item);
       }
     }
-    return 'Não foi possível concluir a operação. Tente novamente.';
   }
 }
 
@@ -972,5 +1111,13 @@ int? _asInt(dynamic value) => switch (value) {
 double? _asDouble(dynamic value) => switch (value) {
   num number => number.toDouble(),
   String text => double.tryParse(text),
+  _ => null,
+};
+
+bool? _asNullableBool(dynamic value) => switch (value) {
+  bool boolean => boolean,
+  String text when text.toLowerCase() == 'true' => true,
+  String text when text.toLowerCase() == 'false' => false,
+  num number => number != 0,
   _ => null,
 };
