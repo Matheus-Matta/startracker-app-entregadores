@@ -2,12 +2,6 @@
 
 Aplicativo Flutter para acompanhamento de entregas em tempo real.
 
-A arquitetura, as politicas de cache e o resultado da revisao de desempenho
-estao documentados em [PERFORMANCE.md](PERFORMANCE.md).
-
-A auditoria de seguranca, Android, REST/WebSocket e prontidao para Google Play
-esta em [AUDITORIA_PRODUCAO.md](AUDITORIA_PRODUCAO.md).
-
 ## URL do backend
 
 A URL pode ser definida em tempo de compilação pela variável `BACKEND_URL`.
@@ -93,7 +87,7 @@ git push origin v1.0.1-build5
 ```
 
 Também são aceitas tags `v1.0.1` e `v1.0.1+5`. As configurações e credenciais
-ficam no Secret `RELEASE_ENV_FILE`, conforme `STORE_RELEASE.md`. Um APK de
+ficam no Secret `RELEASE_ENV_FILE`. Um APK de
 contingência, assinado para depuração e claramente identificado por `-debug`, é
 guardado antes da validação da assinatura oficial. Ele é instalável manualmente,
 mas não serve para o Google Play nem para atualizar uma instalação oficial. Com

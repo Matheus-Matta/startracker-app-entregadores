@@ -44,6 +44,9 @@ migrate_working_dir/
 .release.env
 .release/
 
+# Documentacao interna mantida apenas na maquina local
+/local-docs/
+
 # Symbolication related
 app.*.symbols
 
