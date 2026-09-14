@@ -93,37 +93,31 @@ jobs:
 
       - run: flutter pub get
 
-      - name: Gerar APK instalavel de contingencia
-        shell: bash
-        run: |
-          flutter build apk --debug \
-            --build-name="${{ needs.prepare.outputs.version }}" \
-            --build-number="${{ needs.prepare.outputs.build }}" \
-            --dart-define-from-file=.env.production
-          mkdir -p dist/android-debug
-          cp build/app/outputs/flutter-apk/app-debug.apk "dist/android-debug/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}-debug.apk"
-          cd dist/android-debug
-          sha256sum * > SHA256SUMS-android-debug.txt
-
-      - name: Guardar APK instalavel de contingencia
-        uses: actions/upload-artifact@v7
-        with:
-          name: android-debug-${{ needs.prepare.outputs.safe_tag }}
-          path: dist/android-debug/*
-          if-no-files-found: error
-
       - name: Preparar assinatura Android oficial
+        id: android_signing
+        continue-on-error: true
         shell: bash
         run: python tool/prepare_release_env.py android-build
 
-      - name: Gerar AAB e APK assinados
+      - name: Informar uso da assinatura de contingencia
+        if: steps.android_signing.outcome != 'success'
         shell: bash
         run: |
-          flutter build appbundle --release \
+          echo "::warning::APK sera compilado em modo release com assinatura de desenvolvimento. Ele serve para instalacao direta, mas nao para a Play Store."
+
+      - name: Gerar APK release instalavel
+        shell: bash
+        run: |
+          flutter build apk --release \
             --build-name="${{ needs.prepare.outputs.version }}" \
             --build-number="${{ needs.prepare.outputs.build }}" \
             --dart-define-from-file=.env.production
-          flutter build apk --release \
+
+      - name: Gerar AAB com assinatura oficial
+        if: steps.android_signing.outcome == 'success'
+        shell: bash
+        run: |
+          flutter build appbundle --release \
             --build-name="${{ needs.prepare.outputs.version }}" \
             --build-number="${{ needs.prepare.outputs.build }}" \
             --dart-define-from-file=.env.production
@@ -132,8 +126,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/android
-          cp build/app/outputs/bundle/release/app-release.aab "dist/android/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}.aab"
-          cp build/app/outputs/flutter-apk/app-release.apk "dist/android/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}.apk"
+          if [[ "${{ steps.android_signing.outcome }}" == "success" ]]; then
+            cp build/app/outputs/flutter-apk/app-release.apk "dist/android/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}.apk"
+            cp build/app/outputs/bundle/release/app-release.aab "dist/android/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}.aab"
+          else
+            cp build/app/outputs/flutter-apk/app-release.apk "dist/android/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}-standalone.apk"
+          fi
           cd dist/android
           sha256sum * > SHA256SUMS-android.txt
 
@@ -145,10 +143,12 @@ jobs:
           if-no-files-found: error
 
       - name: Preparar credencial do Google Play
+        if: steps.android_signing.outcome == 'success'
         shell: bash
         run: python tool/prepare_release_env.py google-play
 
       - name: Enviar AAB para o Google Play
+        if: steps.android_signing.outcome == 'success'
         uses: r0adkll/upload-google-play@v1.1.5
         with:
           serviceAccountJson: .release/play-service-account.json
@@ -157,6 +157,13 @@ jobs:
           tracks: ${{ env.PLAY_TRACK }}
           status: ${{ env.PLAY_RELEASE_STATUS }}
           releaseName: StarTracker Entregas ${{ github.ref_name }}
+
+      - name: Sinalizar ausencia da assinatura oficial
+        if: steps.android_signing.outcome != 'success'
+        shell: bash
+        run: |
+          echo "O APK release standalone foi preservado, mas a publicacao na Play Store exige a assinatura oficial."
+          exit 1
 
       - name: Apagar credenciais temporarias
         if: always()

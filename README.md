@@ -87,9 +87,9 @@ git push origin v1.0.1-build5
 ```
 
 Também são aceitas tags `v1.0.1` e `v1.0.1+5`. As configurações e credenciais
-ficam no Secret `RELEASE_ENV_FILE`. Um APK de
-contingência, assinado para depuração e claramente identificado por `-debug`, é
-guardado antes da validação da assinatura oficial. Ele é instalável manualmente,
-mas não serve para o Google Play nem para atualizar uma instalação oficial. Com
-a chave Android válida, o workflow também gera o APK e o AAB oficiais antes da
-tentativa de envio ao Google Play.
+ficam no Secret `RELEASE_ENV_FILE`. O workflow sempre compila um APK otimizado
+em modo release. Sem a chave Android oficial, ele recebe o sufixo `-standalone`
+e uma assinatura de desenvolvimento para permitir a instalação direta. Esse APK
+não serve para o Google Play nem atualiza uma instalação assinada por outra
+chave. Com a chave Android válida, o workflow gera o APK e o AAB oficiais antes
+da tentativa de envio ao Google Play.

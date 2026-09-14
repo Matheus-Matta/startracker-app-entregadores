@@ -31,11 +31,6 @@ val releaseRequested = gradle.startParameter.taskNames.any {
     it.contains("release", ignoreCase = true)
 }
 if (releaseRequested) {
-    if (!releaseKeyPropertiesFile.exists()) {
-        throw GradleException(
-            "Build release bloqueado: configure android/key.properties com a upload key.",
-        )
-    }
     val backendUrl = dartDefineValue("BACKEND_URL")
     if (backendUrl == null || !backendUrl.startsWith("https://")) {
         throw GradleException(
@@ -79,7 +74,11 @@ android {
 
     buildTypes {
         release {
+            // APKs Android precisam ser assinados mesmo quando distribuidos fora da loja.
+            // Sem a upload key, mantemos o build otimizado de release e usamos a chave
+            // de desenvolvimento apenas para permitir a instalacao direta.
             signingConfig = signingConfigs.findByName("release")
+                ?: signingConfigs.getByName("debug")
         }
     }
 }
