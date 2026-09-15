@@ -479,16 +479,9 @@ class _HomePageState extends State<_HomePage> {
             },
           ),
           const SizedBox(height: 23),
-          const Row(
-            children: [
-              Expanded(
-                child: Text(
-                  'Operação atual',
-                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.w900),
-                ),
-              ),
-              Icon(Icons.chevron_right_rounded, size: 20, color: _muted),
-            ],
+          const Text(
+            'Operação atual',
+            style: TextStyle(fontSize: 17, fontWeight: FontWeight.w900),
           ),
           const SizedBox(height: 11),
           FutureBuilder<ActiveWave?>(

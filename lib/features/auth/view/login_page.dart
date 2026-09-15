@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import '../../../core/presentation/app_messages.dart';
 
 import '../../../app/app_dependencies.dart';
 import '../../delivery/view/delivery_page.dart';
@@ -76,10 +75,6 @@ class _LoginPageState extends State<LoginPage> {
     }
   }
 
-  void _showUnavailableMessage(String message) {
-    showAppMessage(context, message);
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -121,7 +116,7 @@ class _LoginPageState extends State<LoginPage> {
                       ),
                       const SizedBox(height: 18),
                       const Text(
-                        'Entre para acompanhar seus ativos, alertas e\nindicadores em tempo real.',
+                        'Entre para acompanhar suas cargas, pedidos e\nentregas em tempo real.',
                         style: TextStyle(
                           color: Color(0xFF7183A1),
                           fontSize: 13.5,
@@ -211,24 +206,6 @@ class _LoginPageState extends State<LoginPage> {
                             style: TextStyle(
                               color: Color(0xFF7183A1),
                               fontSize: 12,
-                            ),
-                          ),
-                          const Spacer(),
-                          TextButton(
-                            onPressed: () => _showUnavailableMessage(
-                              'Recuperação de senha em breve.',
-                            ),
-                            style: TextButton.styleFrom(
-                              foregroundColor: const Color(0xFF111827),
-                              padding: EdgeInsets.zero,
-                              minimumSize: const Size(0, 36),
-                            ),
-                            child: const Text(
-                              'Esqueceu a senha?',
-                              style: TextStyle(
-                                fontSize: 11.5,
-                                fontWeight: FontWeight.w600,
-                              ),
                             ),
                           ),
                         ],
