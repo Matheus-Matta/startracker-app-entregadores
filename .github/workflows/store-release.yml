@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  ANDROID_PACKAGE_ID: br.dev.star.tracker.entregas
+
 concurrency:
   group: store-release
   cancel-in-progress: true

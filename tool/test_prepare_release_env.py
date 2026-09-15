@@ -76,6 +76,31 @@ class PrepareReleaseEnvTest(unittest.TestCase):
         self.assertFalse((self.root / "android" / "key.properties").exists())
         self.assertFalse((self.root / "android" / "upload-keystore.jks").exists())
 
+    def test_app_build_uses_android_package_from_environment_as_fallback(self):
+        values = {
+            "BACKEND_URL": "https://example.com",
+            "NOTIFICATIONS_ENABLED": "true",
+            "FLEET_WEBSOCKET_PATH": "/ws/fleet/",
+            "NOTIFICATIONS_WEBSOCKET_PATH": "/ws/notifications/",
+            "NOTIFICATION_CHANNEL_ID": "delivery_updates",
+            "NOTIFICATION_CHANNEL_NAME": "Delivery updates",
+            "NOTIFICATION_CHANNEL_DESCRIPTION": "Delivery status updates",
+        }
+
+        with self.paths(), patch.dict(
+            release.os.environ,
+            {
+                "GITHUB_ENV": "",
+                "ANDROID_PACKAGE_ID": "br.dev.star.tracker.entregas",
+            },
+        ):
+            release.prepare_app(values)
+
+        self.assertIn(
+            "ANDROID_PACKAGE_ID=br.dev.star.tracker.entregas",
+            (self.root / ".env.production").read_text(),
+        )
+
     def test_google_play_preparation_does_not_require_android_build_values(self):
         service_account = {
             "type": "service_account",

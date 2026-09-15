@@ -153,6 +153,12 @@ def prepare_google_play(values: dict[str, str]) -> None:
 
 
 def prepare_app(values: dict[str, str]) -> None:
+    if not values.get("ANDROID_PACKAGE_ID"):
+        values = dict(values)
+        values["ANDROID_PACKAGE_ID"] = os.environ.get(
+            "ANDROID_PACKAGE_ID",
+            "br.dev.star.tracker.entregas",
+        )
     require(values, APP_KEYS)
     write_app_env(values)
     export_to_github(values, ("ANDROID_PACKAGE_ID",))
