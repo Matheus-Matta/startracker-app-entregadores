@@ -70,6 +70,8 @@ def load_env(path: Path) -> dict[str, str]:
         if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
             raise ValueError(f"Nome invalido na linha {number}: {key}")
         if key in values:
+            if key == "ANDROID_PACKAGE_ID" and values[key] == value:
+                continue
             raise ValueError(f"Variavel repetida: {key}")
         if "\n" in value or "\r" in value:
             raise ValueError(f"A variavel {key} precisa ficar em uma unica linha")

@@ -26,6 +26,21 @@ class PrepareReleaseEnvTest(unittest.TestCase):
             RELEASE_DIR=self.release_directory,
         )
 
+    def test_load_env_accepts_repeated_identical_android_package(self):
+        source = self.root / ".release.env"
+        source.write_text(
+            "ANDROID_PACKAGE_ID=br.dev.star.tracker.entregas\n"
+            "ANDROID_PACKAGE_ID=br.dev.star.tracker.entregas\n",
+            encoding="utf-8",
+        )
+
+        values = release.load_env(source)
+
+        self.assertEqual(
+            values["ANDROID_PACKAGE_ID"],
+            "br.dev.star.tracker.entregas",
+        )
+
     def test_android_build_does_not_require_google_play_credentials(self):
         values = {
             "BACKEND_URL": "https://example.com",
