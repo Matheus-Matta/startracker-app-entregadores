@@ -29,6 +29,7 @@ class PrepareReleaseEnvTest(unittest.TestCase):
     def test_android_build_does_not_require_google_play_credentials(self):
         values = {
             "BACKEND_URL": "https://example.com",
+            "ANDROID_PACKAGE_ID": "br.dev.star.tracker.entregas",
             "NOTIFICATIONS_ENABLED": "true",
             "FLEET_WEBSOCKET_PATH": "/ws/fleet/",
             "NOTIFICATIONS_WEBSOCKET_PATH": "/ws/notifications/",
@@ -55,6 +56,7 @@ class PrepareReleaseEnvTest(unittest.TestCase):
     def test_app_build_does_not_require_android_or_google_credentials(self):
         values = {
             "BACKEND_URL": "https://example.com",
+            "ANDROID_PACKAGE_ID": "br.dev.star.tracker.entregas",
             "NOTIFICATIONS_ENABLED": "true",
             "FLEET_WEBSOCKET_PATH": "/ws/fleet/",
             "NOTIFICATIONS_WEBSOCKET_PATH": "/ws/notifications/",
@@ -67,6 +69,10 @@ class PrepareReleaseEnvTest(unittest.TestCase):
             release.prepare_app(values)
 
         self.assertTrue((self.root / ".env.production").is_file())
+        self.assertIn(
+            "ANDROID_PACKAGE_ID=br.dev.star.tracker.entregas",
+            (self.root / ".env.production").read_text(),
+        )
         self.assertFalse((self.root / "android" / "key.properties").exists())
         self.assertFalse((self.root / "android" / "upload-keystore.jks").exists())
 

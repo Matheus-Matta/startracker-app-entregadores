@@ -30,6 +30,8 @@ fun dartDefineValue(name: String): String? =
 val releaseRequested = gradle.startParameter.taskNames.any {
     it.contains("release", ignoreCase = true)
 }
+val androidPackageId =
+    dartDefineValue("ANDROID_PACKAGE_ID") ?: "br.dev.star.tracker.entregas"
 if (releaseRequested) {
     val backendUrl = dartDefineValue("BACKEND_URL")
     if (backendUrl == null || !backendUrl.startsWith("https://")) {
@@ -37,10 +39,15 @@ if (releaseRequested) {
             "Build release exige BACKEND_URL=https://... via --dart-define-from-file.",
         )
     }
+    if (dartDefineValue("ANDROID_PACKAGE_ID") == null) {
+        throw GradleException(
+            "Build release exige ANDROID_PACKAGE_ID via --dart-define-from-file.",
+        )
+    }
 }
 
 android {
-    namespace = "com.startracker.star_tracker"
+    namespace = "br.dev.star.tracker.entregas"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -52,7 +59,7 @@ android {
 
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.startracker.star_tracker"
+        applicationId = androidPackageId
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion

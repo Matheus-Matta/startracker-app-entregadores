@@ -1,4 +1,4 @@
-package com.startracker.star_tracker
+package br.dev.star.tracker.entregas
 
 import io.flutter.embedding.android.FlutterActivity
 

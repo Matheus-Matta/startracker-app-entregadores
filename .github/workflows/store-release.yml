@@ -152,7 +152,7 @@ jobs:
         uses: r0adkll/upload-google-play@v1.1.5
         with:
           serviceAccountJson: .release/play-service-account.json
-          packageName: com.startracker.star_tracker
+          packageName: ${{ env.ANDROID_PACKAGE_ID }}
           releaseFiles: dist/android/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}.aab
           tracks: ${{ env.PLAY_TRACK }}
           status: ${{ env.PLAY_RELEASE_STATUS }}

@@ -19,6 +19,7 @@ RELEASE_DIR = ROOT / ".release"
 
 APP_KEYS = (
     "BACKEND_URL",
+    "ANDROID_PACKAGE_ID",
     "NOTIFICATIONS_ENABLED",
     "FLEET_WEBSOCKET_PATH",
     "NOTIFICATIONS_WEBSOCKET_PATH",
@@ -95,6 +96,11 @@ def write_app_env(values: dict[str, str]) -> None:
     backend = urlparse(values["BACKEND_URL"])
     if backend.scheme != "https" or not backend.netloc:
         raise ValueError("BACKEND_URL precisa comecar com https://")
+    if not re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+",
+        values["ANDROID_PACKAGE_ID"],
+    ):
+        raise ValueError("ANDROID_PACKAGE_ID invalido")
     APP_ENV_FILE.write_text(
         "".join(f"{key}={values[key]}\n" for key in APP_KEYS),
         encoding="utf-8",
@@ -149,6 +155,7 @@ def prepare_google_play(values: dict[str, str]) -> None:
 def prepare_app(values: dict[str, str]) -> None:
     require(values, APP_KEYS)
     write_app_env(values)
+    export_to_github(values, ("ANDROID_PACKAGE_ID",))
 
 
 def prepare_android(values: dict[str, str], *, with_play: bool = True) -> None:
