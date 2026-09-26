@@ -6,11 +6,11 @@ import '../../../core/presentation/app_messages.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:image_picker/image_picker.dart';
 
 import '../../../app/app_dependencies.dart';
 import '../data/active_route_service.dart';
 import '../data/delivery_photo_recovery.dart';
+import 'delivery_camera_page.dart';
 
 const _ink = Color(0xFF171713);
 const _cream = Color(0xFFF5F3ED);
@@ -39,8 +39,6 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
   final _recipientController = TextEditingController();
   final _documentController = TextEditingController();
   final _notesController = TextEditingController();
-  final _picker = ImagePicker();
-  late final DeliveryPhotoRecovery _photoRecovery;
   final _photos = <_CapturedPhoto>[];
   late final List<_ItemCompletionState> _itemStates;
   Uint8List? _signatureBytes;
@@ -53,7 +51,6 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
   @override
   void initState() {
     super.initState();
-    _photoRecovery = DeliveryPhotoRecovery(widget.service.storage);
     final recovered = widget.recoveredCapture;
     final draft = recovered?.draft;
     _recipientController.text =
@@ -98,50 +95,22 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
     if (_openingCamera || _totalPhotos >= _policy.maximumPhotos) return;
     setState(() => _openingCamera = true);
     try {
-      await _photoRecovery.saveDraft(_currentDraft());
-      final file = await _picker.pickImage(
-        source: ImageSource.camera,
-        preferredCameraDevice: CameraDevice.rear,
-        imageQuality: 78,
-        maxWidth: 1800,
+      // Câmera interna: o app não vai para segundo plano, então o Android não
+      // encerra o processo e a tela de finalização é preservada.
+      final photo = await Navigator.of(context).push<DeliveryCameraPhoto>(
+        MaterialPageRoute<DeliveryCameraPhoto>(
+          fullscreenDialog: true,
+          builder: (_) => const DeliveryCameraPage(),
+        ),
       );
-      if (file == null) {
-        await _photoRecovery.clearDraft();
-        return;
-      }
-      final bytes = await file.readAsBytes();
-      await _photoRecovery.clearDraft();
-      if (!mounted) return;
-      setState(() => _photos.add(_CapturedPhoto(file.name, bytes)));
+      if (!mounted || photo == null) return;
+      setState(() => _photos.add(_CapturedPhoto(photo.filename, photo.bytes)));
     } catch (_) {
-      await _photoRecovery.clearDraft();
-      if (!mounted) return;
-      _message(
-        'A câmera é obrigatória para registrar a foto. Permita o acesso nas configurações do telefone.',
-      );
+      if (mounted) _message('Não foi possível registrar a foto. Tente novamente.');
     } finally {
       if (mounted) setState(() => _openingCamera = false);
     }
   }
-
-  PendingDeliveryDraft _currentDraft() => PendingDeliveryDraft(
-    routeId: widget.routeId,
-    stopId: widget.stop.stopId,
-    recipientName: _recipientController.text,
-    recipientDocument: _documentController.text,
-    notes: _notesController.text,
-    items: _itemStates
-        .map(
-          (state) => DeliveryDraftItem(
-            id: state.item.id,
-            status: state.status,
-            reason: state.reason,
-            notes: state.notesController.text,
-          ),
-        )
-        .toList(),
-    signatureBytes: _signatureBytes,
-  );
 
   Future<void> _openSignature() async {
     final signature = await Navigator.of(context).push<Uint8List>(
