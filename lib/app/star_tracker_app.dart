@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 
+import '../core/presentation/offline_queue_banner.dart';
 import '../core/theme/app_theme.dart';
+import 'app_dependencies.dart';
 import '../features/auth/view/auth_gate.dart';
 
 class StarTrackerApp extends StatelessWidget {
@@ -53,7 +55,12 @@ class StarTrackerApp extends StatelessWidget {
             GlobalWidgetsLocalizations.delegate,
           ],
           supportedLocales: const [Locale('pt', 'BR'), Locale('en', 'US')],
-          builder: (context, child) => ShadAppBuilder(child: child!),
+          builder: (context, child) => ShadAppBuilder(
+            child: OfflineQueueBanner(
+              queue: AppDependencies.instance.apiClient.offlineRequests,
+              child: child!,
+            ),
+          ),
           home: const AuthGate(),
         );
       },

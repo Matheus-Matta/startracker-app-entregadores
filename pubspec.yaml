@@ -44,6 +44,7 @@ dependencies:
   shadcn_ui: ^0.56.1
   flutter_local_notifications: 22.3.0
   camera: ^0.12.1
+  path_provider: ^2.1.5
 dev_dependencies:
   flutter_test:
     sdk: flutter

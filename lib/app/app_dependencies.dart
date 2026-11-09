@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import '../core/config/app_config.dart';
 import '../core/network/api_client.dart';
 import '../core/location/location_service.dart';
@@ -47,7 +49,10 @@ class AppDependencies {
     apiClient.offlineRequests.clear();
     orders.invalidateCache();
     profile.invalidateCache();
-    activeRoutes.invalidateCache();
+    activeRoutes.clearSessionData();
     waves.invalidateCache();
+    activeWave.invalidateCache();
+    driverOverview.invalidateCache();
+    unawaited(storage.clearOpenActiveRoute());
   }
 }

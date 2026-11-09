@@ -203,7 +203,22 @@ class _WaveListSnapshot {
 }
 
 class WaveService {
-  WaveService(this.apiClient);
+  WaveService(this.apiClient) {
+    apiClient.offlineRequests.registerRestoreHandler(_prepareRouteType, (
+      key,
+      payload,
+      _,
+    ) async {
+      final waveId = _asInt(payload['wave_id']);
+      if (waveId == null) return;
+      await _postPrepareRoute(waveId, key);
+      invalidateCache();
+    });
+  }
+
+  static const _prepareRouteType = 'wave.prepare_route';
+  // Mesmo tipo registrado pelo ActiveRouteService para iniciar a rota.
+  static const _routeStartType = 'active_route.route_start';
   final ApiClient apiClient;
   static const _listCacheDuration = Duration(seconds: 30);
   _WaveListSnapshot? _listCache;
@@ -745,6 +760,10 @@ class WaveService {
         resourceKey: 'wave:${wave.waveId}',
         description: 'Preparar rota da carga',
         operation: (key) => _optimizeAndReleaseRequest(wave, key),
+        persisted: PersistedOfflineRequest(
+          type: _prepareRouteType,
+          payload: {'wave_id': wave.waveId},
+        ),
       );
     } on WaveServiceException {
       rethrow;
@@ -758,35 +777,7 @@ class WaveService {
     String idempotencyKey,
   ) async {
     try {
-      try {
-        await apiClient.dio.post<dynamic>(
-          '/api/v1/delivery/waves/${wave.waveId}/prepare-route/',
-          options: apiClient.offlineRequests.requestOptions(
-            idempotencyKey,
-            step: 'prepare',
-          ),
-        );
-      } on DioException catch (error) {
-        if (error.response?.statusCode != 404 &&
-            error.response?.statusCode != 405) {
-          rethrow;
-        }
-        // Compatibilidade temporária com o contrato administrativo anterior.
-        await apiClient.dio.post<dynamic>(
-          '/api/v1/delivery/waves/${wave.waveId}/optimize/',
-          options: apiClient.offlineRequests.requestOptions(
-            idempotencyKey,
-            step: 'optimize',
-          ),
-        );
-        await apiClient.dio.post<dynamic>(
-          '/api/v1/delivery/waves/${wave.waveId}/release/',
-          options: apiClient.offlineRequests.requestOptions(
-            idempotencyKey,
-            step: 'release',
-          ),
-        );
-      }
+      await _postPrepareRoute(wave.waveId, idempotencyKey);
       invalidateCache();
       final routes = await _getAll('/api/v1/delivery/rotas/');
       final matching =
@@ -821,6 +812,38 @@ class WaveService {
     }
   }
 
+  Future<void> _postPrepareRoute(int waveId, String idempotencyKey) async {
+    try {
+      await apiClient.dio.post<dynamic>(
+        '/api/v1/delivery/waves/$waveId/prepare-route/',
+        options: apiClient.offlineRequests.requestOptions(
+          idempotencyKey,
+          step: 'prepare',
+        ),
+      );
+    } on DioException catch (error) {
+      if (error.response?.statusCode != 404 &&
+          error.response?.statusCode != 405) {
+        rethrow;
+      }
+      // Compatibilidade temporária com o contrato administrativo anterior.
+      await apiClient.dio.post<dynamic>(
+        '/api/v1/delivery/waves/$waveId/optimize/',
+        options: apiClient.offlineRequests.requestOptions(
+          idempotencyKey,
+          step: 'optimize',
+        ),
+      );
+      await apiClient.dio.post<dynamic>(
+        '/api/v1/delivery/waves/$waveId/release/',
+        options: apiClient.offlineRequests.requestOptions(
+          idempotencyKey,
+          step: 'release',
+        ),
+      );
+    }
+  }
+
   Future<OfflineMutationResult<void>> startRoute(int routeId) async {
     try {
       final result = await apiClient.offlineRequests.execute<void>(
@@ -832,6 +855,10 @@ class WaveService {
             options: apiClient.offlineRequests.requestOptions(key),
           );
         },
+        persisted: PersistedOfflineRequest(
+          type: _routeStartType,
+          payload: {'route_id': routeId},
+        ),
       );
       invalidateCache();
       return result;

@@ -1,5 +1,8 @@
+import 'package:dio/dio.dart';
+
 import '../../../core/network/api_client.dart';
 import '../../../core/network/api_collection.dart';
+import '../../../core/network/offline_request_queue.dart';
 
 class ActiveWave {
   const ActiveWave({
@@ -22,11 +25,63 @@ class ActiveWave {
 }
 
 class ActiveWaveService {
-  const ActiveWaveService(this.apiClient);
+  ActiveWaveService(this.apiClient);
+
+  static const _cacheDuration = Duration(seconds: 20);
 
   final ApiClient apiClient;
+  ActiveWave? _cached;
+  DateTime? _cachedAt;
+  bool _hasCache = false;
+  Future<ActiveWave?>? _operation;
+  int _generation = 0;
 
-  Future<ActiveWave?> getActiveWave() async {
+  void invalidateCache() {
+    _generation++;
+    _hasCache = false;
+    _cached = null;
+    _cachedAt = null;
+    _operation = null;
+  }
+
+  /// Carga ativa do entregador.
+  ///
+  /// Respostas recentes são reaproveitadas, consultas simultâneas são
+  /// unificadas e, sem rede, a última carga conhecida continua disponível.
+  Future<ActiveWave?> getActiveWave({bool refresh = false}) {
+    final cachedAt = _cachedAt;
+    if (!refresh &&
+        _hasCache &&
+        cachedAt != null &&
+        DateTime.now().difference(cachedAt) < _cacheDuration) {
+      return Future.value(_cached);
+    }
+    final ongoing = _operation;
+    if (ongoing != null) return ongoing;
+    final generation = _generation;
+    final operation = () async {
+      try {
+        final wave = await _loadActiveWave();
+        if (generation == _generation) {
+          _cached = wave;
+          _cachedAt = DateTime.now();
+          _hasCache = true;
+        }
+        return wave;
+      } on DioException catch (error) {
+        if (_hasCache && OfflineRequestQueue.isNetworkFailure(error)) {
+          return _cached;
+        }
+        rethrow;
+      } finally {
+        if (generation == _generation) _operation = null;
+      }
+    }();
+    _operation = operation;
+    return operation;
+  }
+
+  Future<ActiveWave?> _loadActiveWave() async {
     final routes = await _getAllRoutes();
     const activeStatuses = {'released', 'accepted', 'started'};
 

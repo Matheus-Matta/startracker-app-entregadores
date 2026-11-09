@@ -968,6 +968,10 @@ class _PhotoSection extends StatelessWidget {
                       width: 92,
                       height: 92,
                       fit: BoxFit.cover,
+                      gaplessPlayback: true,
+                      // Miniatura: decodifica pequena em vez da foto inteira.
+                      cacheWidth:
+                          (92 * MediaQuery.devicePixelRatioOf(context)).round(),
                     ),
                   ),
                   Positioned(

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
@@ -22,6 +23,15 @@ class DeliveryCameraPhoto {
 /// A câmera externa do sistema (image_picker) coloca o app em segundo plano e,
 /// em aparelhos com pouca memória, o Android encerra o processo antes da foto
 /// voltar, perdendo a tela de finalização. Aqui o app nunca sai da tela.
+///
+/// Cuidados de desempenho (aparelhos de entrada travavam ou fechavam o app):
+/// * resolução `high` (720p) em vez de `veryHigh`: a foto de comprovante não
+///   precisa de mais que isso e cada captura grande ocupava dezenas de MB;
+/// * `initialize()` tem tempo limite e, se falhar, tenta uma resolução menor;
+/// * a câmera só é liberada quando o app vai realmente para segundo plano
+///   (não em `inactive`, que dispara até ao puxar a barra de notificações) e
+///   nunca no meio de uma captura;
+/// * a prévia da foto é decodificada no tamanho da tela, não no tamanho real.
 class DeliveryCameraPage extends StatefulWidget {
   const DeliveryCameraPage({super.key});
 
@@ -31,11 +41,19 @@ class DeliveryCameraPage extends StatefulWidget {
 
 class _DeliveryCameraPageState extends State<DeliveryCameraPage>
     with WidgetsBindingObserver {
+  static const _presets = [ResolutionPreset.high, ResolutionPreset.medium];
+  static const _initTimeout = Duration(seconds: 12);
+  static const _busyRetryLimit = 3;
+  static const _busyRetryDelay = Duration(milliseconds: 1500);
+
   CameraController? _controller;
-  Future<void>? _initializing;
   String? _error;
   bool _capturing = false;
   bool _starting = false;
+  bool _releaseAfterCapture = false;
+  bool _inBackground = false;
+  int _generation = 0;
+  int _presetIndex = 0;
   DeliveryCameraPhoto? _preview;
   FlashMode _flashMode = FlashMode.off;
 
@@ -43,43 +61,80 @@ class _DeliveryCameraPageState extends State<DeliveryCameraPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _initializing = _initCamera();
+    unawaited(_initCamera());
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _generation++;
     final controller = _controller;
     _controller = null;
-    unawaited(controller?.dispose());
+    unawaited(_safeDispose(controller));
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // O controlador precisa ser liberado ao sair do app e recriado ao voltar,
-    // senão a câmera fica presa ou lança erro no retorno.
-    if (state == AppLifecycleState.inactive ||
-        state == AppLifecycleState.paused) {
-      final controller = _controller;
-      if (controller == null) return;
+    switch (state) {
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        _inBackground = true;
+        if (_capturing) {
+          // Liberar a câmera durante takePicture derruba alguns aparelhos.
+          _releaseAfterCapture = true;
+        } else {
+          _releaseCamera();
+        }
+      case AppLifecycleState.resumed:
+        _inBackground = false;
+        if (_controller == null &&
+            _preview == null &&
+            !_starting &&
+            _error == null &&
+            mounted) {
+          unawaited(_initCamera());
+        }
+      case AppLifecycleState.inactive:
+        // Diálogo de permissão, barra de notificações etc. A câmera continua.
+        break;
+    }
+  }
+
+  /// Remove a prévia da árvore antes de liberar o controlador, evitando que
+  /// o CameraPreview desenhe uma textura já descartada.
+  void _releaseCamera() {
+    _generation++;
+    final controller = _controller;
+    if (controller == null) return;
+    if (mounted) {
+      setState(() => _controller = null);
+    } else {
       _controller = null;
-      unawaited(controller.dispose());
-      if (mounted) setState(() {});
-    } else if (state == AppLifecycleState.resumed) {
-      // O pedido de permissão também deixa o app inativo; não reinicia em dobro.
-      if (_controller == null && _preview == null && !_starting && mounted) {
-        setState(() => _initializing = _initCamera());
-      }
+    }
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) => unawaited(_safeDispose(controller)),
+    );
+  }
+
+  static Future<void> _safeDispose(CameraController? controller) async {
+    if (controller == null) return;
+    try {
+      await controller.dispose();
+    } catch (_) {
+      // Alguns drivers lançam erro ao fechar uma sessão já encerrada.
     }
   }
 
   Future<void> _initCamera() async {
     if (_starting) return;
     _starting = true;
-    _error = null;
+    final generation = ++_generation;
+    if (mounted) setState(() => _error = null);
+    CameraController? controller;
     try {
-      final cameras = await availableCameras();
+      final cameras = await availableCameras().timeout(_initTimeout);
       if (cameras.isEmpty) {
         _setError('Nenhuma câmera foi encontrada neste aparelho.');
         return;
@@ -88,15 +143,41 @@ class _DeliveryCameraPageState extends State<DeliveryCameraPage>
         (item) => item.lensDirection == CameraLensDirection.back,
         orElse: () => cameras.first,
       );
-      final controller = CameraController(
-        camera,
-        ResolutionPreset.veryHigh,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.jpeg,
-      );
-      await controller.initialize();
-      if (!mounted) {
-        await controller.dispose();
+      var busyRetries = 0;
+      while (true) {
+        controller = CameraController(
+          camera,
+          _presets[_presetIndex],
+          enableAudio: false,
+        );
+        try {
+          await controller.initialize().timeout(_initTimeout);
+          break;
+        } on CameraException catch (error) {
+          await _safeDispose(controller);
+          controller = null;
+          if (_isPermissionError(error)) rethrow;
+          if (_isBusyError(error) && busyRetries < _busyRetryLimit) {
+            // A câmera ainda está presa a outro app (ou ao leitor de
+            // etiquetas) e costuma ser liberada em poucos segundos.
+            busyRetries++;
+            await Future<void>.delayed(_busyRetryDelay);
+            if (!mounted || generation != _generation || _inBackground) {
+              return;
+            }
+            continue;
+          }
+          if (_presetIndex >= _presets.length - 1) rethrow;
+          _presetIndex++;
+        } on TimeoutException {
+          await _safeDispose(controller);
+          controller = null;
+          if (_presetIndex >= _presets.length - 1) rethrow;
+          _presetIndex++;
+        }
+      }
+      if (!mounted || generation != _generation || _inBackground) {
+        await _safeDispose(controller);
         return;
       }
       try {
@@ -104,15 +185,37 @@ class _DeliveryCameraPageState extends State<DeliveryCameraPage>
       } catch (_) {
         // Aparelhos sem flash continuam funcionando normalmente.
       }
-      final previous = _controller;
+      if (!mounted || generation != _generation) {
+        await _safeDispose(controller);
+        return;
+      }
       setState(() => _controller = controller);
-      await previous?.dispose();
     } on CameraException catch (error) {
-      _setError(_cameraErrorMessage(error));
+      _setError(
+        _isPermissionError(error)
+            ? 'A câmera é obrigatória para registrar a foto. Permita o acesso nas configurações do telefone.'
+            : _isBusyError(error)
+            ? 'A câmera está sendo usada por outro aplicativo. Feche apps de câmera, chamadas de vídeo ou lanterna e toque em tentar novamente.'
+            : 'Não foi possível abrir a câmera. Tente novamente.',
+      );
+    } on TimeoutException {
+      _setError(
+        'A câmera demorou para responder. Feche outros apps e tente novamente.',
+      );
     } catch (_) {
       _setError('Não foi possível abrir a câmera. Tente novamente.');
     } finally {
       _starting = false;
+      // O app pode ter ido e voltado do segundo plano durante a abertura;
+      // nesse caso esta tentativa foi descartada e precisa ser refeita.
+      if (mounted &&
+          generation != _generation &&
+          !_inBackground &&
+          _controller == null &&
+          _preview == null &&
+          _error == null) {
+        unawaited(_initCamera());
+      }
     }
   }
 
@@ -121,21 +224,33 @@ class _DeliveryCameraPageState extends State<DeliveryCameraPage>
     setState(() => _error = message);
   }
 
-  String _cameraErrorMessage(CameraException error) {
+  /// Câmera ocupada/desconectada: outro app, sessão anterior ainda fechando
+  /// ou serviço de câmera do Android travado.
+  static bool _isBusyError(CameraException error) {
+    final text = '${error.code} ${error.description ?? ''}'.toLowerCase();
+    return text.contains('in use') ||
+        text.contains('in_use') ||
+        text.contains('busy') ||
+        text.contains('max_cameras') ||
+        text.contains('maxcameras') ||
+        text.contains('disconnected') ||
+        text.contains('disabled') ||
+        text.contains('cameraaccess') ||
+        text.contains('camera_error') ||
+        text.contains('error_camera');
+  }
+
+  static bool _isPermissionError(CameraException error) {
     final code = error.code.toLowerCase();
-    if (code.contains('denied') ||
+    return code.contains('denied') ||
         code.contains('permission') ||
-        code.contains('restricted')) {
-      return 'A câmera é obrigatória para registrar a foto. Permita o acesso nas configurações do telefone.';
-    }
-    return 'Não foi possível abrir a câmera. Tente novamente.';
+        code.contains('restricted');
   }
 
   void _retry() {
-    final controller = _controller;
-    _controller = null;
-    unawaited(controller?.dispose());
-    setState(() => _initializing = _initCamera());
+    _releaseCamera();
+    setState(() => _error = null);
+    unawaited(_initCamera());
   }
 
   Future<void> _capture() async {
@@ -150,6 +265,13 @@ class _DeliveryCameraPageState extends State<DeliveryCameraPage>
     try {
       final file = await controller.takePicture();
       final bytes = await file.readAsBytes();
+      unawaited(_deleteTemp(file.path));
+      if (!mounted) return;
+      try {
+        await controller.pausePreview();
+      } catch (_) {
+        // Pausar é só economia de bateria/memória durante a revisão.
+      }
       if (!mounted) return;
       setState(
         () => _preview = DeliveryCameraPhoto(
@@ -161,11 +283,25 @@ class _DeliveryCameraPageState extends State<DeliveryCameraPage>
       );
     } catch (_) {
       if (mounted) {
-        showAppMessage(context, 'Não foi possível tirar a foto. Tente novamente.');
+        showAppMessage(
+          context,
+          'Não foi possível tirar a foto. Tente novamente.',
+        );
       }
     } finally {
       if (mounted) setState(() => _capturing = false);
+      if (_releaseAfterCapture) {
+        _releaseAfterCapture = false;
+        if (_inBackground) _releaseCamera();
+      }
     }
+  }
+
+  static Future<void> _deleteTemp(String path) async {
+    if (path.isEmpty) return;
+    try {
+      await File(path).delete();
+    } catch (_) {}
   }
 
   Future<void> _toggleFlash() async {
@@ -182,9 +318,18 @@ class _DeliveryCameraPageState extends State<DeliveryCameraPage>
     }
   }
 
-  void _retake() {
+  Future<void> _retake() async {
     setState(() => _preview = null);
-    if (_controller == null) _retry();
+    final controller = _controller;
+    if (controller == null) {
+      if (!_starting) unawaited(_initCamera());
+      return;
+    }
+    try {
+      await controller.resumePreview();
+    } catch (_) {
+      if (mounted) _retry();
+    }
   }
 
   @override
@@ -207,12 +352,7 @@ class _DeliveryCameraPageState extends State<DeliveryCameraPage>
         else if (_error != null)
           _CameraError(message: _error!, onRetry: _retry)
         else
-          FutureBuilder<void>(
-            future: _initializing,
-            builder: (context, _) => const Center(
-              child: CircularProgressIndicator(color: Colors.white),
-            ),
-          ),
+          const Center(child: CircularProgressIndicator(color: Colors.white)),
         SafeArea(
           child: Padding(
             padding: const EdgeInsets.all(8),
@@ -246,10 +386,7 @@ class _DeliveryCameraPageState extends State<DeliveryCameraPage>
             child: SafeArea(
               child: Padding(
                 padding: const EdgeInsets.only(bottom: 28),
-                child: _ShutterButton(
-                  busy: _capturing,
-                  onPressed: _capture,
-                ),
+                child: _ShutterButton(busy: _capturing, onPressed: _capture),
               ),
             ),
           ),
@@ -258,10 +395,20 @@ class _DeliveryCameraPageState extends State<DeliveryCameraPage>
   }
 
   Widget _buildReview(DeliveryCameraPhoto photo) {
+    final media = MediaQuery.of(context);
+    // Decodifica no tamanho da tela: uma foto 12 MP decodificada inteira
+    // ocupa ~48 MB de RAM e era a principal causa de travamento.
+    final cacheWidth = (media.size.width * media.devicePixelRatio).round();
     return Stack(
       fit: StackFit.expand,
       children: [
-        Image.memory(photo.bytes, fit: BoxFit.contain, gaplessPlayback: true),
+        Image.memory(
+          photo.bytes,
+          fit: BoxFit.contain,
+          gaplessPlayback: true,
+          cacheWidth: cacheWidth > 0 ? cacheWidth : null,
+          filterQuality: FilterQuality.medium,
+        ),
         Align(
           alignment: Alignment.bottomCenter,
           child: SafeArea(

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -400,12 +401,38 @@ class ActiveRouteException implements Exception {
 }
 
 class ActiveRouteService {
-  ActiveRouteService(this.apiClient, {this.storage = const SessionStorage()});
+  ActiveRouteService(this.apiClient, {this.storage = const SessionStorage()}) {
+    _registerOfflineHandlers();
+    _queueSubscription = apiClient.offlineRequests.events.listen(
+      _onOfflineQueueEvent,
+    );
+  }
+
+  static const _warehouseCacheDuration = Duration(minutes: 30);
+  static const _stopActionType = 'active_route.stop_action';
+  static const _stopFailType = 'active_route.stop_fail';
+  static const _stopCompleteType = 'active_route.stop_complete';
+  static const routeStartType = 'active_route.route_start';
 
   final ApiClient apiClient;
   final SessionStorage storage;
   Map<String, dynamic>? _configurationCache;
   Future<String>? _mapStyleOperation;
+  // Mantida viva durante todo o app (o serviço é um singleton).
+  // ignore: unused_field
+  late final StreamSubscription<OfflineQueueEvent> _queueSubscription;
+
+  /// Última rota carregada com sucesso, por id. Serve para abrir o mapa
+  /// instantaneamente e para continuar operando sem rede.
+  final Map<int, ActiveRoute> _routeSnapshots = {};
+  final Map<int, Future<ActiveRoute>> _routeOperations = {};
+
+  /// Status aplicados localmente enquanto a alteração está na fila offline.
+  final Map<int, String> _pendingStopStatuses = {};
+
+  List<Map<String, dynamic>>? _warehouseCache;
+  DateTime? _warehouseCacheAt;
+  Future<List<Map<String, dynamic>>>? _warehouseOperation;
 
   static const openFreeMapStyle =
       'https://tiles.openfreemap.org/styles/positron';
@@ -413,6 +440,115 @@ class ActiveRouteService {
   void invalidateCache() {
     _configurationCache = null;
     _mapStyleOperation = null;
+    _warehouseCache = null;
+    _warehouseCacheAt = null;
+  }
+
+  /// Limpa todos os dados da sessão (logout/troca de conta).
+  void clearSessionData() {
+    invalidateCache();
+    _routeSnapshots.clear();
+    _routeOperations.clear();
+    _pendingStopStatuses.clear();
+  }
+
+  /// Rota em cache para exibição imediata enquanto a versão atual carrega.
+  ActiveRoute? cachedRoute(int routeId) {
+    final route = _routeSnapshots[routeId];
+    return route == null ? null : _withPendingStatuses(route);
+  }
+
+  void _onOfflineQueueEvent(OfflineQueueEvent event) {
+    if (event.type == OfflineQueueEventType.queued ||
+        event.type == OfflineQueueEventType.exhausted) {
+      return;
+    }
+    final key = event.resourceKey;
+    if (!key.startsWith('stop:')) return;
+    final stopId = int.tryParse(key.substring(5));
+    if (stopId != null) _pendingStopStatuses.remove(stopId);
+  }
+
+  ActiveRoute _withPendingStatuses(ActiveRoute route) {
+    if (_pendingStopStatuses.isEmpty) return route;
+    var changed = false;
+    final stops = route.stops.map((stop) {
+      final status = _pendingStopStatuses[stop.stopId];
+      if (status == null || status == stop.status || stop.isTerminal) {
+        return stop;
+      }
+      changed = true;
+      return stop.copyWith(
+        status: status,
+        orderStatus: switch (status) {
+          'completed' => 'delivered',
+          'failed' => 'delivery_failed',
+          _ => null,
+        },
+      );
+    }).toList();
+    return changed ? route.copyWith(stops: stops) : route;
+  }
+
+  void _registerOfflineHandlers() {
+    final queue = apiClient.offlineRequests;
+    queue.registerRestoreHandler(_stopActionType, (key, payload, _) async {
+      final stopId = _asInt(payload['stop_id']);
+      final action = payload['action']?.toString() ?? '';
+      if (stopId == null || action.isEmpty) return;
+      await _postStopAction(stopId, action, key);
+    });
+    queue.registerRestoreHandler(_stopFailType, (key, payload, _) async {
+      final stopId = _asInt(payload['stop_id']);
+      if (stopId == null) return;
+      await _postFailure(
+        stopId: stopId,
+        reason: payload['reason']?.toString() ?? '',
+        notes: payload['notes']?.toString() ?? '',
+        latitude: _asDouble(payload['lat']),
+        longitude: _asDouble(payload['lon']),
+        idempotencyKey: key,
+      );
+    });
+    queue.registerRestoreHandler(routeStartType, (key, payload, _) async {
+      final routeId = _asInt(payload['route_id']);
+      if (routeId == null) return;
+      await postRouteStart(routeId, key);
+    });
+    queue.registerRestoreHandler(_stopCompleteType, (
+      key,
+      payload,
+      files,
+    ) async {
+      final plan = _CompletionPlan.fromJson(payload);
+      if (plan.stopId <= 0) return;
+      if (await _completedResultOrNull(plan.stopId) != null) return;
+      await _runCompletionPlan(plan, files, key);
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> _warehouses() {
+    final cached = _warehouseCache;
+    final cachedAt = _warehouseCacheAt;
+    if (cached != null &&
+        cachedAt != null &&
+        DateTime.now().difference(cachedAt) < _warehouseCacheDuration) {
+      return Future.value(cached);
+    }
+    return _warehouseOperation ??= () async {
+      try {
+        final result = await _getAllOptional('/api/v1/delivery/armazens/');
+        _warehouseCache = result;
+        _warehouseCacheAt = DateTime.now();
+        return result;
+      } on DioException {
+        // Armazém é apenas decoração do mapa: usa a última cópia conhecida.
+        if (cached != null) return cached;
+        rethrow;
+      } finally {
+        _warehouseOperation = null;
+      }
+    }();
   }
 
   Future<String> getMapStyle() => _mapStyleOperation ??= _loadMapStyle();
@@ -485,7 +621,32 @@ class ActiveRouteService {
     );
   }
 
-  Future<ActiveRoute> getRoute(int routeId) async {
+  /// Busca a rota atualizada.
+  ///
+  /// Consultas simultâneas para a mesma rota compartilham a mesma requisição.
+  /// Sem rede, devolve a última cópia conhecida (com as alterações que estão
+  /// na fila offline) para o entregador continuar trabalhando.
+  Future<ActiveRoute> getRoute(int routeId) {
+    final ongoing = _routeOperations[routeId];
+    if (ongoing != null) return ongoing;
+    final operation = () async {
+      try {
+        final route = await _fetchRoute(routeId);
+        _routeSnapshots[routeId] = route;
+        return _withPendingStatuses(route);
+      } on _RouteNetworkFailure catch (failure) {
+        final cached = _routeSnapshots[routeId];
+        if (cached != null) return _withPendingStatuses(cached);
+        throw failure.exception;
+      } finally {
+        _routeOperations.remove(routeId);
+      }
+    }();
+    _routeOperations[routeId] = operation;
+    return operation;
+  }
+
+  Future<ActiveRoute> _fetchRoute(int routeId) async {
     try {
       final refreshToken = DateTime.now().microsecondsSinceEpoch;
       // A rota é consultada primeiro porque seu wave_id limita a carga de
@@ -512,7 +673,7 @@ class ActiveRouteService {
           queryParameters: {'wave': ?waveId, '_map_refresh': refreshToken},
           noCache: true,
         ),
-        _getAllOptional('/api/v1/delivery/armazens/'),
+        _warehouses(),
         _getAll('/api/v1/delivery/comprovantes/'),
         _getAll('/api/v1/delivery/fotos-comprovante/'),
       ]);
@@ -631,10 +792,14 @@ class ActiveRouteService {
         stops: activeStops,
       );
     } on DioException catch (error) {
-      throw ActiveRouteException(
+      final exception = ActiveRouteException(
         _errorMessage(error),
         statusCode: error.response?.statusCode,
       );
+      if (OfflineRequestQueue.isNetworkFailure(error)) {
+        throw _RouteNetworkFailure(exception);
+      }
+      throw exception;
     }
   }
 
@@ -652,16 +817,22 @@ class ActiveRouteService {
       return await apiClient.offlineRequests.execute<void>(
         resourceKey: 'route:$routeId',
         description: 'Iniciar rota',
-        operation: (key) async {
-          await apiClient.dio.post<dynamic>(
-            '/api/v1/delivery/rotas/$routeId/start/',
-            options: apiClient.offlineRequests.requestOptions(key),
-          );
-        },
+        operation: (key) => postRouteStart(routeId, key),
+        persisted: PersistedOfflineRequest(
+          type: routeStartType,
+          payload: {'route_id': routeId},
+        ),
       );
     } on DioException catch (error) {
       throw ActiveRouteException(_errorMessage(error));
     }
+  }
+
+  Future<void> postRouteStart(int routeId, String idempotencyKey) async {
+    await apiClient.dio.post<dynamic>(
+      '/api/v1/delivery/rotas/$routeId/start/',
+      options: apiClient.offlineRequests.requestOptions(idempotencyKey),
+    );
   }
 
   Future<OfflineMutationResult<void>> fail({
@@ -672,25 +843,53 @@ class ActiveRouteService {
     double? longitude,
   }) async {
     try {
-      return await apiClient.offlineRequests.execute<void>(
+      final result = await apiClient.offlineRequests.execute<void>(
         resourceKey: 'stop:$stopId',
         description: 'Registrar falha na entrega',
-        operation: (key) async {
-          await apiClient.dio.post<dynamic>(
-            '/api/v1/delivery/paradas/$stopId/fail/',
-            data: {
-              'reason': reason,
-              'notes': notes,
-              'lat': ?latitude,
-              'lon': ?longitude,
-            },
-            options: apiClient.offlineRequests.requestOptions(key),
-          );
-        },
+        operation: (key) => _postFailure(
+          stopId: stopId,
+          reason: reason,
+          notes: notes,
+          latitude: latitude,
+          longitude: longitude,
+          idempotencyKey: key,
+        ),
+        persisted: PersistedOfflineRequest(
+          type: _stopFailType,
+          payload: {
+            'stop_id': stopId,
+            'reason': reason,
+            'notes': notes,
+            'lat': ?latitude,
+            'lon': ?longitude,
+          },
+        ),
       );
+      if (result.queued) _pendingStopStatuses[stopId] = 'failed';
+      return result;
     } on DioException catch (error) {
       throw ActiveRouteException(_errorMessage(error));
     }
+  }
+
+  Future<void> _postFailure({
+    required int stopId,
+    required String reason,
+    required String notes,
+    required double? latitude,
+    required double? longitude,
+    required String idempotencyKey,
+  }) async {
+    await apiClient.dio.post<dynamic>(
+      '/api/v1/delivery/paradas/$stopId/fail/',
+      data: {
+        'reason': reason,
+        'notes': notes,
+        'lat': ?latitude,
+        'lon': ?longitude,
+      },
+      options: apiClient.offlineRequests.requestOptions(idempotencyKey),
+    );
   }
 
   Future<OfflineMutationResult<DeliveryAuditResult>> complete(
@@ -711,22 +910,46 @@ class ActiveRouteService {
         when !longitude.isFinite || longitude < -180 || longitude > 180) {
       throw const ActiveRouteException('Longitude da entrega inválida.');
     }
+    final plan = _CompletionPlan.fromSubmission(
+      submission,
+      endpoint: _completionEndpoint(
+        submission.stop.confirmationLocation,
+        submission.stop.stopId,
+      ),
+      method: _completionMethod(submission.stop.confirmationLocation),
+    );
+    final files = <String, Uint8List>{
+      if (submission.signatureBytes != null)
+        _CompletionPlan.signatureFile: submission.signatureBytes!,
+      for (final (index, photo) in submission.photos.indexed)
+        _CompletionPlan.photoFile(index): photo.bytes,
+    };
     var firstAttempt = true;
     try {
-      return await apiClient.offlineRequests.execute<DeliveryAuditResult>(
-        resourceKey: 'stop:${submission.stop.stopId}',
-        description: 'Finalizar entrega',
-        operation: (key) async {
-          if (!firstAttempt) {
-            final completed = await _completedResultOrNull(
-              submission.stop.stopId,
-            );
-            if (completed != null) return completed;
-          }
-          firstAttempt = false;
-          return _completeRequest(submission, key);
-        },
-      );
+      final result = await apiClient.offlineRequests
+          .execute<DeliveryAuditResult>(
+            resourceKey: 'stop:${submission.stop.stopId}',
+            description: 'Finalizar entrega',
+            operation: (key) async {
+              if (!firstAttempt) {
+                final completed = await _completedResultOrNull(
+                  submission.stop.stopId,
+                );
+                if (completed != null) return completed;
+              }
+              firstAttempt = false;
+              return _runCompletionPlan(plan, files, key);
+            },
+            persisted: PersistedOfflineRequest(
+              type: _stopCompleteType,
+              payload: plan.toJson(),
+              files: files,
+            ),
+          );
+      if (result.queued) {
+        _pendingStopStatuses[submission.stop.stopId] = 'completed';
+      }
+      return result;
     } on ActiveRouteException {
       rethrow;
     } on DioException catch (error) {
@@ -737,104 +960,78 @@ class ActiveRouteService {
     }
   }
 
-  Future<DeliveryAuditResult> _completeRequest(
-    DeliveryProofSubmission submission,
+  Future<DeliveryAuditResult> _runCompletionPlan(
+    _CompletionPlan plan,
+    Map<String, Uint8List> files,
     String idempotencyKey,
   ) async {
-    try {
-      final locationPolicy = submission.stop.confirmationLocation;
-      final endpoint = _completionEndpoint(
-        locationPolicy,
-        submission.stop.stopId,
+    final signature = files[_CompletionPlan.signatureFile];
+    final proofData = <String, dynamic>{
+      // items e completed_at são resultados geridos pelo complete/.
+      // Nunca devem fazer parte do multipart do comprovante.
+      ...plan.proofFields,
+      if (signature != null)
+        'signature_file': MultipartFile.fromBytes(
+          signature,
+          filename: 'assinatura.png',
+        ),
+    };
+
+    int proofId;
+    if (plan.existingProofId case final int existingId) {
+      final response = await apiClient.dio.patch<dynamic>(
+        '/api/v1/delivery/comprovantes/$existingId/',
+        data: FormData.fromMap(proofData),
+        options: apiClient.offlineRequests.requestOptions(
+          idempotencyKey,
+          step: 'proof',
+        ),
       );
-      final method = _completionMethod(locationPolicy);
-      final proofData = <String, dynamic>{
-        // items e completed_at são resultados geridos pelo complete/.
-        // Nunca devem fazer parte do multipart do comprovante.
-        'route_stop': submission.stop.stopId,
-        'recipient_name': submission.recipientName.trim(),
-        'recipient_document': submission.recipientDocument.trim(),
-        'notes': submission.notes.trim(),
-        if (submission.signatureBytes != null)
-          'signature_file': MultipartFile.fromBytes(
-            submission.signatureBytes!,
-            filename: 'assinatura.png',
-          ),
-      };
-
-      int proofId;
-      if (submission.stop.existingProofId case final int existingId) {
-        final response = await apiClient.dio.patch<dynamic>(
-          '/api/v1/delivery/comprovantes/$existingId/',
-          data: FormData.fromMap(proofData),
-          options: apiClient.offlineRequests.requestOptions(
-            idempotencyKey,
-            step: 'proof',
-          ),
-        );
-        proofId = _asInt(_asMap(response.data)['id']) ?? existingId;
-      } else {
-        final response = await apiClient.dio.post<dynamic>(
-          '/api/v1/delivery/comprovantes/',
-          data: FormData.fromMap(proofData),
-          options: apiClient.offlineRequests.requestOptions(
-            idempotencyKey,
-            step: 'proof',
-          ),
-        );
-        final createdId = _asInt(_asMap(response.data)['id']);
-        if (createdId == null) {
-          throw const ActiveRouteException(
-            'O servidor não retornou o comprovante criado.',
-          );
-        }
-        proofId = createdId;
-      }
-
-      var sequence = submission.stop.existingPhotoCount + 1;
-      for (final (index, photo) in submission.photos.indexed) {
-        await apiClient.dio.post<dynamic>(
-          '/api/v1/delivery/fotos-comprovante/',
-          data: FormData.fromMap({
-            'delivery_proof': proofId,
-            'sequence': sequence++,
-            'file': MultipartFile.fromBytes(
-              photo.bytes,
-              filename: photo.filename,
-            ),
-          }),
-          options: apiClient.offlineRequests.requestOptions(
-            idempotencyKey,
-            step: 'photo-$index',
-          ),
+      proofId = _asInt(_asMap(response.data)['id']) ?? existingId;
+    } else {
+      final response = await apiClient.dio.post<dynamic>(
+        '/api/v1/delivery/comprovantes/',
+        data: FormData.fromMap(proofData),
+        options: apiClient.offlineRequests.requestOptions(
+          idempotencyKey,
+          step: 'proof',
+        ),
+      );
+      final createdId = _asInt(_asMap(response.data)['id']);
+      if (createdId == null) {
+        throw const ActiveRouteException(
+          'O servidor não retornou o comprovante criado.',
         );
       }
-
-      final completionData = <String, dynamic>{
-        if (submission.itemResults.isNotEmpty)
-          'item_results': submission.itemResults
-              .map((result) => result.toJson())
-              .toList(),
-        if (locationPolicy.canRequestLocation &&
-            submission.latitude != null &&
-            submission.longitude != null) ...{
-          locationPolicy.latitudeField: submission.latitude,
-          locationPolicy.longitudeField: submission.longitude,
-        },
-      };
-      final response = await apiClient.dio.request<dynamic>(
-        endpoint,
-        data: completionData.isEmpty ? null : completionData,
-        options: apiClient.offlineRequests
-            .requestOptions(idempotencyKey, step: 'complete')
-            .copyWith(method: method),
-      );
-      return DeliveryAuditResult.fromResponse(response.data);
-    } on ActiveRouteException {
-      rethrow;
-    } on DioException {
-      rethrow;
+      proofId = createdId;
     }
+
+    var sequence = plan.photoSequenceStart;
+    for (final (index, filename) in plan.photoFilenames.indexed) {
+      final bytes = files[_CompletionPlan.photoFile(index)];
+      if (bytes == null) continue;
+      await apiClient.dio.post<dynamic>(
+        '/api/v1/delivery/fotos-comprovante/',
+        data: FormData.fromMap({
+          'delivery_proof': proofId,
+          'sequence': sequence++,
+          'file': MultipartFile.fromBytes(bytes, filename: filename),
+        }),
+        options: apiClient.offlineRequests.requestOptions(
+          idempotencyKey,
+          step: 'photo-$index',
+        ),
+      );
+    }
+
+    final response = await apiClient.dio.request<dynamic>(
+      plan.endpoint,
+      data: plan.completionData.isEmpty ? null : plan.completionData,
+      options: apiClient.offlineRequests
+          .requestOptions(idempotencyKey, step: 'complete')
+          .copyWith(method: plan.method),
+    );
+    return DeliveryAuditResult.fromResponse(response.data);
   }
 
   Future<DeliveryAuditResult?> _completedResultOrNull(int stopId) async {
@@ -889,17 +1086,30 @@ class ActiveRouteService {
       return await apiClient.offlineRequests.execute<void>(
         resourceKey: 'stop:$stopId',
         description: 'Atualizar etapa da entrega',
-        operation: (key) async {
-          await apiClient.dio.post<dynamic>(
-            '/api/v1/delivery/paradas/$stopId/$action/',
-            data: data,
-            options: apiClient.offlineRequests.requestOptions(key),
-          );
-        },
+        operation: (key) => _postStopAction(stopId, action, key, data: data),
+        persisted: data == null
+            ? PersistedOfflineRequest(
+                type: _stopActionType,
+                payload: {'stop_id': stopId, 'action': action},
+              )
+            : null,
       );
     } on DioException catch (error) {
       throw ActiveRouteException(_errorMessage(error));
     }
+  }
+
+  Future<void> _postStopAction(
+    int stopId,
+    String action,
+    String idempotencyKey, {
+    Map<String, dynamic>? data,
+  }) async {
+    await apiClient.dio.post<dynamic>(
+      '/api/v1/delivery/paradas/$stopId/$action/',
+      data: data,
+      options: apiClient.offlineRequests.requestOptions(idempotencyKey),
+    );
   }
 
   Future<Map<String, dynamic>> _deliveryConfiguration({
@@ -1121,3 +1331,103 @@ bool? _asNullableBool(dynamic value) => switch (value) {
   num number => number != 0,
   _ => null,
 };
+
+class _RouteNetworkFailure implements Exception {
+  const _RouteNetworkFailure(this.exception);
+
+  final ActiveRouteException exception;
+}
+
+/// Finalização de entrega já resolvida em dados simples, para poder ser
+/// salva em disco e reenviada depois que o app for reaberto.
+class _CompletionPlan {
+  const _CompletionPlan({
+    required this.stopId,
+    required this.endpoint,
+    required this.method,
+    required this.existingProofId,
+    required this.photoSequenceStart,
+    required this.proofFields,
+    required this.photoFilenames,
+    required this.completionData,
+  });
+
+  static const signatureFile = 'signature';
+  static String photoFile(int index) => 'photo_$index';
+
+  factory _CompletionPlan.fromSubmission(
+    DeliveryProofSubmission submission, {
+    required String endpoint,
+    required String method,
+  }) {
+    final locationPolicy = submission.stop.confirmationLocation;
+    return _CompletionPlan(
+      stopId: submission.stop.stopId,
+      endpoint: endpoint,
+      method: method,
+      existingProofId: submission.stop.existingProofId,
+      photoSequenceStart: submission.stop.existingPhotoCount + 1,
+      proofFields: {
+        'route_stop': submission.stop.stopId,
+        'recipient_name': submission.recipientName.trim(),
+        'recipient_document': submission.recipientDocument.trim(),
+        'notes': submission.notes.trim(),
+      },
+      photoFilenames: [for (final photo in submission.photos) photo.filename],
+      completionData: {
+        if (submission.itemResults.isNotEmpty)
+          'item_results': submission.itemResults
+              .map((result) => result.toJson())
+              .toList(),
+        if (locationPolicy.canRequestLocation &&
+            submission.latitude != null &&
+            submission.longitude != null) ...{
+          locationPolicy.latitudeField: submission.latitude,
+          locationPolicy.longitudeField: submission.longitude,
+        },
+      },
+    );
+  }
+
+  factory _CompletionPlan.fromJson(Map<String, dynamic> json) {
+    final proofFields = json['proof_fields'];
+    final completionData = json['completion_data'];
+    final photos = json['photo_filenames'];
+    return _CompletionPlan(
+      stopId: _asInt(json['stop_id']) ?? 0,
+      endpoint: json['endpoint']?.toString() ?? '',
+      method: json['method']?.toString() ?? 'POST',
+      existingProofId: _asInt(json['existing_proof_id']),
+      photoSequenceStart: _asInt(json['photo_sequence_start']) ?? 1,
+      proofFields: proofFields is Map
+          ? Map<String, dynamic>.from(proofFields)
+          : const {},
+      photoFilenames: photos is List
+          ? photos.map((item) => item.toString()).toList()
+          : const [],
+      completionData: completionData is Map
+          ? Map<String, dynamic>.from(completionData)
+          : const {},
+    );
+  }
+
+  final int stopId;
+  final String endpoint;
+  final String method;
+  final int? existingProofId;
+  final int photoSequenceStart;
+  final Map<String, dynamic> proofFields;
+  final List<String> photoFilenames;
+  final Map<String, dynamic> completionData;
+
+  Map<String, dynamic> toJson() => {
+    'stop_id': stopId,
+    'endpoint': endpoint,
+    'method': method,
+    'existing_proof_id': existingProofId,
+    'photo_sequence_start': photoSequenceStart,
+    'proof_fields': proofFields,
+    'photo_filenames': photoFilenames,
+    'completion_data': completionData,
+  };
+}

@@ -15,6 +15,7 @@ class SessionStorage {
   static const _routeChangeNotificationsKey = 'notification_route_changes';
   static const _orderUpdateNotificationsKey = 'notification_order_updates';
   static const _pendingDeliveryCaptureKey = 'pending_delivery_capture';
+  static const _openActiveRouteKey = 'open_active_route';
   static String? _cachedAccessToken;
   static String? _cachedRefreshToken;
   static bool _accessTokenLoaded = false;
@@ -22,6 +23,7 @@ class SessionStorage {
   static Future<String?>? _accessTokenRead;
   static Future<String?>? _refreshTokenRead;
   static int _tokenCacheGeneration = 0;
+  static int _identityGeneration = 0;
   final FlutterSecureStorage _storage;
 
   /// Muda sempre que a identidade da sessao em memoria e alterada.
@@ -29,6 +31,12 @@ class SessionStorage {
   /// Operacoes de rede longas usam este valor para impedir que uma resposta
   /// iniciada antes do logout restaure tokens de uma sessao encerrada.
   int get sessionGeneration => _tokenCacheGeneration;
+
+  /// Muda apenas quando a sessao e encerrada (logout ou refresh recusado).
+  ///
+  /// Diferente de [sessionGeneration], nao muda na renovacao do token: uma
+  /// entrega salva offline continua valida depois que o access token expira.
+  int get identityGeneration => _identityGeneration;
 
   Future<void> saveToken(String token) async {
     _tokenCacheGeneration++;
@@ -132,6 +140,17 @@ class SessionStorage {
   Future<void> clearPendingDeliveryCapture() =>
       _storage.delete(key: _pendingDeliveryCaptureKey);
 
+  /// Rota cujo mapa estava aberto. Usada para reabrir o mapa da carga quando
+  /// o sistema encerra o app (por exemplo, por falta de memoria na camera).
+  Future<void> saveOpenActiveRoute(int routeId) =>
+      _storage.write(key: _openActiveRouteKey, value: routeId.toString());
+
+  Future<int?> readOpenActiveRoute() async =>
+      int.tryParse(await _storage.read(key: _openActiveRouteKey) ?? '');
+
+  Future<void> clearOpenActiveRoute() =>
+      _storage.delete(key: _openActiveRouteKey);
+
   Future<NotificationPreferences> readNotificationPreferences() async {
     final values = await Future.wait([
       _storage.read(key: _newWaveNotificationsKey),
@@ -173,6 +192,7 @@ class SessionStorage {
 
   Future<void> clear() async {
     _tokenCacheGeneration++;
+    _identityGeneration++;
     _cachedAccessToken = null;
     _cachedRefreshToken = null;
     _accessTokenLoaded = true;

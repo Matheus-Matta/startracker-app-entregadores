@@ -55,6 +55,11 @@ class _ActiveWavePageState extends State<ActiveWavePage>
   int? _pendingPostponedStopId;
   int _locationGeneration = 0;
 
+  /// O mapa (MapLibre) fica fora da árvore enquanto a finalização/câmera
+  /// está aberta. Mantê-lo vivo por baixo da câmera consumia memória de GPU
+  /// suficiente para o Android encerrar o app em aparelhos de entrada.
+  bool _mapSuspended = false;
+
   @override
   void initState() {
     super.initState();
@@ -62,6 +67,15 @@ class _ActiveWavePageState extends State<ActiveWavePage>
     final dependencies = AppDependencies.instance;
     _service = dependencies.activeRoutes;
     _waveService = dependencies.waves;
+    // Abre imediatamente com a última cópia conhecida da rota; a versão
+    // atualizada substitui assim que chegar.
+    final cached = _service.cachedRoute(widget.routeId);
+    if (cached != null) {
+      _route = cached;
+      _loading = false;
+    }
+    // Se o sistema encerrar o app, ele reabre direto no mapa desta carga.
+    unawaited(dependencies.storage.saveOpenActiveRoute(widget.routeId));
     _loadRoute();
     _loadMapStyle();
     _startLocation();
@@ -75,6 +89,8 @@ class _ActiveWavePageState extends State<ActiveWavePage>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    // Saída normal da tela: não reabrir o mapa na próxima inicialização.
+    unawaited(AppDependencies.instance.storage.clearOpenActiveRoute());
     _locationGeneration++;
     _realtimeDebouncer.dispose();
     _realtimeSubscription?.cancel();
@@ -330,23 +346,50 @@ class _ActiveWavePageState extends State<ActiveWavePage>
       if (mounted) setState(() => _performingAction = false);
     }
     if (!mounted) return;
-    final completed = await Navigator.of(context).push<bool>(
-      MaterialPageRoute<bool>(
-        builder: (_) => DeliveryCompletionPage(
-          routeId: widget.routeId,
-          stop: effectiveStop,
-          service: _service,
+    setState(() => _mapSuspended = true);
+    bool? completed;
+    try {
+      completed = await Navigator.of(context).push<bool>(
+        MaterialPageRoute<bool>(
+          builder: (_) => DeliveryCompletionPage(
+            routeId: widget.routeId,
+            stop: effectiveStop,
+            service: _service,
+          ),
         ),
-      ),
-    );
+      );
+    } finally {
+      if (mounted) setState(() => _mapSuspended = false);
+    }
     if (!mounted) return;
     if (completed != true) {
       await _loadRoute();
       return;
     }
-    setState(() => _route = _withStopStatus(stop.stopId, 'completed'));
-    _message('Entrega finalizada com sucesso.');
+    setState(
+      () => _route = _withStopStatus(
+        stop.stopId,
+        'completed',
+        orderStatus: 'delivered',
+      ),
+    );
     await _loadRoute();
+    if (!mounted) return;
+    // Ainda há pedidos na carga: continua no mapa, já na próxima entrega.
+    // Era o último: volta para a tela de cargas.
+    // A parada recém-finalizada é ignorada caso uma leitura antiga da API
+    // ainda a mostre como pendente.
+    final hasRemainingStops =
+        _route?.stops.any(
+          (item) => !item.isTerminal && item.stopId != stop.stopId,
+        ) ??
+        true;
+    if (hasRemainingStops) {
+      _message('Entrega finalizada. Próxima entrega carregada.');
+      return;
+    }
+    _message('Entrega finalizada. Todos os pedidos da carga foram concluídos.');
+    Navigator.of(context).pop(false);
   }
 
   Future<void> _registerFailure(ActiveRouteStop stop) async {
@@ -486,13 +529,16 @@ class _ActiveWavePageState extends State<ActiveWavePage>
       body: Stack(
         fit: StackFit.expand,
         children: [
-          _ActiveRouteMap(
-            key: _mapKey,
-            route: route,
-            stop: stop,
-            position: _position,
-            style: _mapStyle,
-          ),
+          if (_mapSuspended)
+            const ColoredBox(color: _cream)
+          else
+            _ActiveRouteMap(
+              key: _mapKey,
+              route: route,
+              stop: stop,
+              position: _position,
+              style: _mapStyle,
+            ),
           SafeArea(
             bottom: false,
             child: Padding(

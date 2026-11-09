@@ -396,7 +396,7 @@ class _HomePageState extends State<_HomePage> {
     final operations = <Future<dynamic>>[];
     setState(() {
       if (activeWave) {
-        final operation = _activeWaveService.getActiveWave();
+        final operation = _activeWaveService.getActiveWave(refresh: true);
         _activeWaveCache = operation;
         operations.add(operation);
       }
