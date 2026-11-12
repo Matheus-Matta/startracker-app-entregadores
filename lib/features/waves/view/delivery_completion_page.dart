@@ -106,7 +106,9 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
       if (!mounted || photo == null) return;
       setState(() => _photos.add(_CapturedPhoto(photo.filename, photo.bytes)));
     } catch (_) {
-      if (mounted) _message('Não foi possível registrar a foto. Tente novamente.');
+      if (mounted) {
+        _message('Não foi possível registrar a foto. Tente novamente.');
+      }
     } finally {
       if (mounted) setState(() => _openingCamera = false);
     }
@@ -970,8 +972,8 @@ class _PhotoSection extends StatelessWidget {
                       fit: BoxFit.cover,
                       gaplessPlayback: true,
                       // Miniatura: decodifica pequena em vez da foto inteira.
-                      cacheWidth:
-                          (92 * MediaQuery.devicePixelRatioOf(context)).round(),
+                      cacheWidth: (92 * MediaQuery.devicePixelRatioOf(context))
+                          .round(),
                     ),
                   ),
                   Positioned(
@@ -1222,9 +1224,16 @@ class _SignaturePadState extends State<_SignaturePad> {
     if (!hasSignature) return null;
     final boundary = _boundaryKey.currentContext?.findRenderObject();
     if (boundary is! RenderRepaintBoundary) return null;
-    final image = await boundary.toImage(pixelRatio: 2.5);
-    final data = await image.toByteData(format: ui.ImageByteFormat.png);
-    return data?.buffer.asUint8List();
+    // 1.5x mantém o traço legível e gera ~1/3 dos pixels de 2.5x: menos
+    // memória ao exportar e um PNG menor para enviar no 4G.
+    final image = await boundary.toImage(pixelRatio: 1.5);
+    try {
+      final data = await image.toByteData(format: ui.ImageByteFormat.png);
+      return data?.buffer.asUint8List();
+    } finally {
+      // Libera a imagem nativa na hora, sem esperar o coletor de lixo.
+      image.dispose();
+    }
   }
 
   @override

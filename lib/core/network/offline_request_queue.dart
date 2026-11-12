@@ -135,18 +135,39 @@ class OfflineRequestQueue {
   Stream<OfflineQueueEvent> get events => _events.stream;
   int get pendingCount => _pending.length;
 
+  /// Falha transitória de transporte: a requisição deve ser guardada e
+  /// reenviada, nunca descartada.
+  ///
+  /// Em dados móveis a conexão costuma cair no meio do upload
+  /// (`HttpException: Connection closed...`), o TLS é interrompido
+  /// (`HandshakeException`) ou o Cloudflare responde com erro de gateway ou
+  /// desafio anti-bot para IPs compartilhados de operadora. Antes esses casos
+  /// eram tratados como erro definitivo e a entrega era perdida.
   static bool isNetworkFailure(DioException error) {
-    if (error.response != null || error.type == DioExceptionType.cancel) {
-      return false;
-    }
+    if (error.type == DioExceptionType.cancel) return false;
+    final response = error.response;
+    if (response != null) return isTransientResponse(response);
     if (error.type == DioExceptionType.connectionError ||
         error.type == DioExceptionType.connectionTimeout ||
         error.type == DioExceptionType.sendTimeout ||
         error.type == DioExceptionType.receiveTimeout) {
       return true;
     }
-    return error.type == DioExceptionType.unknown &&
-        (error.error is SocketException || error.error is TimeoutException);
+    final cause = error.error;
+    // IOException cobre SocketException, HttpException e TlsException.
+    return cause is IOException || cause is TimeoutException;
+  }
+
+  /// Respostas que não vieram da API, e sim de proxy/CDN no caminho.
+  static bool isTransientResponse(Response<dynamic> response) {
+    final status = response.statusCode ?? 0;
+    if (response.headers.value('cf-mitigated') != null) return true;
+    return status == 408 ||
+        status == 429 ||
+        status == 502 ||
+        status == 503 ||
+        status == 504 ||
+        (status >= 520 && status <= 530);
   }
 
   /// Registra como reconstruir requisições do tipo [type] salvas em disco.
@@ -251,12 +272,20 @@ class OfflineRequestQueue {
     }
   }
 
-  Options requestOptions(String idempotencyKey, {String? step}) => Options(
+  Options requestOptions(
+    String idempotencyKey, {
+    String? step,
+    bool upload = false,
+  }) => Options(
     headers: {
       'Idempotency-Key': step == null
           ? idempotencyKey
           : '$idempotencyKey-$step',
     },
+    // Fotos e assinatura em dados móveis: o upload inteiro precisa caber no
+    // sendTimeout e o servidor ainda grava o arquivo antes de responder.
+    sendTimeout: upload ? const Duration(minutes: 3) : null,
+    receiveTimeout: upload ? const Duration(seconds: 90) : null,
   );
 
   /// Tenta enviar a fila agora.

@@ -14,18 +14,21 @@ class ApiClient {
            Dio(
              BaseOptions(
                baseUrl: baseUrl.replaceFirst(RegExp(r'/$'), ''),
-               connectTimeout: const Duration(seconds: 15),
-               sendTimeout: const Duration(seconds: 15),
-               receiveTimeout: const Duration(seconds: 15),
+               connectTimeout: const Duration(seconds: 30),
+               sendTimeout: const Duration(seconds: 30),
+               receiveTimeout: const Duration(seconds: 30),
                headers: const {'Accept': 'application/json'},
              ),
            ),
        dio = Dio(
          BaseOptions(
            baseUrl: baseUrl.replaceFirst(RegExp(r'/$'), ''),
-           connectTimeout: const Duration(seconds: 15),
-           sendTimeout: const Duration(seconds: 30),
-           receiveTimeout: const Duration(seconds: 15),
+           // Em 3G/4G fraco o handshake TLS e o envio do corpo demoram bem
+           // mais que no Wi-Fi; os limites antigos (15 s/30 s) cortavam o
+           // envio da entrega no meio e ela nunca chegava ao backend.
+           connectTimeout: const Duration(seconds: 30),
+           sendTimeout: const Duration(seconds: 60),
+           receiveTimeout: const Duration(seconds: 45),
            headers: const {'Accept': 'application/json'},
          ),
        ) {

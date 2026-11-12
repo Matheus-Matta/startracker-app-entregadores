@@ -8,12 +8,19 @@ extension ApiCollection on ApiClient {
     Map<String, dynamic>? queryParameters,
     Options? options,
     int maximumPages = 100,
+    // O backend devolve 50 por padrão e aceita até 100: páginas maiores
+    // cortam pela metade as idas e voltas, que no 4G custam mais que os bytes.
+    int pageSize = 100,
   }) async {
     final items = <Map<String, dynamic>>[];
     for (var page = 1; page <= maximumPages; page++) {
       final response = await dio.get<dynamic>(
         path,
-        queryParameters: {...?queryParameters, 'page': page},
+        queryParameters: {
+          ...?queryParameters,
+          'page': page,
+          'page_size': pageSize,
+        },
         options: options,
       );
       items.addAll(collectionItems(response.data));

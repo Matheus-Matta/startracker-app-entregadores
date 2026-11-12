@@ -9,6 +9,76 @@ import 'package:star_tracker/core/network/offline_request_store.dart';
 import 'package:star_tracker/core/storage/session_storage.dart';
 
 void main() {
+  group('isNetworkFailure', () {
+    final request = RequestOptions(path: '/api/v1/');
+    DioException withResponse(
+      int status, {
+      Map<String, List<String>>? headers,
+    }) => DioException.badResponse(
+      statusCode: status,
+      requestOptions: request,
+      response: Response<dynamic>(
+        requestOptions: request,
+        statusCode: status,
+        headers: Headers.fromMap(headers ?? {}),
+      ),
+    );
+
+    test('conexao cortada no meio do upload e falha de rede', () {
+      expect(
+        OfflineRequestQueue.isNetworkFailure(
+          DioException(
+            requestOptions: request,
+            error: const HttpException(
+              'Connection closed while receiving data',
+            ),
+          ),
+        ),
+        isTrue,
+      );
+      expect(
+        OfflineRequestQueue.isNetworkFailure(
+          DioException(
+            requestOptions: request,
+            error: const HandshakeException('Connection terminated'),
+          ),
+        ),
+        isTrue,
+      );
+    });
+
+    test('erros de gateway e desafio do Cloudflare sao transitorios', () {
+      for (final status in [408, 429, 502, 503, 504, 522, 524]) {
+        expect(
+          OfflineRequestQueue.isNetworkFailure(withResponse(status)),
+          isTrue,
+          reason: '$status',
+        );
+      }
+      expect(
+        OfflineRequestQueue.isNetworkFailure(
+          withResponse(
+            403,
+            headers: {
+              'cf-mitigated': ['challenge'],
+            },
+          ),
+        ),
+        isTrue,
+      );
+    });
+
+    test('respostas da API continuam sendo erro definitivo', () {
+      for (final status in [400, 401, 403, 404, 409, 500]) {
+        expect(
+          OfflineRequestQueue.isNetworkFailure(withResponse(status)),
+          isFalse,
+          reason: '$status',
+        );
+      }
+    });
+  });
+
   late Dio dio;
   late OfflineRequestQueue queue;
 
@@ -103,7 +173,9 @@ void main() {
       persisted: PersistedOfflineRequest(
         type: 'test.complete',
         payload: const {'stop_id': 7},
-        files: {'photo_0': Uint8List.fromList([1, 2, 3])},
+        files: {
+          'photo_0': Uint8List.fromList([1, 2, 3]),
+        },
       ),
     );
     first.dispose();
@@ -116,7 +188,11 @@ void main() {
     );
     addTearDown(restored.dispose);
     final received = Completer<(String, Map<String, dynamic>, List<int>)>();
-    restored.registerRestoreHandler('test.complete', (key, payload, files) async {
+    restored.registerRestoreHandler('test.complete', (
+      key,
+      payload,
+      files,
+    ) async {
       received.complete((key, payload, files['photo_0']!.toList()));
     });
     await restored.restorePersisted();

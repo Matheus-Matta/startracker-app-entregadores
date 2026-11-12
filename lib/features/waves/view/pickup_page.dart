@@ -26,19 +26,26 @@ class PickupPage extends StatefulWidget {
   State<PickupPage> createState() => _PickupPageState();
 }
 
-class _PickupPageState extends State<PickupPage> {
+class _PickupPageState extends State<PickupPage> with WidgetsBindingObserver {
   static const _stabilizationDuration = Duration(seconds: 1);
   static const _postScanDelay = Duration(seconds: 1);
   static const _maximumDetectionGap = Duration(milliseconds: 450);
 
   final _manualCodeController = TextEditingController();
+  // autoStart desligado: a câmera é ligada/desligada apenas pela fila
+  // serializada abaixo. start()/stop() concorrentes (widget + leitura +
+  // atualização em tempo real) derrubavam o CameraX em vários aparelhos.
+  // autoZoom desligado: instável em aparelhos de entrada.
   final _scannerController = MobileScannerController(
+    autoStart: false,
     cameraResolution: const Size(1280, 720),
     detectionSpeed: DetectionSpeed.normal,
     detectionTimeoutMs: 200,
     formats: const [BarcodeFormat.qrCode, BarcodeFormat.code128],
-    autoZoom: true,
   );
+  Future<void> _cameraOperation = Future<void>.value();
+  bool _disposed = false;
+  bool _inBackground = false;
   late PickupProgress _progress;
   PickupLabelScope _labelGranularity = PickupLabelScope.fallback;
   bool _registering = false;
@@ -68,11 +75,60 @@ class _PickupPageState extends State<PickupPage> {
     _realtimeSubscription = FleetRealtimeChannel.instance.events.listen(
       _onRealtimeEvent,
     );
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(_startCamera());
     unawaited(_refreshProgress(showError: true));
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    switch (state) {
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        _inBackground = true;
+        unawaited(_stopCamera());
+      case AppLifecycleState.resumed:
+        _inBackground = false;
+        if (!_registering && !_markingNotGoing) unawaited(_startCamera());
+      case AppLifecycleState.inactive:
+        break;
+    }
+  }
+
+  /// Executa start/stop da câmera um de cada vez, na ordem pedida.
+  Future<void> _queueCamera(Future<void> Function() action) {
+    final next = _cameraOperation.then((_) async {
+      if (_disposed) return;
+      try {
+        await action();
+      } catch (_) {
+        // Falhas de câmera não podem derrubar a tela; as ações manuais
+        // continuam disponíveis.
+      }
+    });
+    _cameraOperation = next;
+    return next;
+  }
+
+  Future<void> _startCamera() => _queueCamera(() async {
+    if (!mounted || _inBackground || _progress.isComplete) return;
+    if (_scannerController.value.isRunning) return;
+    await _scannerController.start();
+  });
+
+  Future<void> _stopCamera() => _queueCamera(() async {
+    if (!_scannerController.value.isRunning &&
+        !_scannerController.value.isStarting) {
+      return;
+    }
+    await _scannerController.stop();
+  });
+
+  @override
   void dispose() {
+    _disposed = true;
+    WidgetsBinding.instance.removeObserver(this);
     unawaited(
       SystemChrome.setPreferredOrientations(const [
         DeviceOrientation.portraitUp,
@@ -159,11 +215,7 @@ class _PickupPageState extends State<PickupPage> {
       _scanFeedback = null;
     });
     try {
-      try {
-        await _scannerController.stop();
-      } catch (_) {
-        // A leitura manual pode ocorrer antes de a câmera terminar de iniciar.
-      }
+      await _stopCamera();
       final updated = await widget.service.registerPickup(
         waveId: _progress.waveId,
         code: code,
@@ -279,11 +331,7 @@ class _PickupPageState extends State<PickupPage> {
         _labelGranularity = updated.labelGranularity ?? _labelGranularity;
       });
       if (updated.isComplete) {
-        try {
-          await _scannerController.stop();
-        } catch (_) {
-          // A tela pode terminar a retirada antes de a camera iniciar.
-        }
+        await _stopCamera();
       } else if (wasComplete) {
         await _resumeScanner();
       }
@@ -399,13 +447,7 @@ class _PickupPageState extends State<PickupPage> {
     if (mounted) setState(() => _landscape = landscape);
   }
 
-  Future<void> _pauseScanner() async {
-    try {
-      await _scannerController.stop();
-    } catch (_) {
-      // A camera pode ainda nem ter terminado de iniciar; seguir e seguro.
-    }
-  }
+  Future<void> _pauseScanner() => _stopCamera();
 
   Future<void> _resumeScanner() async {
     if (_progress.isComplete) return;
@@ -415,11 +457,7 @@ class _PickupPageState extends State<PickupPage> {
       if (!remaining.isNegative) await Future<void>.delayed(remaining);
     }
     if (!mounted || _progress.isComplete) return;
-    try {
-      await _scannerController.start();
-    } catch (_) {
-      // As acoes manuais continuam disponiveis se a camera nao reiniciar.
-    }
+    await _startCamera();
   }
 
   Future<void> _openOrders() async {
@@ -498,11 +536,7 @@ class _PickupPageState extends State<PickupPage> {
   }
 
   Future<void> _openManualCode() async {
-    try {
-      await _scannerController.stop();
-    } catch (_) {
-      // A entrada manual funciona mesmo antes da câmera terminar de iniciar.
-    }
+    await _stopCamera();
     if (!mounted) return;
     final code = await Navigator.of(context).push<String>(
       MaterialPageRoute<String>(

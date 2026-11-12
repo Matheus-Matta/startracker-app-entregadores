@@ -26,6 +26,7 @@ void main() {
 
     expect(items.map((item) => item['id']), [1, 2]);
     expect(adapter.requests, 2);
+    expect(adapter.pageSizes, everyElement('100'));
   });
 
   test(
@@ -53,6 +54,7 @@ class _MemorySessionStorage extends SessionStorage {
 
 class _CountingAdapter implements HttpClientAdapter {
   int requests = 0;
+  final pageSizes = <String>[];
 
   @override
   Future<ResponseBody> fetch(
@@ -61,6 +63,7 @@ class _CountingAdapter implements HttpClientAdapter {
     Future<void>? cancelFuture,
   ) async {
     requests++;
+    pageSizes.add(options.queryParameters['page_size'].toString());
     final page = int.tryParse(options.queryParameters['page'].toString()) ?? 1;
     final id = page == 1 ? 1 : 2;
     return ResponseBody.fromString(

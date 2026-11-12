@@ -111,7 +111,12 @@ jobs:
       - name: Gerar APK release instalavel
         shell: bash
         run: |
+          # Somente ARM (todos os celulares reais). x86/x86_64 sao de
+          # emulador e somavam ~38 MB ao APK baixado pelo 4G.
+          # Nao usar --split-per-abi: ele altera o versionCode e quebraria as
+          # atualizacoes pela Play Store de quem instalou o APK avulso.
           flutter build apk --release \
+            --target-platform android-arm,android-arm64 \
             --build-name="${{ needs.prepare.outputs.version }}" \
             --build-number="${{ needs.prepare.outputs.build }}" \
             --dart-define-from-file=.env.production
@@ -132,6 +137,10 @@ jobs:
           if [[ "${{ steps.android_signing.outcome }}" == "success" ]]; then
             cp build/app/outputs/flutter-apk/app-release.apk "dist/android/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}.apk"
             cp build/app/outputs/bundle/release/app-release.aab "dist/android/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}.aab"
+            # Nome fixo usado pelo aviso de atualizacao do app. So o APK com a
+            # assinatura oficial: o standalone (chave de desenvolvimento) nao
+            # instala por cima do app ja instalado.
+            cp build/app/outputs/flutter-apk/app-release.apk "dist/android/StarTracker-Entregas.apk"
           else
             cp build/app/outputs/flutter-apk/app-release.apk "dist/android/StarTracker-Entregas-${{ needs.prepare.outputs.safe_tag }}-standalone.apk"
           fi

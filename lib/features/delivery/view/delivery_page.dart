@@ -7,6 +7,7 @@ import '../../../core/async/debouncer.dart';
 import '../../../core/network/paged_result.dart';
 import '../../../core/notifications/app_notification_manager.dart';
 import '../../../core/realtime/fleet_realtime_channel.dart';
+import '../../../core/update/app_update_prompt.dart';
 import '../../notifications/view/notifications_page.dart';
 import '../../orders/data/order_service.dart';
 import '../../orders/view/orders_page.dart';
@@ -38,24 +39,57 @@ class _DeliveryPageState extends State<DeliveryPage>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     unawaited(_startRealtime());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _checkForUpdate());
+  }
+
+  void _checkForUpdate() {
+    if (mounted) unawaited(AppUpdatePrompt.instance.maybeShow(context));
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _stopRealtimeTimer?.cancel();
     unawaited(_stopRealtime());
     super.dispose();
   }
+
+  /// Saídas rápidas do app (permissão, ligação curta, conferir o WhatsApp)
+  /// não derrubam o tempo real: reconectar no 4G custa handshake TLS e uma
+  /// recarga completa das telas abertas.
+  static const _backgroundGrace = Duration(seconds: 60);
+  Timer? _stopRealtimeTimer;
+  bool _realtimeStopped = false;
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     switch (state) {
       case AppLifecycleState.resumed:
+        _checkForUpdate();
+        final stopPending = _stopRealtimeTimer != null;
+        _stopRealtimeTimer?.cancel();
+        _stopRealtimeTimer = null;
+        if (stopPending && !_realtimeStopped) {
+          // Voltou dentro da tolerância: só reenvia o que estiver na fila.
+          unawaited(
+            AppDependencies.instance.apiClient.offlineRequests.retryNow(),
+          );
+          break;
+        }
+        _realtimeStopped = false;
         unawaited(_startRealtime());
         break;
       case AppLifecycleState.hidden:
       case AppLifecycleState.paused:
+        _stopRealtimeTimer ??= Timer(_backgroundGrace, () {
+          _stopRealtimeTimer = null;
+          _realtimeStopped = true;
+          unawaited(_stopRealtime());
+        });
       case AppLifecycleState.detached:
+        _stopRealtimeTimer?.cancel();
+        _stopRealtimeTimer = null;
+        _realtimeStopped = true;
         unawaited(_stopRealtime());
       case AppLifecycleState.inactive:
         // Estados transitorios, como abrir a central de notificacoes, nao

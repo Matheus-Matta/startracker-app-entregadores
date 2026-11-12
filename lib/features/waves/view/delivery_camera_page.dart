@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_image_compress/flutter_image_compress.dart';
 
 import '../../../core/presentation/app_messages.dart';
 
@@ -264,7 +265,7 @@ class _DeliveryCameraPageState extends State<DeliveryCameraPage>
     setState(() => _capturing = true);
     try {
       final file = await controller.takePicture();
-      final bytes = await file.readAsBytes();
+      final bytes = await _compress(await file.readAsBytes());
       unawaited(_deleteTemp(file.path));
       if (!mounted) return;
       try {
@@ -294,6 +295,27 @@ class _DeliveryCameraPageState extends State<DeliveryCameraPage>
         _releaseAfterCapture = false;
         if (_inBackground) _releaseCamera();
       }
+    }
+  }
+
+  /// Recomprime a foto (JPEG 75, lado menor até 1280 px) antes de guardar.
+  /// A câmera entrega JPEG com qualidade alta; para comprovante, 75 é
+  /// indistinguível e reduz bastante o upload no 4G e o espaço da fila
+  /// offline. Em qualquer falha, segue com a foto original.
+  static Future<Uint8List> _compress(Uint8List original) async {
+    try {
+      final compressed = await FlutterImageCompress.compressWithList(
+        original,
+        minWidth: 1280,
+        minHeight: 1280,
+        quality: 75,
+      );
+      if (compressed.isEmpty || compressed.length >= original.length) {
+        return original;
+      }
+      return compressed;
+    } catch (_) {
+      return original;
     }
   }
 
@@ -579,10 +601,7 @@ class _ShutterButton extends StatelessWidget {
           child: busy
               ? const Padding(
                   padding: EdgeInsets.all(20),
-                  child: CircularProgressIndicator(
-                    strokeWidth: 3,
-                    color: _ink,
-                  ),
+                  child: CircularProgressIndicator(strokeWidth: 3, color: _ink),
                 )
               : null,
         ),

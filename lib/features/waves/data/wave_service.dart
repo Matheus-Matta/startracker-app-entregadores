@@ -435,36 +435,59 @@ class WaveService {
     final noCache = Options(
       headers: const {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'},
     );
-    final pickup = await getPickupProgress(wave.waveId);
-    final waveData = await _getOptionalMap(
+    // As consultas são independentes: em paralelo, o detalhe abre no tempo
+    // da mais lenta, não na soma das seis (cada ida e volta no 4G pesa).
+    final pickupFuture = getPickupProgress(wave.waveId);
+    final waveDataFuture = _getOptionalMap(
       '/api/v1/delivery/waves/${wave.waveId}/',
       queryParameters: freshQuery,
       options: noCache,
     );
-    final route = routeId == null
-        ? const <String, dynamic>{}
-        : await _getOptionalMap(
+    final routeFuture = routeId == null
+        ? Future.value(const <String, dynamic>{})
+        : _getOptionalMap(
             '/api/v1/delivery/rotas/$routeId/',
             queryParameters: freshQuery,
             options: noCache,
           );
-    final stops = routeId == null
-        ? const <Map<String, dynamic>>[]
-        : await _getAll(
+    final stopsFuture = routeId == null
+        ? Future.value(const <Map<String, dynamic>>[])
+        : _getAll(
             '/api/v1/delivery/paradas/',
             queryParameters: {'route': routeId, ...freshQuery},
             options: noCache,
           );
+    final linksFuture = _getAllOptional(
+      '/api/v1/delivery/pedidos-wave/',
+      queryParameters: {'wave': wave.waveId, ...freshQuery},
+      options: noCache,
+    );
+    final ordersFuture = _getAll(
+      '/api/v1/delivery/pedidos/',
+      queryParameters: {'wave': wave.waveId, ...freshQuery},
+      options: noCache,
+    );
+    // Evita erro "não tratado" das demais enquanto a primeira é aguardada.
+    for (final future in <Future<Object?>>[
+      pickupFuture,
+      waveDataFuture,
+      routeFuture,
+      stopsFuture,
+      linksFuture,
+      ordersFuture,
+    ]) {
+      future.ignore();
+    }
+    final pickup = await pickupFuture;
+    final waveData = await waveDataFuture;
+    final route = await routeFuture;
+    final stops = await stopsFuture;
     final routeStops = stops
         .where((item) => _asInt(item['route']) == routeId)
         .toList();
 
     // WaveOrder existe desde a criação da wave, antes das RouteStops.
-    final links = await _getAllOptional(
-      '/api/v1/delivery/pedidos-wave/',
-      queryParameters: {'wave': wave.waveId, ...freshQuery},
-      options: noCache,
-    );
+    final links = await linksFuture;
     final waveLinks =
         links
             .where(
@@ -488,11 +511,7 @@ class WaveService {
             );
           });
 
-    final orders = await _getAll(
-      '/api/v1/delivery/pedidos/',
-      queryParameters: {'wave': wave.waveId, ...freshQuery},
-      options: noCache,
-    );
+    final orders = await ordersFuture;
     final ordersById = <int, Map<String, dynamic>>{};
     final currentOrderIds = <int>{};
     for (final order in orders) {
@@ -779,7 +798,10 @@ class WaveService {
     try {
       await _postPrepareRoute(wave.waveId, idempotencyKey);
       invalidateCache();
-      final routes = await _getAll('/api/v1/delivery/rotas/');
+      final routes = await _getAll(
+        '/api/v1/delivery/rotas/',
+        queryParameters: {'wave': wave.waveId},
+      );
       final matching =
           routes.where((route) => _asInt(route['wave']) == wave.waveId).toList()
             ..sort(

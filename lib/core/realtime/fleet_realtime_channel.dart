@@ -115,11 +115,39 @@ class FleetRealtimeChannel {
 
   final AuthenticatedWebSocket<FleetRealtimeEvent> _socket;
 
-  Stream<FleetRealtimeEvent> get events => _socket.events;
+  final ReconnectReconcileThrottle _throttle = ReconnectReconcileThrottle();
+
+  Stream<FleetRealtimeEvent> get events =>
+      _socket.events.where((event) => _throttle.allow(event, DateTime.now()));
 
   Future<void> start() => _socket.start();
 
   Future<void> stop() => _socket.stop();
+}
+
+/// No 4G a conexão cai e volta várias vezes por minuto. Cada `connected`
+/// fazia todas as telas abertas recarregarem tudo pela API. Este filtro deixa
+/// passar no máximo uma reconciliação a cada [interval]; os demais eventos
+/// passam sempre.
+class ReconnectReconcileThrottle {
+  ReconnectReconcileThrottle({this.interval = const Duration(seconds: 30)});
+
+  final Duration interval;
+  DateTime? _lastReconcileAt;
+  FleetRealtimeEvent? _lastDecidedEvent;
+  bool _lastDecision = true;
+
+  bool allow(FleetRealtimeEvent event, DateTime now) {
+    if (!event.isConnected) return true;
+    // O mesmo evento é avaliado uma vez por ouvinte; a decisão é única.
+    if (identical(event, _lastDecidedEvent)) return _lastDecision;
+    final last = _lastReconcileAt;
+    final forward = last == null || now.difference(last) >= interval;
+    if (forward) _lastReconcileAt = now;
+    _lastDecidedEvent = event;
+    _lastDecision = forward;
+    return forward;
+  }
 }
 
 int? _asInt(dynamic value) => switch (value) {

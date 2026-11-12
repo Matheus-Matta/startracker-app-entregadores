@@ -553,19 +553,16 @@ class ActiveRouteService {
 
   Future<String> getMapStyle() => _mapStyleOperation ??= _loadMapStyle();
 
+  /// Monta o estilo do mapa com uma única fonte de tiles.
+  ///
+  /// Antes o app baixava os tiles vetoriais do OpenFreeMap e, por cima, os
+  /// tiles raster do Mapbox em `512@2x` (~1024 px cada) — a camada de baixo
+  /// nunca aparecia e o 4G pagava as duas. Agora:
+  /// * com Mapbox disponível: estilo mínimo só com o raster, em 512 px sem
+  ///   `@2x` (um quarto dos pixels);
+  /// * sem Mapbox: o estilo vetorial do OpenFreeMap, carregado direto pelo
+  ///   MapLibre (que mantém cache em disco).
   Future<String> _loadMapStyle() async {
-    Map<String, dynamic> style;
-    try {
-      final openMapResponse = await Dio().get<dynamic>(openFreeMapStyle);
-      final rawStyle = openMapResponse.data;
-      style = rawStyle is String
-          ? _asMap(jsonDecode(rawStyle))
-          : _asMap(rawStyle);
-      if (style.isEmpty) return openFreeMapStyle;
-    } catch (_) {
-      return openFreeMapStyle;
-    }
-
     try {
       final configResponse = await apiClient.dio.get<dynamic>(
         '/api/v1/mapbox/',
@@ -576,35 +573,37 @@ class ActiveRouteService {
         config['available'],
         fallback: token.isNotEmpty,
       );
-      if (!available || token.isEmpty) return jsonEncode(style);
-
-      final sources = style['sources'] is Map
-          ? Map<String, dynamic>.from(style['sources'] as Map)
-          : <String, dynamic>{};
-      sources['startracker-mapbox'] = {
-        'type': 'raster',
-        'tiles': [
-          'https://api.mapbox.com/styles/v1/mapbox/streets-v12/tiles/512/{z}/{x}/{y}@2x?access_token=${Uri.encodeQueryComponent(token)}',
+      if (!available || token.isEmpty) return openFreeMapStyle;
+      return jsonEncode({
+        'version': 8,
+        'sources': {
+          'startracker-mapbox': {
+            'type': 'raster',
+            'tiles': [
+              'https://api.mapbox.com/styles/v1/mapbox/streets-v12/tiles/512/{z}/{x}/{y}?access_token=${Uri.encodeQueryComponent(token)}',
+            ],
+            'tileSize': 512,
+            'maxzoom': 20,
+            'attribution': '© Mapbox © OpenStreetMap',
+          },
+        },
+        'layers': [
+          {
+            'id': 'startracker-background',
+            'type': 'background',
+            'paint': {'background-color': '#E8E7E1'},
+          },
+          {
+            'id': 'startracker-mapbox-primary',
+            'type': 'raster',
+            'source': 'startracker-mapbox',
+          },
         ],
-        'tileSize': 512,
-        'attribution': '© Mapbox © OpenStreetMap',
-      };
-      style['sources'] = sources;
-
-      final layers = style['layers'] is List
-          ? List<dynamic>.from(style['layers'] as List)
-          : <dynamic>[];
-      layers.add({
-        'id': 'startracker-mapbox-primary',
-        'type': 'raster',
-        'source': 'startracker-mapbox',
-        'minzoom': 0,
-        'maxzoom': 22,
       });
-      style['layers'] = layers;
-      return jsonEncode(style);
     } catch (_) {
-      return jsonEncode(style);
+      // Sem a configuração, o mapa vetorial gratuito continua funcionando.
+      _mapStyleOperation = null;
+      return openFreeMapStyle;
     }
   }
 
@@ -674,8 +673,6 @@ class ActiveRouteService {
           noCache: true,
         ),
         _warehouses(),
-        _getAll('/api/v1/delivery/comprovantes/'),
-        _getAll('/api/v1/delivery/fotos-comprovante/'),
       ]);
       final deliveryConfig = results[0] as Map<String, dynamic>;
       final stops = (results[1] as List<Map<String, dynamic>>)
@@ -685,6 +682,18 @@ class ActiveRouteService {
                 item['status']?.toString() != 'cancelled',
           )
           .toList();
+      // Antes, comprovantes e fotos vinham sem filtro: o histórico inteiro do
+      // entregador a cada atualização do mapa. Agora só os desta rota.
+      final proofItems = await _getAllByIds(
+        '/api/v1/delivery/comprovantes/',
+        'route_stop',
+        [for (final stop in stops) ?_asInt(stop['id'])],
+      );
+      final photoItems = await _getAllByIds(
+        '/api/v1/delivery/fotos-comprovante/',
+        'delivery_proof',
+        [for (final proof in proofItems) ?_asInt(proof['id'])],
+      );
       final orders = {
         for (final item in results[2] as List<Map<String, dynamic>>)
           if (_asInt(item['id']) case final int id) id: item,
@@ -694,11 +703,11 @@ class ActiveRouteService {
           if (_asInt(item['id']) case final int id) id: item,
       };
       final proofs = {
-        for (final item in results[4] as List<Map<String, dynamic>>)
+        for (final item in proofItems)
           if (_asInt(item['route_stop']) case final int stopId) stopId: item,
       };
       final photoCounts = <int, int>{};
-      for (final photo in results[5] as List<Map<String, dynamic>>) {
+      for (final photo in photoItems) {
         final proofId = _asInt(photo['delivery_proof']);
         if (proofId != null) {
           photoCounts.update(proofId, (count) => count + 1, ifAbsent: () => 1);
@@ -985,6 +994,7 @@ class ActiveRouteService {
         options: apiClient.offlineRequests.requestOptions(
           idempotencyKey,
           step: 'proof',
+          upload: true,
         ),
       );
       proofId = _asInt(_asMap(response.data)['id']) ?? existingId;
@@ -995,6 +1005,7 @@ class ActiveRouteService {
         options: apiClient.offlineRequests.requestOptions(
           idempotencyKey,
           step: 'proof',
+          upload: true,
         ),
       );
       final createdId = _asInt(_asMap(response.data)['id']);
@@ -1020,6 +1031,7 @@ class ActiveRouteService {
         options: apiClient.offlineRequests.requestOptions(
           idempotencyKey,
           step: 'photo-$index',
+          upload: true,
         ),
       );
     }
@@ -1159,6 +1171,39 @@ class ActiveRouteService {
           )
         : null,
   );
+
+  /// Busca registros filtrando por uma lista de ids (`campo=1&campo=2`),
+  /// em lotes para a URL não ficar longa demais.
+  Future<List<Map<String, dynamic>>> _getAllByIds(
+    String path,
+    String field,
+    List<int> ids,
+  ) async {
+    if (ids.isEmpty) return const [];
+    const chunkSize = 40;
+    final chunks = [
+      for (var start = 0; start < ids.length; start += chunkSize)
+        ids.sublist(
+          start,
+          start + chunkSize > ids.length ? ids.length : start + chunkSize,
+        ),
+    ];
+    final pages = await Future.wait([
+      for (final chunk in chunks)
+        _getAll(
+          path,
+          queryParameters: {field: chunk.map((id) => '$id').toList()},
+          noCache: true,
+        ),
+    ]);
+    final wanted = ids.toSet();
+    return [
+      for (final page in pages)
+        for (final item in page)
+          // Servidor antigo que ignore o filtro não pode misturar outra rota.
+          if (wanted.contains(_asInt(item[field]))) item,
+    ];
+  }
 
   Future<List<Map<String, dynamic>>> _getAllOptional(String path) async {
     try {

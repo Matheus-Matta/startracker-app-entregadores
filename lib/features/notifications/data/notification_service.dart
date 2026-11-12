@@ -90,6 +90,7 @@ class NotificationService {
       final rawItems = await apiClient.getAllPages(
         '/api/v1/notificacoes/',
         maximumPages: 5,
+        pageSize: 50,
       );
       final notifications = rawItems
           .map(DeliveryNotification.tryParse)

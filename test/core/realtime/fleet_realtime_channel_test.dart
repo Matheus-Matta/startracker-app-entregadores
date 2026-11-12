@@ -3,6 +3,45 @@ import 'package:star_tracker/core/config/app_config.dart';
 import 'package:star_tracker/core/realtime/fleet_realtime_channel.dart';
 
 void main() {
+  group('ReconnectReconcileThrottle', () {
+    // Sem const: no app cada mensagem do socket vira um objeto novo.
+    FleetRealtimeEvent connected() =>
+        FleetRealtimeEvent(type: 'connected', data: const {});
+    final start = DateTime(2026, 11, 12, 8);
+
+    test('reconexoes seguidas reconciliam uma vez por intervalo', () {
+      final throttle = ReconnectReconcileThrottle();
+      expect(throttle.allow(connected(), start), isTrue);
+      expect(
+        throttle.allow(connected(), start.add(const Duration(seconds: 10))),
+        isFalse,
+      );
+      expect(
+        throttle.allow(connected(), start.add(const Duration(seconds: 31))),
+        isTrue,
+      );
+    });
+
+    test('mesmo evento recebe a mesma decisao para todos os ouvintes', () {
+      final throttle = ReconnectReconcileThrottle();
+      final event = connected();
+      expect(throttle.allow(event, start), isTrue);
+      expect(throttle.allow(event, start), isTrue);
+    });
+
+    test('eventos de rota e pedido nunca sao filtrados', () {
+      final throttle = ReconnectReconcileThrottle();
+      throttle.allow(connected(), start);
+      expect(
+        throttle.allow(
+          const FleetRealtimeEvent(type: 'delivery_route_update', data: {}),
+          start,
+        ),
+        isTrue,
+      );
+    });
+  });
+
   group('FleetRealtimeEvent', () {
     test('interpreta atualizacao de rota aninhada', () {
       final event = FleetRealtimeEvent.tryParse('''

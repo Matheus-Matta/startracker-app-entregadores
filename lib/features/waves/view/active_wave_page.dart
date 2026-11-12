@@ -40,7 +40,10 @@ class _ActiveWavePageState extends State<ActiveWavePage>
   ActiveRoute? _route;
   PickupProgress? _pickupProgress;
   String _mapStyle = ActiveRouteService.openFreeMapStyle;
-  Position? _position;
+  // A posição muda a cada ~10 m. Fica num notifier para reconstruir só o
+  // mapa e o painel, não a tela inteira (pesado em aparelhos antigos).
+  final ValueNotifier<Position?> _positionNotifier = ValueNotifier(null);
+  Position? get _position => _positionNotifier.value;
   StreamSubscription<Position>? _positionSubscription;
   StreamSubscription<FleetRealtimeEvent>? _realtimeSubscription;
   StreamSubscription<OfflineQueueEvent>? _offlineQueueSubscription;
@@ -96,6 +99,7 @@ class _ActiveWavePageState extends State<ActiveWavePage>
     _realtimeSubscription?.cancel();
     _offlineQueueSubscription?.cancel();
     _positionSubscription?.cancel();
+    _positionNotifier.dispose();
     super.dispose();
   }
 
@@ -245,7 +249,7 @@ class _ActiveWavePageState extends State<ActiveWavePage>
         ),
       );
       if (!mounted || generation != _locationGeneration) return;
-      setState(() => _position = first);
+      _positionNotifier.value = first;
       _positionSubscription =
           Geolocator.getPositionStream(
             locationSettings: const LocationSettings(
@@ -254,7 +258,7 @@ class _ActiveWavePageState extends State<ActiveWavePage>
             ),
           ).listen((position) {
             if (mounted && generation == _locationGeneration) {
-              setState(() => _position = position);
+              _positionNotifier.value = position;
             }
           });
     } catch (_) {
@@ -439,11 +443,20 @@ class _ActiveWavePageState extends State<ActiveWavePage>
   Future<void> _openPickup() async {
     final progress = _pickupProgress;
     if (progress == null || !progress.enabled || progress.isComplete) return;
-    final completed = await Navigator.of(context).push<bool>(
-      MaterialPageRoute<bool>(
-        builder: (_) => PickupPage(service: _waveService, progress: progress),
-      ),
-    );
+    // O mapa (OpenGL) aberto por baixo da câmera + leitor de etiquetas
+    // estourava a memória e o Android matava o app, que reabria na tela
+    // inicial. Mesmo cuidado já usado na finalização da entrega.
+    setState(() => _mapSuspended = true);
+    bool? completed;
+    try {
+      completed = await Navigator.of(context).push<bool>(
+        MaterialPageRoute<bool>(
+          builder: (_) => PickupPage(service: _waveService, progress: progress),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _mapSuspended = false);
+    }
     if (!mounted) return;
     if (completed == true) _message('Retirada conferida. Rota atualizada.');
     await _loadRoute();
@@ -532,12 +545,15 @@ class _ActiveWavePageState extends State<ActiveWavePage>
           if (_mapSuspended)
             const ColoredBox(color: _cream)
           else
-            _ActiveRouteMap(
-              key: _mapKey,
-              route: route,
-              stop: stop,
-              position: _position,
-              style: _mapStyle,
+            ValueListenableBuilder<Position?>(
+              valueListenable: _positionNotifier,
+              builder: (context, position, _) => _ActiveRouteMap(
+                key: _mapKey,
+                route: route,
+                stop: stop,
+                position: position,
+                style: _mapStyle,
+              ),
             ),
           SafeArea(
             bottom: false,
@@ -569,23 +585,26 @@ class _ActiveWavePageState extends State<ActiveWavePage>
               onPerspective: () => _mapKey.currentState?.togglePerspective(),
             ),
           ),
-          _DeliverySheet(
-            key: ValueKey<int?>(stop?.stopId),
-            route: route,
-            stop: stop,
-            pickupProgress: _pickupProgress,
-            position: _position,
-            performingAction: _performingAction,
-            onStart: () => _runStopAction(
-              () => _service.startRoute(route.routeId),
-              optimisticUpdate: (current) =>
-                  current.copyWith(status: 'started'),
+          ValueListenableBuilder<Position?>(
+            valueListenable: _positionNotifier,
+            builder: (context, position, _) => _DeliverySheet(
+              key: ValueKey<int?>(stop?.stopId),
+              route: route,
+              stop: stop,
+              pickupProgress: _pickupProgress,
+              position: position,
+              performingAction: _performingAction,
+              onStart: () => _runStopAction(
+                () => _service.startRoute(route.routeId),
+                optimisticUpdate: (current) =>
+                    current.copyWith(status: 'started'),
+              ),
+              onFinalize: stop == null ? null : () => _finalizeStop(stop),
+              onFailure: stop == null ? null : () => _registerFailure(stop),
+              onPostpone: stop == null ? null : () => _postponeStop(stop),
+              onOpenOrder: stop == null ? null : () => _openOrder(stop),
+              onOpenPickup: _openPickup,
             ),
-            onFinalize: stop == null ? null : () => _finalizeStop(stop),
-            onFailure: stop == null ? null : () => _registerFailure(stop),
-            onPostpone: stop == null ? null : () => _postponeStop(stop),
-            onOpenOrder: stop == null ? null : () => _openOrder(stop),
-            onOpenPickup: _openPickup,
           ),
         ],
       ),
@@ -612,6 +631,9 @@ class _ActiveRouteMap extends StatefulWidget {
 }
 
 class _ActiveRouteMapState extends State<_ActiveRouteMap> {
+  // Inclinação menor mostra menos mapa até o horizonte: menos tiles
+  // baixados no 4G e menos trabalho para a GPU de aparelhos antigos.
+  static const _navigationTilt = 35.0;
   MapLibreMapController? _controller;
   Symbol? _driverSymbol;
   bool _styleLoaded = false;
@@ -637,8 +659,10 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
     }
     if (!_styleLoaded) return;
 
+    // Cada recarga da rota cria uma lista nova; comparar por referência
+    // apagava e redesenhava linhas e marcadores sem necessidade.
     final routeChanged =
-        !identical(oldWidget.route.path, widget.route.path) ||
+        !_samePath(oldWidget.route.path, widget.route.path) ||
         oldWidget.stop?.stopId != widget.stop?.stopId;
     if (routeChanged) {
       unawaited(_renderRoute());
@@ -651,6 +675,18 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
         oldPosition?.heading != position?.heading) {
       unawaited(_updateDriverPosition());
     }
+  }
+
+  static bool _samePath(List<RouteCoordinate> a, List<RouteCoordinate> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (var index = 0; index < a.length; index++) {
+      if (a[index].latitude != b[index].latitude ||
+          a[index].longitude != b[index].longitude) {
+        return false;
+      }
+    }
+    return true;
   }
 
   @override
@@ -738,7 +774,7 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
             CameraPosition(
               target: destination,
               zoom: 16,
-              tilt: _perspective ? 48 : 0,
+              tilt: _perspective ? _navigationTilt : 0,
             ),
           ),
         );
@@ -903,7 +939,7 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
           CameraPosition(
             target: LatLng(position.latitude, position.longitude),
             zoom: 17.2,
-            tilt: _perspective ? 55 : 0,
+            tilt: _perspective ? _navigationTilt : 0,
             bearing: _navigationBearing,
           ),
         ),
@@ -921,7 +957,7 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
         CameraPosition(
           target: current,
           zoom: 17.2,
-          tilt: _perspective ? 55 : 0,
+          tilt: _perspective ? _navigationTilt : 0,
           bearing: _navigationBearing,
         ),
       ),
@@ -962,7 +998,7 @@ class _ActiveRouteMapState extends State<_ActiveRouteMap> {
       initialCameraPosition: CameraPosition(
         target: _initialTarget,
         zoom: widget.position == null ? 16 : 17.2,
-        tilt: 55,
+        tilt: _navigationTilt,
         bearing: _navigationBearing,
       ),
       compassEnabled: false,

@@ -130,7 +130,13 @@ class ActiveWaveService {
   }
 
   Future<List<Map<String, dynamic>>> _getAllRoutes() async {
-    return apiClient.getAllPages('/api/v1/delivery/rotas/');
+    // Só as rotas em andamento: antes vinha o histórico inteiro do entregador.
+    return apiClient.getAllPages(
+      '/api/v1/delivery/rotas/',
+      queryParameters: const {
+        'status': ['released', 'accepted', 'started'],
+      },
+    );
   }
 
   int? _asInt(dynamic value) => switch (value) {

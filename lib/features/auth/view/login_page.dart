@@ -287,7 +287,12 @@ class _BrandHeader extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(
       children: [
-        Image.asset('logo.png', width: 48, height: 48, fit: BoxFit.contain),
+        Image.asset(
+          'assets/images/logo_login.png',
+          width: 48,
+          height: 48,
+          fit: BoxFit.contain,
+        ),
         const SizedBox(width: 10),
         const Text(
           'Star Tracker',

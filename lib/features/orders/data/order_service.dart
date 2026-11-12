@@ -174,10 +174,12 @@ class OrderService {
   List<Map<String, dynamic>>? _cachedOrders;
   DateTime? _cacheCreatedAt;
   Future<List<Map<String, dynamic>>>? _loadOperation;
-  final Map<int, _CachedOrderPage> _pageCache = {};
-  final Map<int, Future<PagedResult<OrderListItem>>> _pageOperations = {};
-  final Map<int, int> _pageOperationGenerations = {};
+  final Map<String, _CachedOrderPage> _pageCache = {};
+  final Map<String, Future<PagedResult<OrderListItem>>> _pageOperations = {};
+  final Map<String, int> _pageOperationGenerations = {};
   int? _loadOperationGeneration;
+  String? _loadOperationStatus;
+  String? _cachedOrdersStatus;
   int _cacheGeneration = 0;
 
   Future<PagedResult<OrderListItem>> getOrders({
@@ -187,12 +189,15 @@ class OrderService {
     bool refresh = false,
   }) async {
     final query = search.trim().toLowerCase();
-    if (query.isEmpty && status.isEmpty) {
-      return _getOrderPage(page, refresh: refresh);
+    if (query.isEmpty) {
+      // Sem texto, o filtro de status é feito pelo servidor, página a página.
+      // Antes, escolher um status baixava todos os pedidos da conta.
+      return _getOrderPage(page, refresh: refresh, status: status);
     }
 
+    // A API não tem busca por texto; a busca local baixa só o status pedido.
     const pageSize = 20;
-    final rawItems = await _getOrders(refresh: refresh);
+    final rawItems = await _getOrders(refresh: refresh, status: status);
     final items = _parseItems(rawItems, query: query, status: status);
 
     final start = (page - 1) * pageSize;
@@ -268,41 +273,45 @@ class OrderService {
   Future<PagedResult<OrderListItem>> _getOrderPage(
     int page, {
     required bool refresh,
+    String status = '',
   }) async {
-    final cached = _pageCache[page];
+    final key = '$status|$page';
+    final cached = _pageCache[key];
     if (!refresh &&
         cached != null &&
         DateTime.now().difference(cached.createdAt) < _cacheDuration) {
       return cached.result;
     }
 
-    final ongoing = _pageOperations[page];
-    if (ongoing != null &&
-        _pageOperationGenerations[page] == _cacheGeneration) {
+    final ongoing = _pageOperations[key];
+    if (ongoing != null && _pageOperationGenerations[key] == _cacheGeneration) {
       return ongoing;
     }
     final generation = _cacheGeneration;
-    final operation = _loadOrderPage(page);
-    _pageOperations[page] = operation;
-    _pageOperationGenerations[page] = generation;
+    final operation = _loadOrderPage(page, status);
+    _pageOperations[key] = operation;
+    _pageOperationGenerations[key] = generation;
     try {
       final result = await operation;
       if (generation == _cacheGeneration) {
-        _pageCache[page] = _CachedOrderPage(DateTime.now(), result);
+        _pageCache[key] = _CachedOrderPage(DateTime.now(), result);
       }
       return result;
     } finally {
-      if (identical(_pageOperations[page], operation)) {
-        _pageOperations.remove(page);
-        _pageOperationGenerations.remove(page);
+      if (identical(_pageOperations[key], operation)) {
+        _pageOperations.remove(key);
+        _pageOperationGenerations.remove(key);
       }
     }
   }
 
-  Future<PagedResult<OrderListItem>> _loadOrderPage(int page) async {
+  Future<PagedResult<OrderListItem>> _loadOrderPage(
+    int page,
+    String status,
+  ) async {
     final response = await apiClient.dio.get<dynamic>(
       '/api/v1/delivery/pedidos/',
-      queryParameters: {'page': page},
+      queryParameters: {'page': page, 'status': ?_nonEmpty(status)},
     );
     final data = response.data;
     final items = _parseItems(collectionItems(data));
@@ -315,28 +324,41 @@ class OrderService {
     );
   }
 
-  Future<List<Map<String, dynamic>>> _getOrders({required bool refresh}) async {
+  static String? _nonEmpty(String value) => value.isEmpty ? null : value;
+
+  Future<List<Map<String, dynamic>>> _getOrders({
+    required bool refresh,
+    String status = '',
+  }) async {
     final cached = _cachedOrders;
     final createdAt = _cacheCreatedAt;
     final cacheIsFresh =
         cached != null &&
+        _cachedOrdersStatus == status &&
         createdAt != null &&
         DateTime.now().difference(createdAt) < _cacheDuration;
     if (!refresh && cacheIsFresh) return cached;
 
     final ongoing = _loadOperation;
-    if (ongoing != null && _loadOperationGeneration == _cacheGeneration) {
+    if (ongoing != null &&
+        _loadOperationGeneration == _cacheGeneration &&
+        _loadOperationStatus == status) {
       return ongoing;
     }
 
     final generation = _cacheGeneration;
-    final operation = apiClient.getAllPages('/api/v1/delivery/pedidos/');
+    final operation = apiClient.getAllPages(
+      '/api/v1/delivery/pedidos/',
+      queryParameters: {'status': ?_nonEmpty(status)},
+    );
+    _loadOperationStatus = status;
     _loadOperation = operation;
     _loadOperationGeneration = generation;
     try {
       final orders = await operation;
       if (generation == _cacheGeneration) {
         _cachedOrders = orders;
+        _cachedOrdersStatus = status;
         _cacheCreatedAt = DateTime.now();
       }
       return orders;

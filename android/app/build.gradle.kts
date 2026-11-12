@@ -88,6 +88,17 @@ android {
                 ?: signingConfigs.getByName("debug")
         }
     }
+
+    if (releaseRequested) {
+        // Somente ARM no release: as libs nativas dos plugins (MapLibre,
+        // leitor de codigos) traziam x86/x86_64 de emulador, ~17 MB a mais no
+        // APK baixado pelo 4G. O debug continua rodando no emulador.
+        packaging {
+            jniLibs {
+                excludes += listOf("lib/x86/**", "lib/x86_64/**")
+            }
+        }
+    }
 }
 
 dependencies {

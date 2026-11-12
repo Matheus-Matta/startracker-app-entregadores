@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart';
 
 import '../../../core/network/api_client.dart';
@@ -10,6 +12,8 @@ class AuthService {
 
   final ApiClient apiClient;
   final SessionStorage storage;
+
+  static const _restoreTimeout = Duration(seconds: 8);
 
   Future<void> login({
     required String identifier,
@@ -59,10 +63,15 @@ class AuthService {
     if (access == null || access.isEmpty) return false;
 
     try {
-      await apiClient.dio.post<void>(
-        '/api/v1/auth/token/verify/',
-        data: {'token': access},
-      );
+      // Com sinal fraco a abertura do app ficava presa na tela de
+      // carregamento até o tempo limite da rede. Sem resposta em poucos
+      // segundos, segue com a sessão salva; o token é renovado na primeira
+      // requisição que receber 401.
+      await apiClient.dio
+          .post<void>('/api/v1/auth/token/verify/', data: {'token': access})
+          .timeout(_restoreTimeout);
+      return true;
+    } on TimeoutException {
       return true;
     } on DioException catch (error) {
       // Uma sessao lembrada continua utilizavel sem rede. A validade sera

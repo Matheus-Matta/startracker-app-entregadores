@@ -32,7 +32,14 @@ class _AuthGateState extends State<AuthGate> {
       final dependencies = AppDependencies.instance;
       final loggedIn = await authService.restoreSession();
       if (!loggedIn) return const _AuthBootstrap(loggedIn: false);
-      await authService.deliveryConfig(refresh: true);
+      // Com uma cópia local da configuração, o app abre na hora e atualiza
+      // em segundo plano; só o primeiro acesso precisa esperar a API.
+      final cachedConfig = await authService.deliveryConfig();
+      if (cachedConfig.isEmpty) {
+        await authService.deliveryConfig(refresh: true);
+      } else {
+        unawaited(authService.deliveryConfig(refresh: true));
+      }
       // Requisições que falharam sem rede antes do app ser fechado voltam
       // para a fila e são reenviadas automaticamente.
       unawaited(dependencies.apiClient.offlineRequests.restorePersisted());
