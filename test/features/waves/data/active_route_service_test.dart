@@ -134,6 +134,48 @@ void main() {
       expect(adapter.proofFields, isNot(contains('lon')));
     },
   );
+
+  test(
+    'reenvio retoma comprovante e fotos ja gravados em vez de recria-los',
+    () async {
+      final client = ApiClient(
+        baseUrl: 'https://api.example.test',
+        storage: const _EmptyStorage(),
+      );
+      final adapter = _FlakyCompletionAdapter();
+      client.dio.httpClientAdapter = adapter;
+      final service = ActiveRouteService(
+        client,
+        storage: const _EmptyStorage(),
+      );
+
+      final first = await service.complete(
+        DeliveryProofSubmission(
+          stop: _stop(id: 42, sequence: 1, status: 'delivering'),
+          recipientName: 'Maria',
+          recipientDocument: '',
+          notes: '',
+          photos: [
+            DeliveryPhotoUpload(bytes: Uint8List(4), filename: 'a.jpg'),
+            DeliveryPhotoUpload(bytes: Uint8List(4), filename: 'b.jpg'),
+          ],
+          signatureBytes: null,
+          latitude: null,
+          longitude: null,
+          itemResults: const [],
+        ),
+      );
+      expect(first.queued, isTrue);
+
+      await client.offlineRequests.retryNow(manual: true);
+
+      expect(client.offlineRequests.pendingCount, 0);
+      expect(adapter.proofCreates, 1);
+      expect(adapter.proofPatches, 1);
+      expect(adapter.photoSequences, ['1', '2']);
+      expect(adapter.completions, 1);
+    },
+  );
 }
 
 ActiveRouteStop _stop({
@@ -247,6 +289,76 @@ class _CompletionAdapter implements HttpClientAdapter {
       };
     } else {
       response = {};
+    }
+    return ResponseBody.fromString(
+      jsonEncode(response),
+      200,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+/// Simula o 4G: o comprovante e a 1a foto chegam ao servidor, a 2a foto cai.
+class _FlakyCompletionAdapter implements HttpClientAdapter {
+  int proofCreates = 0;
+  int proofPatches = 0;
+  int completions = 0;
+  final List<String> photoSequences = [];
+  final List<String> _storedSequences = [];
+  bool _dropped = false;
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final path = options.path;
+    Object response = <String, dynamic>{};
+    if (path == '/api/v1/delivery/comprovantes/' && options.method == 'POST') {
+      proofCreates++;
+      response = {'id': 15};
+    } else if (path == '/api/v1/delivery/comprovantes/15/') {
+      proofPatches++;
+      response = {'id': 15};
+    } else if (path == '/api/v1/delivery/fotos-comprovante/' &&
+        options.method == 'POST') {
+      final form = options.data as FormData;
+      final sequence = form.fields
+          .firstWhere((entry) => entry.key == 'sequence')
+          .value;
+      if (sequence == '2' && !_dropped) {
+        _dropped = true;
+        throw DioException.connectionError(
+          requestOptions: options,
+          reason: 'Connection closed while receiving data',
+        );
+      }
+      photoSequences.add(sequence);
+      _storedSequences.add(sequence);
+      response = {'id': 100 + photoSequences.length};
+    } else if (path == '/api/v1/delivery/fotos-comprovante/') {
+      response = {
+        'results': [
+          for (final sequence in _storedSequences)
+            {'delivery_proof': 15, 'sequence': int.parse(sequence)},
+        ],
+        'next': null,
+      };
+    } else if (path == '/api/v1/delivery/paradas/42/') {
+      response = {
+        'id': 42,
+        'status': 'delivering',
+        'proof': {'id': 15},
+      };
+    } else if (path == '/api/v1/delivery/paradas/42/complete/') {
+      completions++;
+      response = {'status': 'completed', 'proof': <String, dynamic>{}};
     }
     return ResponseBody.fromString(
       jsonEncode(response),

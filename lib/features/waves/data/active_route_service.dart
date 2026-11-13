@@ -522,8 +522,9 @@ class ActiveRouteService {
     ) async {
       final plan = _CompletionPlan.fromJson(payload);
       if (plan.stopId <= 0) return;
-      if (await _completedResultOrNull(plan.stopId) != null) return;
-      await _runCompletionPlan(plan, files, key);
+      final state = await _serverCompletionState(plan.stopId);
+      if (state.completed != null) return;
+      await _runCompletionPlan(plan, files, key, resume: state);
     });
   }
 
@@ -940,14 +941,16 @@ class ActiveRouteService {
             resourceKey: 'stop:${submission.stop.stopId}',
             description: 'Finalizar entrega',
             operation: (key) async {
+              _ServerCompletionState? resume;
               if (!firstAttempt) {
-                final completed = await _completedResultOrNull(
-                  submission.stop.stopId,
-                );
-                if (completed != null) return completed;
+                // A tentativa anterior pode ter gravado parte da baixa antes
+                // de a resposta se perder no 4G: retoma do ponto em que o
+                // servidor parou em vez de recriar o comprovante (400).
+                resume = await _serverCompletionState(submission.stop.stopId);
+                if (resume.completed case final completed?) return completed;
               }
               firstAttempt = false;
-              return _runCompletionPlan(plan, files, key);
+              return _runCompletionPlan(plan, files, key, resume: resume);
             },
             persisted: PersistedOfflineRequest(
               type: _stopCompleteType,
@@ -972,8 +975,9 @@ class ActiveRouteService {
   Future<DeliveryAuditResult> _runCompletionPlan(
     _CompletionPlan plan,
     Map<String, Uint8List> files,
-    String idempotencyKey,
-  ) async {
+    String idempotencyKey, {
+    _ServerCompletionState? resume,
+  }) async {
     final signature = files[_CompletionPlan.signatureFile];
     final proofData = <String, dynamic>{
       // items e completed_at são resultados geridos pelo complete/.
@@ -987,7 +991,7 @@ class ActiveRouteService {
     };
 
     int proofId;
-    if (plan.existingProofId case final int existingId) {
+    if (resume?.proofId ?? plan.existingProofId case final int existingId) {
       final response = await apiClient.dio.patch<dynamic>(
         '/api/v1/delivery/comprovantes/$existingId/',
         data: FormData.fromMap(proofData),
@@ -1018,14 +1022,19 @@ class ActiveRouteService {
     }
 
     var sequence = plan.photoSequenceStart;
+    final uploadedSequences = resume?.photoSequences ?? const <int>{};
     for (final (index, filename) in plan.photoFilenames.indexed) {
       final bytes = files[_CompletionPlan.photoFile(index)];
       if (bytes == null) continue;
+      final photoSequence = sequence++;
+      // Foto já recebida numa tentativa anterior: reenviar daria 400
+      // (sequência única por comprovante) e desfaria a entrega.
+      if (uploadedSequences.contains(photoSequence)) continue;
       await apiClient.dio.post<dynamic>(
         '/api/v1/delivery/fotos-comprovante/',
         data: FormData.fromMap({
           'delivery_proof': proofId,
-          'sequence': sequence++,
+          'sequence': photoSequence,
           'file': MultipartFile.fromBytes(bytes, filename: filename),
         }),
         options: apiClient.offlineRequests.requestOptions(
@@ -1046,7 +1055,11 @@ class ActiveRouteService {
     return DeliveryAuditResult.fromResponse(response.data);
   }
 
-  Future<DeliveryAuditResult?> _completedResultOrNull(int stopId) async {
+  /// O que já foi gravado no servidor para esta parada.
+  ///
+  /// Usado antes de reenviar uma baixa: o comprovante e parte das fotos podem
+  /// ter sido gravados numa tentativa cuja resposta nunca chegou ao aparelho.
+  Future<_ServerCompletionState> _serverCompletionState(int stopId) async {
     final response = await apiClient.dio.get<dynamic>(
       '/api/v1/delivery/paradas/$stopId/',
       options: Options(
@@ -1054,8 +1067,26 @@ class ActiveRouteService {
       ),
     );
     final data = _asMap(response.data);
-    if (data['status']?.toString() != 'completed') return null;
-    return DeliveryAuditResult.fromResponse(data);
+    if (data['status']?.toString() == 'completed') {
+      return _ServerCompletionState(
+        completed: DeliveryAuditResult.fromResponse(data),
+      );
+    }
+    final rawProof = data['proof'];
+    final proofId = rawProof is Map ? _asInt(rawProof['id']) : _asInt(rawProof);
+    if (proofId == null) return const _ServerCompletionState();
+    final photos = await _getAllByIds(
+      '/api/v1/delivery/fotos-comprovante/',
+      'delivery_proof',
+      [proofId],
+    );
+    return _ServerCompletionState(
+      proofId: proofId,
+      photoSequences: {
+        for (final photo in photos)
+          if (_asInt(photo['sequence']) case final int sequence) sequence,
+      },
+    );
   }
 
   static String _completionEndpoint(
@@ -1385,6 +1416,19 @@ class _RouteNetworkFailure implements Exception {
 
 /// Finalização de entrega já resolvida em dados simples, para poder ser
 /// salva em disco e reenviada depois que o app for reaberto.
+class _ServerCompletionState {
+  const _ServerCompletionState({
+    this.completed,
+    this.proofId,
+    this.photoSequences = const {},
+  });
+
+  /// Preenchido quando a parada já está concluída no servidor.
+  final DeliveryAuditResult? completed;
+  final int? proofId;
+  final Set<int> photoSequences;
+}
+
 class _CompletionPlan {
   const _CompletionPlan({
     required this.stopId,
