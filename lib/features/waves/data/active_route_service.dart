@@ -9,6 +9,7 @@ import '../../../core/network/api_client.dart';
 import '../../../core/network/offline_request_queue.dart';
 import '../../../core/storage/session_storage.dart';
 import '../../auth/data/delivery_configuration.dart';
+import 'route_snapshot_store.dart';
 
 class ActiveRoute {
   const ActiveRoute({
@@ -401,7 +402,11 @@ class ActiveRouteException implements Exception {
 }
 
 class ActiveRouteService {
-  ActiveRouteService(this.apiClient, {this.storage = const SessionStorage()}) {
+  ActiveRouteService(
+    this.apiClient, {
+    this.storage = const SessionStorage(),
+    RouteSnapshotStore? snapshotStore,
+  }) : _snapshotStore = snapshotStore ?? RouteSnapshotStore() {
     _registerOfflineHandlers();
     _queueSubscription = apiClient.offlineRequests.events.listen(
       _onOfflineQueueEvent,
@@ -416,6 +421,7 @@ class ActiveRouteService {
 
   final ApiClient apiClient;
   final SessionStorage storage;
+  final RouteSnapshotStore _snapshotStore;
   Map<String, dynamic>? _configurationCache;
   Future<String>? _mapStyleOperation;
   // Mantida viva durante todo o app (o serviço é um singleton).
@@ -450,6 +456,7 @@ class ActiveRouteService {
     _routeSnapshots.clear();
     _routeOperations.clear();
     _pendingStopStatuses.clear();
+    unawaited(_snapshotStore.clear());
   }
 
   /// Rota em cache para exibição imediata enquanto a versão atual carrega.
@@ -631,11 +638,14 @@ class ActiveRouteService {
     if (ongoing != null) return ongoing;
     final operation = () async {
       try {
-        final route = await _fetchRoute(routeId);
+        final bundle = await _fetchRouteBundle(routeId);
+        final route = _buildRoute(routeId, bundle);
         _routeSnapshots[routeId] = route;
+        unawaited(_snapshotStore.save(routeId, bundle.toJson()));
         return _withPendingStatuses(route);
       } on _RouteNetworkFailure catch (failure) {
-        final cached = _routeSnapshots[routeId];
+        final cached =
+            _routeSnapshots[routeId] ?? await _restoreRouteSnapshot(routeId);
         if (cached != null) return _withPendingStatuses(cached);
         throw failure.exception;
       } finally {
@@ -646,7 +656,21 @@ class ActiveRouteService {
     return operation;
   }
 
-  Future<ActiveRoute> _fetchRoute(int routeId) async {
+  /// Cópia em disco da última leitura, para abrir o mapa sem sinal depois
+  /// que o sistema encerrou o app.
+  Future<ActiveRoute?> _restoreRouteSnapshot(int routeId) async {
+    final data = await _snapshotStore.read(routeId);
+    if (data == null) return null;
+    try {
+      final route = _buildRoute(routeId, _RouteBundle.fromJson(data));
+      _routeSnapshots[routeId] = route;
+      return route;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<_RouteBundle> _fetchRouteBundle(int routeId) async {
     try {
       final refreshToken = DateTime.now().microsecondsSinceEpoch;
       // A rota é consultada primeiro porque seu wave_id limita a carga de
@@ -695,111 +719,14 @@ class ActiveRouteService {
         'delivery_proof',
         [for (final proof in proofItems) ?_asInt(proof['id'])],
       );
-      final orders = {
-        for (final item in results[2] as List<Map<String, dynamic>>)
-          if (_asInt(item['id']) case final int id) id: item,
-      };
-      final warehouses = {
-        for (final item in results[3] as List<Map<String, dynamic>>)
-          if (_asInt(item['id']) case final int id) id: item,
-      };
-      final proofs = {
-        for (final item in proofItems)
-          if (_asInt(item['route_stop']) case final int stopId) stopId: item,
-      };
-      final photoCounts = <int, int>{};
-      for (final photo in photoItems) {
-        final proofId = _asInt(photo['delivery_proof']);
-        if (proofId != null) {
-          photoCounts.update(proofId, (count) => count + 1, ifAbsent: () => 1);
-        }
-      }
-
-      final activeStops = <ActiveRouteStop>[];
-      for (final stop in stops) {
-        final stopId = _asInt(stop['id']);
-        final orderId = _asInt(stop['order']);
-        if (stopId == null || orderId == null) continue;
-        final order = orders[orderId] ?? const <String, dynamic>{};
-        final proof = proofs[stopId];
-        final proofId = _asInt(proof?['id']);
-        final overrides = order['proof_overrides'] is Map
-            ? Map<String, dynamic>.from(order['proof_overrides'] as Map)
-            : const <String, dynamic>{};
-        activeStops.add(
-          ActiveRouteStop(
-            stopId: stopId,
-            orderId: orderId,
-            sequence: _asInt(stop['sequence']) ?? 0,
-            status: stop['status']?.toString() ?? 'planned',
-            orderStatus: order['status']?.toString() ?? '',
-            isManual: _asBool(stop['is_manual'], fallback: false),
-            plannedEta: DateTime.tryParse(
-              stop['planned_eta']?.toString() ?? '',
-            ),
-            orderNumber: order['order_number']?.toString() ?? '#$orderId',
-            customerName: order['customer_name']?.toString() ?? 'Cliente',
-            customerPhone: order['customer_phone']?.toString() ?? '',
-            fullAddress: _fullAddress(order),
-            latitude: _asDouble(order['lat']),
-            longitude: _asDouble(order['lon']),
-            units: _asInt(order['units']) ?? 0,
-            weightGrams: _asInt(order['weight']) ?? 0,
-            contents: _parseContents(order['items']),
-            proofOverrides: overrides,
-            policy: CompletionPolicy.fromConfiguration(
-              deliveryConfig,
-              overrides: overrides,
-            ),
-            existingProofId: proofId,
-            existingPhotoCount: proofId == null ? 0 : photoCounts[proofId] ?? 0,
-            hasSignature:
-                (proof?['signature_file']?.toString() ?? '').isNotEmpty,
-            existingRecipientName: proof?['recipient_name']?.toString() ?? '',
-            existingRecipientDocument:
-                proof?['recipient_document']?.toString() ?? '',
-            existingNotes: proof?['notes']?.toString() ?? '',
-            confirmationLocation: ConfirmationLocationPolicy.fromConfiguration(
-              deliveryConfig,
-            ),
-          ),
-        );
-      }
-      activeStops.sort((a, b) => a.sequence.compareTo(b.sequence));
-      final path = _parsePath(route['path_geometry']);
-      final deliveryWaypoints = _parseDeliveryWaypoints(
-        route['planned_waypoints'],
-      );
-      final plannedWarehouse = parseWarehouseWaypoint(
-        route['planned_waypoints'],
-      );
-      final firstOrder = activeStops.isEmpty
-          ? null
-          : orders[activeStops.first.orderId];
-      final orderWarehouse = firstOrder?['warehouse'];
-      final embeddedWarehouse = _asMap(orderWarehouse);
-      final warehouseId = orderWarehouse is Map
-          ? _asInt(orderWarehouse['id'])
-          : _asInt(orderWarehouse);
-      final warehouseData = warehouses[warehouseId] ?? embeddedWarehouse;
-      final warehouseCoordinate = _parseCoordinate(warehouseData);
-
-      return ActiveRoute(
-        routeId: _asInt(route['id']) ?? routeId,
-        waveId: _asInt(route['wave']) ?? 0,
-        routeNumber: route['route_number']?.toString() ?? 'Rota #$routeId',
-        status: route['status']?.toString() ?? '',
-        path: path,
-        deliveryWaypoints: deliveryWaypoints,
-        warehouse:
-            plannedWarehouse ??
-            (warehouseCoordinate == null
-                ? null
-                : RoutePlace(
-                    name: warehouseData['name']?.toString() ?? 'Armazém',
-                    coordinate: warehouseCoordinate,
-                  )),
-        stops: activeStops,
+      return _RouteBundle(
+        route: route,
+        deliveryConfig: deliveryConfig,
+        stops: stops,
+        orders: results[2] as List<Map<String, dynamic>>,
+        warehouses: results[3] as List<Map<String, dynamic>>,
+        proofs: proofItems,
+        photos: photoItems,
       );
     } on DioException catch (error) {
       final exception = ActiveRouteException(
@@ -811,6 +738,115 @@ class ActiveRouteService {
       }
       throw exception;
     }
+  }
+
+  ActiveRoute _buildRoute(int routeId, _RouteBundle bundle) {
+    final route = bundle.route;
+    final deliveryConfig = bundle.deliveryConfig;
+    final stops = bundle.stops;
+    final proofItems = bundle.proofs;
+    final photoItems = bundle.photos;
+    final orders = {
+      for (final item in bundle.orders)
+        if (_asInt(item['id']) case final int id) id: item,
+    };
+    final warehouses = {
+      for (final item in bundle.warehouses)
+        if (_asInt(item['id']) case final int id) id: item,
+    };
+    final proofs = {
+      for (final item in proofItems)
+        if (_asInt(item['route_stop']) case final int stopId) stopId: item,
+    };
+    final photoCounts = <int, int>{};
+    for (final photo in photoItems) {
+      final proofId = _asInt(photo['delivery_proof']);
+      if (proofId != null) {
+        photoCounts.update(proofId, (count) => count + 1, ifAbsent: () => 1);
+      }
+    }
+
+    final activeStops = <ActiveRouteStop>[];
+    for (final stop in stops) {
+      final stopId = _asInt(stop['id']);
+      final orderId = _asInt(stop['order']);
+      if (stopId == null || orderId == null) continue;
+      final order = orders[orderId] ?? const <String, dynamic>{};
+      final proof = proofs[stopId];
+      final proofId = _asInt(proof?['id']);
+      final overrides = order['proof_overrides'] is Map
+          ? Map<String, dynamic>.from(order['proof_overrides'] as Map)
+          : const <String, dynamic>{};
+      activeStops.add(
+        ActiveRouteStop(
+          stopId: stopId,
+          orderId: orderId,
+          sequence: _asInt(stop['sequence']) ?? 0,
+          status: stop['status']?.toString() ?? 'planned',
+          orderStatus: order['status']?.toString() ?? '',
+          isManual: _asBool(stop['is_manual'], fallback: false),
+          plannedEta: DateTime.tryParse(stop['planned_eta']?.toString() ?? ''),
+          orderNumber: order['order_number']?.toString() ?? '#$orderId',
+          customerName: order['customer_name']?.toString() ?? 'Cliente',
+          customerPhone: order['customer_phone']?.toString() ?? '',
+          fullAddress: _fullAddress(order),
+          latitude: _asDouble(order['lat']),
+          longitude: _asDouble(order['lon']),
+          units: _asInt(order['units']) ?? 0,
+          weightGrams: _asInt(order['weight']) ?? 0,
+          contents: _parseContents(order['items']),
+          proofOverrides: overrides,
+          policy: CompletionPolicy.fromConfiguration(
+            deliveryConfig,
+            overrides: overrides,
+          ),
+          existingProofId: proofId,
+          existingPhotoCount: proofId == null ? 0 : photoCounts[proofId] ?? 0,
+          hasSignature: (proof?['signature_file']?.toString() ?? '').isNotEmpty,
+          existingRecipientName: proof?['recipient_name']?.toString() ?? '',
+          existingRecipientDocument:
+              proof?['recipient_document']?.toString() ?? '',
+          existingNotes: proof?['notes']?.toString() ?? '',
+          confirmationLocation: ConfirmationLocationPolicy.fromConfiguration(
+            deliveryConfig,
+          ),
+        ),
+      );
+    }
+    activeStops.sort((a, b) => a.sequence.compareTo(b.sequence));
+    final path = _parsePath(route['path_geometry']);
+    final deliveryWaypoints = _parseDeliveryWaypoints(
+      route['planned_waypoints'],
+    );
+    final plannedWarehouse = parseWarehouseWaypoint(route['planned_waypoints']);
+    final firstOrder = activeStops.isEmpty
+        ? null
+        : orders[activeStops.first.orderId];
+    final orderWarehouse = firstOrder?['warehouse'];
+    final embeddedWarehouse = _asMap(orderWarehouse);
+    final warehouseId = orderWarehouse is Map
+        ? _asInt(orderWarehouse['id'])
+        : _asInt(orderWarehouse);
+    final warehouseData = warehouses[warehouseId] ?? embeddedWarehouse;
+    final warehouseCoordinate = _parseCoordinate(warehouseData);
+
+    return ActiveRoute(
+      routeId: _asInt(route['id']) ?? routeId,
+      waveId: _asInt(route['wave']) ?? 0,
+      routeNumber: route['route_number']?.toString() ?? 'Rota #$routeId',
+      status: route['status']?.toString() ?? '',
+      path: path,
+      deliveryWaypoints: deliveryWaypoints,
+      warehouse:
+          plannedWarehouse ??
+          (warehouseCoordinate == null
+              ? null
+              : RoutePlace(
+                  name: warehouseData['name']?.toString() ?? 'Armazém',
+                  coordinate: warehouseCoordinate,
+                )),
+      stops: activeStops,
+    );
   }
 
   Future<OfflineMutationResult<void>> arrive(int stopId) =>
@@ -1407,6 +1443,57 @@ bool? _asNullableBool(dynamic value) => switch (value) {
   num number => number != 0,
   _ => null,
 };
+
+/// Respostas cruas que formam uma rota: o que é gravado em disco e remontado
+/// por `_buildRoute` sem rede.
+class _RouteBundle {
+  const _RouteBundle({
+    required this.route,
+    required this.deliveryConfig,
+    required this.stops,
+    required this.orders,
+    required this.warehouses,
+    required this.proofs,
+    required this.photos,
+  });
+
+  factory _RouteBundle.fromJson(Map<String, dynamic> json) {
+    List<Map<String, dynamic>> list(String key) => [
+      for (final item in json[key] is List ? json[key] as List : const [])
+        if (item is Map) Map<String, dynamic>.from(item),
+    ];
+    Map<String, dynamic> map(String key) => json[key] is Map
+        ? Map<String, dynamic>.from(json[key] as Map)
+        : <String, dynamic>{};
+    return _RouteBundle(
+      route: map('route'),
+      deliveryConfig: map('delivery_config'),
+      stops: list('stops'),
+      orders: list('orders'),
+      warehouses: list('warehouses'),
+      proofs: list('proofs'),
+      photos: list('photos'),
+    );
+  }
+
+  final Map<String, dynamic> route;
+  final Map<String, dynamic> deliveryConfig;
+  final List<Map<String, dynamic>> stops;
+  final List<Map<String, dynamic>> orders;
+  final List<Map<String, dynamic>> warehouses;
+  final List<Map<String, dynamic>> proofs;
+  final List<Map<String, dynamic>> photos;
+
+  Map<String, dynamic> toJson() => {
+    'route': route,
+    'delivery_config': deliveryConfig,
+    'stops': stops,
+    'orders': orders,
+    'warehouses': warehouses,
+    'proofs': proofs,
+    'photos': photos,
+  };
+}
 
 class _RouteNetworkFailure implements Exception {
   const _RouteNetworkFailure(this.exception);

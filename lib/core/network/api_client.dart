@@ -64,8 +64,48 @@ class ApiClient {
         },
       ),
     );
+    dio.interceptors.add(
+      InterceptorsWrapper(
+        onError: (error, handler) async {
+          final request = error.requestOptions;
+          final attempt = (request.extra[_readRetryKey] as int?) ?? 0;
+          if (!_isRetryableRead(request) ||
+              attempt >= readRetryDelays.length ||
+              !OfflineRequestQueue.isNetworkFailure(error)) {
+            handler.next(error);
+            return;
+          }
+          // Leitura é idempotente: no 4G uma oscilação curta ou um 502 do
+          // proxy derrubava a tela inteira (o mapa faz ~8 GETs ao abrir e
+          // bastava um falhar). Repete com espera crescente antes de desistir.
+          await Future<void>.delayed(readRetryDelays[attempt]);
+          request.extra[_readRetryKey] = attempt + 1;
+          try {
+            handler.resolve(await dio.fetch<dynamic>(request));
+          } on DioException catch (retryError) {
+            handler.next(retryError);
+          }
+        },
+      ),
+    );
     offlineRequests = OfflineRequestQueue(dio, storage);
   }
+
+  static const _readRetryKey = 'readRetryAttempt';
+
+  /// Marque `extra[ApiClient.noReadRetry] = true` em sondas que precisam
+  /// falhar rápido (ex.: teste de alcance da fila offline).
+  static const noReadRetry = 'noReadRetry';
+
+  /// Espera antes de cada nova tentativa de leitura.
+  List<Duration> readRetryDelays = const [
+    Duration(milliseconds: 800),
+    Duration(seconds: 2),
+  ];
+
+  static bool _isRetryableRead(RequestOptions request) =>
+      (request.method == 'GET' || request.method == 'HEAD') &&
+      request.extra[noReadRetry] != true;
 
   Future<String?>? _refreshOperation;
   Future<void> Function()? onSessionRenewed;

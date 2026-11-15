@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
@@ -6,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:star_tracker/core/network/api_client.dart';
 import 'package:star_tracker/core/storage/session_storage.dart';
 import 'package:star_tracker/features/waves/data/active_route_service.dart';
+import 'package:star_tracker/features/waves/data/route_snapshot_store.dart';
 import 'package:star_tracker/features/auth/data/delivery_configuration.dart';
 
 void main() {
@@ -174,6 +176,39 @@ void main() {
       expect(adapter.proofPatches, 1);
       expect(adapter.photoSequences, ['1', '2']);
       expect(adapter.completions, 1);
+    },
+  );
+
+  test(
+    'mapa abre da copia em disco sem rede depois de o app reabrir',
+    () async {
+      final directory = await Directory.systemTemp.createTemp('route_snap');
+      addTearDown(() => directory.delete(recursive: true));
+      ActiveRouteService service(HttpClientAdapter adapter) {
+        final client = ApiClient(
+          baseUrl: 'https://api.example.test',
+          storage: const _EmptyStorage(),
+        )..readRetryDelays = const [];
+        client.dio.httpClientAdapter = adapter;
+        return ActiveRouteService(
+          client,
+          storage: const _EmptyStorage(),
+          snapshotStore: RouteSnapshotStore(
+            baseDirectory: () async => directory,
+          ),
+        );
+      }
+
+      final online = await service(_OnlineRouteAdapter()).getRoute(20);
+      expect(online.stops.single.stopId, 30);
+      // A gravação em disco é assíncrona; espera ela terminar.
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+
+      // Novo serviço = app reaberto pelo sistema, memória vazia, sem rede.
+      final restored = await service(_OfflineAdapter()).getRoute(20);
+
+      expect(restored.routeNumber, 'Rota 20');
+      expect(restored.stops.single.stopId, 30);
     },
   );
 }
@@ -368,6 +403,70 @@ class _FlakyCompletionAdapter implements HttpClientAdapter {
       },
     );
   }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+class _OnlineRouteAdapter implements HttpClientAdapter {
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final data = switch (options.path) {
+      '/api/v1/delivery/rotas/20/' => {
+        'id': 20,
+        'wave': 10,
+        'route_number': 'Rota 20',
+        'status': 'started',
+        'path_geometry': <dynamic>[],
+        'planned_waypoints': <dynamic>[],
+      },
+      '/api/v1/delivery/paradas/' => {
+        'results': [
+          {
+            'id': 30,
+            'route': 20,
+            'order': 81,
+            'sequence': 1,
+            'status': 'planned',
+          },
+        ],
+        'next': null,
+      },
+      '/api/v1/delivery/pedidos/' => {
+        'results': [
+          {'id': 81, 'order_number': 'PED-81', 'status': 'out_for_delivery'},
+        ],
+        'next': null,
+      },
+      _ => {'results': <dynamic>[], 'next': null},
+    };
+    return ResponseBody.fromString(
+      jsonEncode(data),
+      200,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+class _OfflineAdapter implements HttpClientAdapter {
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async => throw DioException.connectionError(
+    requestOptions: options,
+    reason: 'Failed host lookup',
+  );
 
   @override
   void close({bool force = false}) {}

@@ -398,7 +398,11 @@ class OfflineRequestQueue {
     try {
       await _dio.get<dynamic>(
         '/api/v1/',
-        options: Options(validateStatus: (status) => status != null),
+        options: Options(
+          validateStatus: (status) => status != null,
+          // A sonda decide rápido se vale drenar a fila; sem repetição.
+          extra: const {'noReadRetry': true},
+        ),
       );
       return true;
     } on DioException catch (error) {
