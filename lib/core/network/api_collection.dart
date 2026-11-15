@@ -31,6 +31,54 @@ extension ApiCollection on ApiClient {
   }
 }
 
+extension RecentApiCollection on ApiClient {
+  /// Registros mais novos primeiro (`ordering=-id`), até [maximumItems].
+  ///
+  /// Ler o histórico inteiro deixava a tela de cargas mais lenta a cada mês
+  /// (uma ida e volta no 4G por página de 100). Servidor que ainda não
+  /// ordene devolve ids crescentes: nesse caso lê tudo, como antes, para não
+  /// esconder justamente os registros de hoje.
+  Future<List<Map<String, dynamic>>> getRecentPages(
+    String path, {
+    Map<String, dynamic>? queryParameters,
+    Options? options,
+    int maximumItems = 200,
+    int pageSize = 100,
+  }) async {
+    final items = <Map<String, dynamic>>[];
+    var newestFirst = true;
+    for (var page = 1; page <= 100; page++) {
+      final response = await dio.get<dynamic>(
+        path,
+        queryParameters: {
+          ...?queryParameters,
+          'ordering': '-id',
+          'page': page,
+          'page_size': pageSize,
+        },
+        options: options,
+      );
+      final pageItems = collectionItems(response.data);
+      if (page == 1 && pageItems.length > 1) {
+        final first = _id(pageItems.first);
+        final last = _id(pageItems.last);
+        newestFirst = first == null || last == null || first > last;
+      }
+      items.addAll(pageItems);
+      final data = response.data;
+      if (data is! Map || data['next'] == null) break;
+      if (newestFirst && items.length >= maximumItems) break;
+    }
+    return items;
+  }
+
+  static int? _id(Map<String, dynamic> item) => switch (item['id']) {
+    int value => value,
+    String value => int.tryParse(value),
+    _ => null,
+  };
+}
+
 List<Map<String, dynamic>> collectionItems(dynamic data) {
   final rawItems = data is Map ? data['results'] : data;
   if (rawItems is! List) return const [];

@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:star_tracker/core/network/api_client.dart';
+import 'package:star_tracker/core/network/api_collection.dart';
 import 'package:star_tracker/core/storage/session_storage.dart';
 
 void main() {
@@ -50,6 +51,83 @@ void main() {
     );
     expect(writeAdapter.calls, 1);
   });
+
+  group('getRecentPages', () {
+    ApiClient pagedClient(_PagedAdapter adapter) {
+      final api = ApiClient(
+        baseUrl: 'https://api.example.test',
+        storage: const _NoTokenStorage(),
+      )..readRetryDelays = const [];
+      api.dio.httpClientAdapter = adapter;
+      return api;
+    }
+
+    test('para nas mais recentes quando o servidor ordena', () async {
+      final adapter = _PagedAdapter(descending: true);
+
+      final items = await pagedClient(
+        adapter,
+      ).getRecentPages('/api/v1/x/', maximumItems: 4, pageSize: 2);
+
+      expect(adapter.pages, [1, 2]);
+      expect(adapter.orderings, everyElement('-id'));
+      expect(items.map((item) => item['id']), [10, 9, 8, 7]);
+    });
+
+    test(
+      'servidor antigo (ids crescentes) le tudo para nao perder os novos',
+      () async {
+        final adapter = _PagedAdapter(descending: false);
+
+        final items = await pagedClient(
+          adapter,
+        ).getRecentPages('/api/v1/x/', maximumItems: 4, pageSize: 2);
+
+        expect(adapter.pages, [1, 2, 3, 4, 5]);
+        expect(items.length, 10);
+      },
+    );
+  });
+}
+
+/// Dez registros (ids 1..10) paginados pelo `page_size` pedido.
+class _PagedAdapter implements HttpClientAdapter {
+  _PagedAdapter({required this.descending});
+
+  final bool descending;
+  final List<int> pages = [];
+  final List<String?> orderings = [];
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final page = options.queryParameters['page'] as int;
+    final size = options.queryParameters['page_size'] as int;
+    pages.add(page);
+    orderings.add(options.queryParameters['ordering']?.toString());
+    final ids = [for (var id = 1; id <= 10; id++) id];
+    final ordered = descending ? ids.reversed.toList() : ids;
+    final start = (page - 1) * size;
+    final slice = ordered.skip(start).take(size).toList();
+    return ResponseBody.fromString(
+      jsonEncode({
+        'results': [
+          for (final id in slice) {'id': id},
+        ],
+        'next': start + size < ordered.length ? 'more' : null,
+      }),
+      200,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
 }
 
 class _NoTokenStorage extends SessionStorage {

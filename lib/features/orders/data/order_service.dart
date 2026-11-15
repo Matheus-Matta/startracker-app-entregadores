@@ -311,7 +311,13 @@ class OrderService {
   ) async {
     final response = await apiClient.dio.get<dynamic>(
       '/api/v1/delivery/pedidos/',
-      queryParameters: {'page': page, 'status': ?_nonEmpty(status)},
+      // Mais novos primeiro: sem isso a página 1 trazia os pedidos mais
+      // antigos da conta. Servidor antigo ignora o parâmetro.
+      queryParameters: {
+        'page': page,
+        'ordering': '-id',
+        'status': ?_nonEmpty(status),
+      },
     );
     final data = response.data;
     final items = _parseItems(collectionItems(data));

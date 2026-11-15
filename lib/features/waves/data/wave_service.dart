@@ -336,8 +336,10 @@ class WaveService {
   }
 
   Future<_WaveListSnapshot> _loadListSnapshot() async {
+    // Só as mais recentes: a tela pagina localmente de 20 em 20 e o
+    // histórico inteiro crescia uma página (uma ida e volta) a cada 100.
     final results = await Future.wait([
-      _getAll('/api/v1/delivery/rotas/'),
+      apiClient.getRecentPages('/api/v1/delivery/rotas/'),
       _getWavesAllowed(),
     ]);
     return _WaveListSnapshot(DateTime.now(), results[0], results[1]);
@@ -345,7 +347,7 @@ class WaveService {
 
   Future<List<Map<String, dynamic>>> _getWavesAllowed() async {
     try {
-      return await _getAll('/api/v1/delivery/waves/');
+      return await apiClient.getRecentPages('/api/v1/delivery/waves/');
     } on DioException catch (error) {
       if (error.response?.statusCode == 403 ||
           error.response?.statusCode == 404) {

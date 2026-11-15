@@ -465,6 +465,14 @@ class ActiveRouteService {
     return route == null ? null : _withPendingStatuses(route);
   }
 
+  /// Igual a [cachedRoute], mas também procura a cópia em disco (app reaberto
+  /// pelo sistema). Permite desenhar o mapa antes da rede responder.
+  Future<ActiveRoute?> storedRoute(int routeId) async {
+    final route =
+        _routeSnapshots[routeId] ?? await _restoreRouteSnapshot(routeId);
+    return route == null ? null : _withPendingStatuses(route);
+  }
+
   void _onOfflineQueueEvent(OfflineQueueEvent event) {
     if (event.type == OfflineQueueEventType.queued ||
         event.type == OfflineQueueEventType.exhausted) {
@@ -559,7 +567,39 @@ class ActiveRouteService {
     }();
   }
 
-  Future<String> getMapStyle() => _mapStyleOperation ??= _loadMapStyle();
+  Future<String> getMapStyle() => _mapStyleOperation ??= _resolveMapStyle();
+
+  /// Usa o estilo salvo (instantâneo) e confere a configuração em segundo
+  /// plano; a mudança, se houver, vale na próxima abertura do mapa. Assim o
+  /// mapa é criado uma única vez, sem baixar tiles de um estilo descartado.
+  Future<String> _resolveMapStyle() async {
+    String? stored;
+    try {
+      stored = await storage.readMapStyle();
+    } catch (_) {}
+    if (stored != null) {
+      unawaited(
+        _loadMapStyle()
+            .then((fresh) async {
+              if (fresh != null && fresh != stored) {
+                await storage.saveMapStyle(fresh);
+              }
+            })
+            .catchError((Object _) {}),
+      );
+      return stored;
+    }
+    final fresh = await _loadMapStyle();
+    if (fresh == null) {
+      // Sem rede: o mapa gratuito funciona, e a próxima abertura tenta de novo.
+      _mapStyleOperation = null;
+      return openFreeMapStyle;
+    }
+    try {
+      await storage.saveMapStyle(fresh);
+    } catch (_) {}
+    return fresh;
+  }
 
   /// Monta o estilo do mapa com uma única fonte de tiles.
   ///
@@ -570,7 +610,8 @@ class ActiveRouteService {
   ///   `@2x` (um quarto dos pixels);
   /// * sem Mapbox: o estilo vetorial do OpenFreeMap, carregado direto pelo
   ///   MapLibre (que mantém cache em disco).
-  Future<String> _loadMapStyle() async {
+  /// `null` quando a configuração não pôde ser consultada.
+  Future<String?> _loadMapStyle() async {
     try {
       final configResponse = await apiClient.dio.get<dynamic>(
         '/api/v1/mapbox/',
@@ -609,9 +650,7 @@ class ActiveRouteService {
         ],
       });
     } catch (_) {
-      // Sem a configuração, o mapa vetorial gratuito continua funcionando.
-      _mapStyleOperation = null;
-      return openFreeMapStyle;
+      return null;
     }
   }
 
@@ -670,60 +709,98 @@ class ActiveRouteService {
     }
   }
 
+  /// Carga da rota em uma única rodada de requisições paralelas.
+  ///
+  /// No 4G cada ida e volta custa de 300 ms a vários segundos; antes eram
+  /// quatro rodadas em sequência (rota → paradas/pedidos → comprovantes →
+  /// fotos) a cada atualização do mapa.
   Future<_RouteBundle> _fetchRouteBundle(int routeId) async {
     try {
       final refreshToken = DateTime.now().microsecondsSinceEpoch;
-      // A rota é consultada primeiro porque seu wave_id limita a carga de
-      // pedidos abaixo. Antes, cada atualização do mapa baixava todos os
-      // pedidos da conta.
-      final routeResponse = await apiClient.dio.get<dynamic>(
-        '/api/v1/delivery/rotas/$routeId/',
-        queryParameters: {'_map_refresh': refreshToken},
-        options: Options(
-          headers: const {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'},
-        ),
+      Future<List<Map<String, dynamic>>> orders(int? waveId) => _getAll(
+        '/api/v1/delivery/pedidos/',
+        // O wave limita os pedidos aos desta carga; sem ele viria o
+        // histórico inteiro do entregador.
+        queryParameters: {'wave': ?waveId, '_map_refresh': refreshToken},
+        noCache: true,
       );
-      final route = _asMap(routeResponse.data);
-      final waveId = _asInt(route['wave']);
+      // A carga (wave) de uma rota praticamente nunca muda: com a cópia
+      // anterior, os pedidos vão junto na mesma rodada da rota.
+      final knownWaveId =
+          (_routeSnapshots[routeId] ?? await _restoreRouteSnapshot(routeId))
+              ?.waveId;
+      final speculativeWave = knownWaveId != null && knownWaveId > 0
+          ? knownWaveId
+          : null;
       final results = await Future.wait<dynamic>([
+        apiClient.dio.get<dynamic>(
+          '/api/v1/delivery/rotas/$routeId/',
+          queryParameters: {'_map_refresh': refreshToken},
+          options: Options(
+            headers: const {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'},
+          ),
+        ),
         _deliveryConfiguration(),
         _getAll(
           '/api/v1/delivery/paradas/',
           queryParameters: {'route': routeId, '_map_refresh': refreshToken},
           noCache: true,
         ),
-        _getAll(
-          '/api/v1/delivery/pedidos/',
-          queryParameters: {'wave': ?waveId, '_map_refresh': refreshToken},
-          noCache: true,
-        ),
         _warehouses(),
+        if (speculativeWave != null) orders(speculativeWave),
       ]);
-      final deliveryConfig = results[0] as Map<String, dynamic>;
-      final stops = (results[1] as List<Map<String, dynamic>>)
+      final route = _asMap((results[0] as Response<dynamic>).data);
+      final waveId = _asInt(route['wave']);
+      final orderItems = speculativeWave != null && speculativeWave == waveId
+          ? results[4] as List<Map<String, dynamic>>
+          : await orders(waveId);
+      final deliveryConfig = results[1] as Map<String, dynamic>;
+      final stops = (results[2] as List<Map<String, dynamic>>)
           .where(
             (item) =>
                 _asInt(item['route']) == routeId &&
                 item['status']?.toString() != 'cancelled',
           )
           .toList();
-      // Antes, comprovantes e fotos vinham sem filtro: o histórico inteiro do
-      // entregador a cada atualização do mapa. Agora só os desta rota.
-      final proofItems = await _getAllByIds(
-        '/api/v1/delivery/comprovantes/',
-        'route_stop',
-        [for (final stop in stops) ?_asInt(stop['id'])],
-      );
+      // A parada já traz o comprovante embutido; a consulta separada só fica
+      // para servidor antigo que não o envie.
+      final proofItems = stops.every((stop) => stop.containsKey('proof'))
+          ? [
+              for (final stop in stops)
+                if (stop['proof'] is Map)
+                  {
+                    ...Map<String, dynamic>.from(stop['proof'] as Map),
+                    'route_stop': stop['id'],
+                  },
+            ]
+          : await _getAllByIds('/api/v1/delivery/comprovantes/', 'route_stop', [
+              for (final stop in stops) ?_asInt(stop['id']),
+            ]);
+      // A contagem de fotos só serve para continuar uma baixa que ficou pela
+      // metade; parada concluída não precisa dela. No caso comum, nenhuma
+      // requisição.
+      final finishedStops = {
+        for (final stop in stops)
+          if (const {
+            'completed',
+            'cancelled',
+          }.contains(stop['status']?.toString()))
+            ?_asInt(stop['id']),
+      };
       final photoItems = await _getAllByIds(
         '/api/v1/delivery/fotos-comprovante/',
         'delivery_proof',
-        [for (final proof in proofItems) ?_asInt(proof['id'])],
+        [
+          for (final proof in proofItems)
+            if (!finishedStops.contains(_asInt(proof['route_stop'])))
+              ?_asInt(proof['id']),
+        ],
       );
       return _RouteBundle(
         route: route,
         deliveryConfig: deliveryConfig,
         stops: stops,
-        orders: results[2] as List<Map<String, dynamic>>,
+        orders: orderItems,
         warehouses: results[3] as List<Map<String, dynamic>>,
         proofs: proofItems,
         photos: photoItems,

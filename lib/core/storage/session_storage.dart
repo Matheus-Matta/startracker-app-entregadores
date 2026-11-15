@@ -16,6 +16,7 @@ class SessionStorage {
   static const _orderUpdateNotificationsKey = 'notification_order_updates';
   static const _pendingDeliveryCaptureKey = 'pending_delivery_capture';
   static const _openActiveRouteKey = 'open_active_route';
+  static const _mapStyleKey = 'map_style';
   static String? _cachedAccessToken;
   static String? _cachedRefreshToken;
   static bool _accessTokenLoaded = false;
@@ -150,6 +151,17 @@ class SessionStorage {
 
   Future<void> clearOpenActiveRoute() =>
       _storage.delete(key: _openActiveRouteKey);
+
+  /// Último estilo de mapa resolvido. Sem ele o mapa abria com um estilo e
+  /// trocava para outro quando a configuração chegava, baixando os tiles
+  /// duas vezes no 4G.
+  Future<void> saveMapStyle(String style) =>
+      _storage.write(key: _mapStyleKey, value: style);
+
+  Future<String?> readMapStyle() async {
+    final value = await _storage.read(key: _mapStyleKey);
+    return value == null || value.isEmpty ? null : value;
+  }
 
   Future<NotificationPreferences> readNotificationPreferences() async {
     final values = await Future.wait([

@@ -39,7 +39,9 @@ class _ActiveWavePageState extends State<ActiveWavePage>
   final _mapKey = GlobalKey<_ActiveRouteMapState>();
   ActiveRoute? _route;
   PickupProgress? _pickupProgress;
-  String _mapStyle = ActiveRouteService.openFreeMapStyle;
+  // Nulo até o estilo ser resolvido: criar o mapa com um estilo e trocar
+  // depois recriava o MapLibre e baixava os tiles duas vezes.
+  String? _mapStyle;
   // A posição muda a cada ~10 m. Fica num notifier para reconstruir só o
   // mapa e o painel, não a tela inteira (pesado em aparelhos antigos).
   final ValueNotifier<Position?> _positionNotifier = ValueNotifier(null);
@@ -76,6 +78,8 @@ class _ActiveWavePageState extends State<ActiveWavePage>
     if (cached != null) {
       _route = cached;
       _loading = false;
+    } else {
+      unawaited(_showStoredRoute());
     }
     // Se o sistema encerrar o app, ele reabre direto no mapa desta carga.
     unawaited(dependencies.storage.saveOpenActiveRoute(widget.routeId));
@@ -121,6 +125,27 @@ class _ActiveWavePageState extends State<ActiveWavePage>
     }
   }
 
+  /// App reaberto pelo sistema: mostra a cópia em disco enquanto a rede
+  /// responde, em vez de deixar o entregador olhando um carregamento no 4G.
+  Future<void> _showStoredRoute() async {
+    final stored = await _service.storedRoute(widget.routeId);
+    if (stored == null || !mounted || _route != null) return;
+    setState(() {
+      _route = stored;
+      _loading = false;
+    });
+  }
+
+  /// `null` quando a consulta falha: a tela usa a estimativa local. Nunca
+  /// lança, porque pode ficar sem ser aguardada se a rota falhar.
+  Future<PickupProgress?> _fetchPickup(int waveId) async {
+    try {
+      return await _waveService.getPickupProgress(waveId);
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<void> _loadRoute({int? postponedStopId}) async {
     if (_routeRequestRunning) {
       _routeReloadPending = true;
@@ -128,6 +153,12 @@ class _ActiveWavePageState extends State<ActiveWavePage>
       return;
     }
     _routeRequestRunning = true;
+    // O progresso da retirada vai na mesma rodada da rota quando a carga já
+    // é conhecida: uma ida e volta a menos no 4G.
+    final knownWaveId = _route?.waveId;
+    final earlyPickup = knownWaveId != null && knownWaveId > 0
+        ? _fetchPickup(knownWaveId)
+        : null;
     try {
       var route = await _service.getRoute(widget.routeId);
       final pendingStops = route.stops.where((stop) => !stop.isTerminal).length;
@@ -140,10 +171,13 @@ class _ActiveWavePageState extends State<ActiveWavePage>
         await Future<void>.delayed(const Duration(milliseconds: 250));
         route = await _service.getRoute(widget.routeId);
       }
-      PickupProgress pickup;
-      try {
-        pickup = await _waveService.getPickupProgress(route.waveId);
-      } on WaveServiceException {
+      final fetched = earlyPickup != null && route.waveId == knownWaveId
+          ? await earlyPickup
+          : await _fetchPickup(route.waveId);
+      final PickupProgress pickup;
+      if (fetched != null) {
+        pickup = fetched;
+      } else {
         final pendingTransferred = route.stops
             .where((stop) => stop.orderStatus == 'awaiting_pickup')
             .length;
@@ -227,7 +261,10 @@ class _ActiveWavePageState extends State<ActiveWavePage>
   }
 
   Future<void> _loadMapStyle() async {
-    final style = await _service.getMapStyle();
+    final style = await _service.getMapStyle().timeout(
+      const Duration(seconds: 4),
+      onTimeout: () => ActiveRouteService.openFreeMapStyle,
+    );
     if (mounted && style != _mapStyle) setState(() => _mapStyle = style);
   }
 
@@ -542,7 +579,7 @@ class _ActiveWavePageState extends State<ActiveWavePage>
       body: Stack(
         fit: StackFit.expand,
         children: [
-          if (_mapSuspended)
+          if (_mapSuspended || _mapStyle == null)
             const ColoredBox(color: _cream)
           else
             ValueListenableBuilder<Position?>(
@@ -552,7 +589,7 @@ class _ActiveWavePageState extends State<ActiveWavePage>
                 route: route,
                 stop: stop,
                 position: position,
-                style: _mapStyle,
+                style: _mapStyle!,
               ),
             ),
           SafeArea(
