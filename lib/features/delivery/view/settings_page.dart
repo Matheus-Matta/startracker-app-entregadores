@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../../../app/app_dependencies.dart';
 import '../../../core/notifications/app_notification_manager.dart';
+import '../../../core/presentation/failure_log_panel.dart';
 import '../../../core/notifications/notification_preferences.dart';
 import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../../auth/data/profile_service.dart';
@@ -311,6 +312,8 @@ class _SettingsPageState extends State<SettingsPage> {
             ],
           ),
         ),
+        const SizedBox(height: 14),
+        const _Panel(child: FailureLogPanel()),
         const SizedBox(height: 14),
         OutlinedButton.icon(
           onPressed: _logout,

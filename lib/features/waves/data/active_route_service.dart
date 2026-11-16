@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:dio/dio.dart';
 
 import '../../../core/network/api_collection.dart';
+import '../../../core/network/api_failure.dart';
 import '../../../core/network/api_client.dart';
 import '../../../core/network/offline_request_queue.dart';
 import '../../../core/storage/session_storage.dart';
@@ -399,6 +400,9 @@ class ActiveRouteException implements Exception {
   const ActiveRouteException(this.message, {this.statusCode});
   final String message;
   final int? statusCode;
+
+  @override
+  String toString() => message;
 }
 
 class ActiveRouteService {
@@ -844,11 +848,20 @@ class ActiveRouteService {
     }
 
     final activeStops = <ActiveRouteStop>[];
+    final seenStops = <int>{};
     for (final stop in stops) {
       final stopId = _asInt(stop['id']);
       final orderId = _asInt(stop['order']);
-      if (stopId == null || orderId == null) continue;
+      // Parada sem id/pedido não tem como receber baixa; repetida (página
+      // que mudou durante a leitura) desenharia dois pinos para a mesma.
+      if (stopId == null || orderId == null || !seenStops.add(stopId)) {
+        continue;
+      }
       final order = orders[orderId] ?? const <String, dynamic>{};
+      final orderCoordinate = validCoordinate(
+        _asDouble(order['lat']),
+        _asDouble(order['lon']),
+      );
       final proof = proofs[stopId];
       final proofId = _asInt(proof?['id']);
       final overrides = order['proof_overrides'] is Map
@@ -867,8 +880,8 @@ class ActiveRouteService {
           customerName: order['customer_name']?.toString() ?? 'Cliente',
           customerPhone: order['customer_phone']?.toString() ?? '',
           fullAddress: _fullAddress(order),
-          latitude: _asDouble(order['lat']),
-          longitude: _asDouble(order['lon']),
+          latitude: orderCoordinate?.latitude,
+          longitude: orderCoordinate?.longitude,
           units: _asInt(order['units']) ?? 0,
           weightGrams: _asInt(order['weight']) ?? 0,
           contents: _parseContents(order['items']),
@@ -1111,6 +1124,7 @@ class ActiveRouteService {
         options: apiClient.offlineRequests.requestOptions(
           idempotencyKey,
           step: 'proof',
+          stage: 'Enviar comprovante',
           upload: true,
         ),
       );
@@ -1122,20 +1136,22 @@ class ActiveRouteService {
         options: apiClient.offlineRequests.requestOptions(
           idempotencyKey,
           step: 'proof',
+          stage: 'Enviar comprovante',
           upload: true,
         ),
       );
       final createdId = _asInt(_asMap(response.data)['id']);
       if (createdId == null) {
-        throw const ActiveRouteException(
-          'O servidor não retornou o comprovante criado.',
-        );
+        // O comprovante pode ter sido gravado: fica na fila e o reenvio
+        // retoma pelo estado do servidor, em vez de descartar a baixa.
+        throw _invalidResponse(response, 'comprovante criado sem "id"');
       }
       proofId = createdId;
     }
 
     var sequence = plan.photoSequenceStart;
     final uploadedSequences = resume?.photoSequences ?? const <int>{};
+    final photoTotal = plan.photoFilenames.length;
     for (final (index, filename) in plan.photoFilenames.indexed) {
       final bytes = files[_CompletionPlan.photoFile(index)];
       if (bytes == null) continue;
@@ -1153,6 +1169,7 @@ class ActiveRouteService {
         options: apiClient.offlineRequests.requestOptions(
           idempotencyKey,
           step: 'photo-$index',
+          stage: 'Enviar foto ${index + 1} de $photoTotal',
           upload: true,
         ),
       );
@@ -1162,11 +1179,28 @@ class ActiveRouteService {
       plan.endpoint,
       data: plan.completionData.isEmpty ? null : plan.completionData,
       options: apiClient.offlineRequests
-          .requestOptions(idempotencyKey, step: 'complete')
+          .requestOptions(
+            idempotencyKey,
+            step: 'complete',
+            stage: 'Confirmar entrega',
+          )
           .copyWith(method: plan.method),
     );
+    if (response.data != null && response.data is! Map) {
+      throw _invalidResponse(response, 'confirmação sem objeto JSON');
+    }
     return DeliveryAuditResult.fromResponse(response.data);
   }
+
+  static DioException _invalidResponse(
+    Response<dynamic> response,
+    String reason,
+  ) => DioException(
+    requestOptions: response.requestOptions,
+    response: response,
+    type: DioExceptionType.badResponse,
+    error: UnexpectedResponseFormat(reason),
+  );
 
   /// O que já foi gravado no servidor para esta parada.
   ///
@@ -1177,6 +1211,7 @@ class ActiveRouteService {
       '/api/v1/delivery/paradas/$stopId/',
       options: Options(
         headers: const {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'},
+        extra: const {ApiFailure.stageKey: 'Verificar envio anterior'},
       ),
     );
     final data = _asMap(response.data);
@@ -1388,9 +1423,11 @@ class ActiveRouteService {
     final result = <RouteCoordinate>[];
     for (final coordinate in value['coordinates'] as List) {
       if (coordinate is! List || coordinate.length < 2) continue;
-      final lon = _asDouble(coordinate[0]);
-      final lat = _asDouble(coordinate[1]);
-      if (lat != null && lon != null) result.add(RouteCoordinate(lat, lon));
+      final point = validCoordinate(
+        _asDouble(coordinate[1]),
+        _asDouble(coordinate[0]),
+      );
+      if (point != null) result.add(point);
     }
     return result;
   }
@@ -1406,11 +1443,11 @@ class ActiveRouteService {
       if (orderId == null || location is! List || location.length < 2) {
         continue;
       }
-      final longitude = _asDouble(location[0]);
-      final latitude = _asDouble(location[1]);
-      if (latitude != null && longitude != null) {
-        result[orderId] = RouteCoordinate(latitude, longitude);
-      }
+      final point = validCoordinate(
+        _asDouble(location[1]),
+        _asDouble(location[0]),
+      );
+      if (point != null) result[orderId] = point;
     }
     return result;
   }
@@ -1439,19 +1476,31 @@ class ActiveRouteService {
       rawLocation = rawLocation['coordinates'];
     }
     if (rawLocation is List && rawLocation.length >= 2) {
-      final longitude = _asDouble(rawLocation[0]);
-      final latitude = _asDouble(rawLocation[1]);
-      if (latitude != null && longitude != null) {
-        return RouteCoordinate(latitude, longitude);
-      }
+      final point = validCoordinate(
+        _asDouble(rawLocation[1]),
+        _asDouble(rawLocation[0]),
+      );
+      if (point != null) return point;
     }
-    final latitude = _asDouble(data['lat'] ?? data['latitude']);
-    final longitude = _asDouble(
-      data['lon'] ?? data['lng'] ?? data['longitude'],
+    return validCoordinate(
+      _asDouble(data['lat'] ?? data['latitude']),
+      _asDouble(data['lon'] ?? data['lng'] ?? data['longitude']),
     );
-    return latitude == null || longitude == null
-        ? null
-        : RouteCoordinate(latitude, longitude);
+  }
+
+  /// Coordenada que pode ir para o mapa e para a navegação.
+  ///
+  /// "NaN"/"Infinity" passam pelo `double.tryParse`, latitude 999 vem de
+  /// cadastro com campos trocados, e 0,0 é pedido sem geocodificação: o mapa
+  /// enquadrava o Golfo da Guiné junto com a rota, e coordenada não finita
+  /// pode derrubar o MapLibre em aparelho fraco.
+  static RouteCoordinate? validCoordinate(double? latitude, double? longitude) {
+    if (latitude == null || longitude == null) return null;
+    if (!latitude.isFinite || !longitude.isFinite) return null;
+    if (latitude < -90 || latitude > 90) return null;
+    if (longitude < -180 || longitude > 180) return null;
+    if (latitude == 0 && longitude == 0) return null;
+    return RouteCoordinate(latitude, longitude);
   }
 
   static String _fullAddress(Map<String, dynamic> order) => [
@@ -1471,26 +1520,10 @@ class ActiveRouteService {
   static Map<String, dynamic> _asMap(dynamic value) =>
       value is Map ? Map<String, dynamic>.from(value) : <String, dynamic>{};
 
-  static String _errorMessage(DioException error) {
-    final data = error.response?.data;
-    final messages = _validationMessages(data).toSet().take(4).toList();
-    if (messages.isNotEmpty) return messages.join('\n');
-    return 'Não foi possível concluir a operação. Tente novamente.';
-  }
-
-  static Iterable<String> _validationMessages(dynamic value) sync* {
-    if (value is String && value.trim().isNotEmpty) {
-      yield value.trim();
-    } else if (value is Iterable) {
-      for (final item in value) {
-        yield* _validationMessages(item);
-      }
-    } else if (value is Map) {
-      for (final item in value.values) {
-        yield* _validationMessages(item);
-      }
-    }
-  }
+  /// Etapa, motivo, texto do servidor e código de referência — antes toda
+  /// falha sem corpo virava "Não foi possível concluir a operação".
+  static String _errorMessage(DioException error) =>
+      ApiFailure.fromDio(error).userMessage;
 }
 
 bool _asBool(dynamic value, {required bool fallback}) => switch (value) {

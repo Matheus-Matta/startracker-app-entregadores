@@ -1,6 +1,7 @@
 import 'package:dio/dio.dart';
 
 import '../storage/session_storage.dart';
+import 'api_failure.dart';
 import 'offline_request_queue.dart';
 
 class ApiClient {
@@ -34,9 +35,32 @@ class ApiClient {
        ) {
     dio.interceptors.add(
       InterceptorsWrapper(
+        onResponse: (response, handler) {
+          final problem = unexpectedFormat(response);
+          if (problem == null) {
+            handler.next(response);
+            return;
+          }
+          handler.reject(
+            DioException(
+              requestOptions: response.requestOptions,
+              response: response,
+              type: DioExceptionType.badResponse,
+              error: UnexpectedResponseFormat(problem),
+            ),
+            true,
+          );
+        },
+      ),
+    );
+    dio.interceptors.add(
+      InterceptorsWrapper(
         onRequest: (options, handler) async {
           final token = await storage.readToken();
           if (token != null) options.headers['Authorization'] = 'Bearer $token';
+          // Mesmo código no log do servidor e na mensagem de erro do app,
+          // inclusive quando a resposta nunca chega (timeout no 4G).
+          options.headers.putIfAbsent(ApiFailure.requestIdHeader, newRequestId);
           handler.next(options);
         },
         onError: (error, handler) async {
@@ -88,7 +112,45 @@ class ApiClient {
         },
       ),
     );
+    dio.interceptors.add(
+      InterceptorsWrapper(
+        onError: (error, handler) {
+          if (error.type != DioExceptionType.cancel) {
+            failureLog.record(ApiFailure.fromDio(error));
+          }
+          handler.next(error);
+        },
+      ),
+    );
     offlineRequests = OfflineRequestQueue(dio, storage);
+  }
+
+  /// Histórico das últimas falhas (tela de diagnóstico).
+  ApiFailureLog failureLog = ApiFailureLog.instance;
+
+  /// Motivo pelo qual uma resposta 2xx não é o JSON esperado da API, ou
+  /// `null` quando está tudo certo.
+  ///
+  /// No 4G, quando o pacote de dados acaba ou num Wi-Fi com login, a
+  /// operadora responde 200 com uma página HTML no lugar da API. Antes isso
+  /// era aceito: a baixa saía da fila como enviada sem nunca ter chegado ao
+  /// servidor, e a entrega "voltava" depois.
+  static String? unexpectedFormat(Response<dynamic> response) {
+    final request = response.requestOptions;
+    if (request.responseType != ResponseType.json) return null;
+    final status = response.statusCode ?? 0;
+    if (status < 200 || status >= 300 || status == 204) return null;
+    final data = response.data;
+    if (data is Map || data is List || data is num || data is bool) {
+      return null;
+    }
+    final text = data?.toString().trim() ?? '';
+    final read = request.method == 'GET' || request.method == 'HEAD';
+    if (text.isEmpty) return read ? 'resposta vazia' : null;
+    final contentType = response.headers.value(Headers.contentTypeHeader);
+    final preview = text.length > 60 ? '${text.substring(0, 60)}…' : text;
+    return 'corpo não JSON (${contentType ?? 'sem content-type'}): '
+        '${preview.replaceAll(RegExp(r'\s+'), ' ')}';
   }
 
   static const _readRetryKey = 'readRetryAttempt';

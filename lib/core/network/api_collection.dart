@@ -1,6 +1,7 @@
 import 'package:dio/dio.dart';
 
 import 'api_client.dart';
+import 'api_failure.dart';
 
 extension ApiCollection on ApiClient {
   Future<List<Map<String, dynamic>>> getAllPages(
@@ -23,6 +24,7 @@ extension ApiCollection on ApiClient {
         },
         options: options,
       );
+      requirePage(response);
       items.addAll(collectionItems(response.data));
       final data = response.data;
       if (data is! Map || data['next'] == null) break;
@@ -58,6 +60,7 @@ extension RecentApiCollection on ApiClient {
         },
         options: options,
       );
+      requirePage(response);
       final pageItems = collectionItems(response.data);
       if (page == 1 && pageItems.length > 1) {
         final first = _id(pageItems.first);
@@ -86,4 +89,21 @@ List<Map<String, dynamic>> collectionItems(dynamic data) {
       .whereType<Map>()
       .map((item) => Map<String, dynamic>.from(item))
       .toList(growable: false);
+}
+
+/// Uma página da API é uma lista ou `{"results": [...]}`. Qualquer outra
+/// coisa (objeto de erro com 200, HTML) virava uma rota vazia sem aviso:
+/// o entregador via "nenhuma entrega" sem saber que a leitura falhou.
+void requirePage(Response<dynamic> response) {
+  final data = response.data;
+  if (data is List || (data is Map && data['results'] is List)) return;
+  final shape = data is Map
+      ? 'objeto sem "results" (${data.keys.take(4).join(', ')})'
+      : data.runtimeType.toString();
+  throw DioException(
+    requestOptions: response.requestOptions,
+    response: response,
+    type: DioExceptionType.badResponse,
+    error: UnexpectedResponseFormat('página inválida: $shape'),
+  );
 }

@@ -6,6 +6,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
 import '../storage/session_storage.dart';
+import 'api_failure.dart';
 import 'offline_request_store.dart';
 
 export 'offline_request_store.dart' show PersistedOfflineRequest;
@@ -74,6 +75,17 @@ class OfflineQueueStatus {
     exhausted,
     description,
   );
+}
+
+/// Registro da fila que não pôde ser reenviado depois de o app reabrir.
+class OfflineRecordDiscarded implements Exception {
+  const OfflineRecordDiscarded(this.reason);
+  final String reason;
+
+  @override
+  String toString() =>
+      'o registro salvo no aparelho estava danificado ($reason) e não pôde '
+      'ser reenviado. Refaça a operação.';
 }
 
 class OfflineMutationResult<T> {
@@ -146,6 +158,13 @@ class OfflineRequestQueue {
   static bool isNetworkFailure(DioException error) {
     if (error.type == DioExceptionType.cancel) return false;
     final response = error.response;
+    final status = response?.statusCode ?? 0;
+    // Portal da operadora/Wi-Fi ou corpo truncado: a requisição pode não ter
+    // chegado à API. Reenviar com a mesma chave de idempotência é seguro.
+    if (error.error is UnexpectedResponseFormat ||
+        (error.error is FormatException && (status == 0 || status < 300))) {
+      return true;
+    }
     if (response != null) return isTransientResponse(response);
     if (error.type == DioExceptionType.connectionError ||
         error.type == DioExceptionType.connectionTimeout ||
@@ -184,6 +203,22 @@ class OfflineRequestQueue {
       stored = await _store.readAll();
     } catch (_) {
       return;
+    }
+    for (final lost in _store.lastDiscarded) {
+      final failure = ApiFailure(
+        stage: 'Reabrir fila offline',
+        kind: ApiFailureKind.unknown,
+        detail: '${lost.description}: ${lost.reason}',
+      );
+      ApiFailureLog.instance.record(failure);
+      _emit(
+        OfflineQueueEvent(
+          type: OfflineQueueEventType.rejected,
+          resourceKey: lost.resourceKey,
+          description: lost.description,
+          error: OfflineRecordDiscarded(lost.reason),
+        ),
+      );
     }
     final known = _pending.map((item) => item.id).toSet();
     for (final item in stored) {
@@ -275,8 +310,10 @@ class OfflineRequestQueue {
   Options requestOptions(
     String idempotencyKey, {
     String? step,
+    String? stage,
     bool upload = false,
   }) => Options(
+    extra: {ApiFailure.stageKey: ?stage},
     headers: {
       'Idempotency-Key': step == null
           ? idempotencyKey

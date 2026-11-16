@@ -8,10 +8,12 @@ const appMessageDuration = Duration(seconds: 3);
 /// Sem esconder o atual o Flutter enfileira as SnackBars: cada aviso novo so
 /// aparece depois que o anterior termina, e a fila da a impressao de que os
 /// avisos nao somem da tela.
-void showAppMessage(BuildContext context, String message) {
+void showAppMessage(
+  BuildContext context,
+  String message, {
+  Duration duration = appMessageDuration,
+}) {
   ScaffoldMessenger.of(context)
     ..hideCurrentSnackBar()
-    ..showSnackBar(
-      SnackBar(content: Text(message), duration: appMessageDuration),
-    );
+    ..showSnackBar(SnackBar(content: Text(message), duration: duration));
 }

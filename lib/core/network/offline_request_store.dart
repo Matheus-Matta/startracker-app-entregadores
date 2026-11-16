@@ -44,6 +44,21 @@ class StoredOfflineRequest {
 /// Cada requisição ocupa uma pasta própria: `request.json` + um arquivo por
 /// anexo. A escrita do JSON é feita por último e via rename, então uma pasta
 /// sem `request.json` é sempre lixo de uma gravação interrompida.
+/// Registro salvo que não pôde ser reconstruído (JSON corrompido, anexo
+/// apagado pelo sistema). Antes sumia em silêncio: uma baixa feita sem rede
+/// desaparecia e ninguém sabia por quê.
+class DiscardedOfflineRequest {
+  const DiscardedOfflineRequest({
+    required this.resourceKey,
+    required this.description,
+    required this.reason,
+  });
+
+  final String resourceKey;
+  final String description;
+  final String reason;
+}
+
 class OfflineRequestStore {
   OfflineRequestStore({Future<Directory> Function()? baseDirectory})
     : _baseDirectory = baseDirectory ?? getApplicationSupportDirectory;
@@ -51,11 +66,16 @@ class OfflineRequestStore {
   final Future<Directory> Function() _baseDirectory;
   Directory? _root;
 
+  /// O que a última chamada de [readAll] precisou descartar.
+  List<DiscardedOfflineRequest> lastDiscarded = const [];
+
   Future<Directory> _rootDirectory() async {
     final cached = _root;
     if (cached != null) return cached;
     final base = await _baseDirectory();
-    final root = Directory('${base.path}${Platform.pathSeparator}offline_queue');
+    final root = Directory(
+      '${base.path}${Platform.pathSeparator}offline_queue',
+    );
     if (!await root.exists()) await root.create(recursive: true);
     return _root = root;
   }
@@ -94,11 +114,13 @@ class OfflineRequestStore {
   Future<List<StoredOfflineRequest>> readAll() async {
     final root = await _rootDirectory();
     final result = <StoredOfflineRequest>[];
+    final discarded = <DiscardedOfflineRequest>[];
     await for (final entity in root.list()) {
       if (entity is! Directory) continue;
       final requestFile = File(
         '${entity.path}${Platform.pathSeparator}request.json',
       );
+      Map<String, dynamic>? data;
       try {
         if (!await requestFile.exists()) {
           await entity.delete(recursive: true);
@@ -106,14 +128,18 @@ class OfflineRequestStore {
         }
         final decoded = jsonDecode(await requestFile.readAsString());
         if (decoded is! Map) throw const FormatException('json inválido');
-        final data = Map<String, dynamic>.from(decoded);
+        final record = data = Map<String, dynamic>.from(decoded);
         final files = <String, Uint8List>{};
-        final rawFiles = data['files'];
+        final rawFiles = record['files'];
         if (rawFiles is Map) {
           for (final entry in rawFiles.entries) {
-            files[entry.key.toString()] = await File(
+            final file = File(
               '${entity.path}${Platform.pathSeparator}${entry.value}',
-            ).readAsBytes();
+            );
+            if (!await file.exists()) {
+              throw FileSystemException('anexo "${entry.key}" ausente');
+            }
+            files[entry.key.toString()] = await file.readAsBytes();
           }
         }
         final payload = data['payload'];
@@ -135,13 +161,27 @@ class OfflineRequestStore {
             ),
           ),
         );
-      } catch (_) {
-        // Um registro corrompido não pode travar a fila inteira.
+      } catch (error) {
+        // Um registro corrompido não pode travar a fila inteira, mas o
+        // descarte precisa chegar à interface e ao diagnóstico.
+        discarded.add(
+          DiscardedOfflineRequest(
+            resourceKey: data?['resource_key']?.toString() ?? '',
+            description:
+                data?['description']?.toString() ?? 'Alteração salva offline',
+            reason: switch (error) {
+              FileSystemException(:final message) => message,
+              FormatException() => 'registro corrompido',
+              _ => error.runtimeType.toString(),
+            },
+          ),
+        );
         try {
           await entity.delete(recursive: true);
         } catch (_) {}
       }
     }
+    lastDiscarded = List.unmodifiable(discarded);
     result.sort((a, b) => a.createdAt.compareTo(b.createdAt));
     return result.where((item) => item.id.isNotEmpty).toList();
   }
@@ -167,5 +207,6 @@ class OfflineRequestStore {
     } catch (_) {}
   }
 
-  static String _safe(String id) => id.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+  static String _safe(String id) =>
+      id.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
 }

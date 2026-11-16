@@ -10,6 +10,7 @@ import 'package:maplibre_gl/maplibre_gl.dart';
 
 import '../../../app/app_dependencies.dart';
 import '../../../core/async/debouncer.dart';
+import '../../../core/network/api_failure.dart';
 import '../../../core/network/offline_request_queue.dart';
 import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../../orders/view/order_detail_page.dart';
@@ -251,8 +252,12 @@ class _ActiveWavePageState extends State<ActiveWavePage>
         true;
     if (!affectsRoute && !affectsStop) return;
     if (event.type == OfflineQueueEventType.rejected && mounted) {
-      _message(
-        'A API recusou uma alteracao salva offline. O estado foi restaurado.',
+      // Antes: "A API recusou..." sem dizer qual etapa nem por quê.
+      showAppMessage(
+        context,
+        '${event.description} não foi aceito: '
+        '${describeFailure(event.error)}',
+        duration: const Duration(seconds: 8),
       );
     }
     if (event.type != OfflineQueueEventType.queued && mounted) {

@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../../../app/app_dependencies.dart';
 import '../../../core/async/debouncer.dart';
+import '../../../core/network/api_failure.dart';
 import '../../../core/network/offline_request_queue.dart';
 import '../../../core/presentation/app_messages.dart';
 import '../../../core/realtime/fleet_realtime_channel.dart';
@@ -196,7 +197,14 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
         (routeId != null && event.resourceKey == 'route:$routeId');
     if (!affectsCurrent || event.type == OfflineQueueEventType.queued) return;
     if (event.type == OfflineQueueEventType.rejected) {
-      _message('A API recusou a alteracao offline. O estado foi restaurado.');
+      if (mounted) {
+        showAppMessage(
+          context,
+          '${event.description} não foi aceito: '
+          '${describeFailure(event.error)}',
+          duration: const Duration(seconds: 8),
+        );
+      }
     }
     unawaited(_refresh());
   }
