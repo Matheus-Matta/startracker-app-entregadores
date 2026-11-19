@@ -73,9 +73,15 @@ class _NotificationsPageState extends State<NotificationsPage> {
   }
 
   Future<void> _reload() async {
+    if (!mounted) return;
     final next = _service.getNotifications();
     setState(() => _notifications = next);
-    await next;
+    try {
+      await next;
+    } catch (_) {
+      // O FutureBuilder mostra o erro com "tentar novamente"; sem isto o
+      // "puxar para atualizar" sem sinal deixava um erro sem tratamento.
+    }
   }
 
   Future<void> _markRead(DeliveryNotification notification) async {

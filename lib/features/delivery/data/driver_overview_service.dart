@@ -1,7 +1,5 @@
-import 'package:dio/dio.dart';
-
 import '../../../core/network/api_client.dart';
-import '../../../core/network/offline_request_queue.dart';
+import '../../../core/network/offline_deadline.dart';
 import '../../auth/data/profile_service.dart';
 
 class DriverOverview {
@@ -63,10 +61,8 @@ class DriverOverviewService {
           _cachedAt = DateTime.now();
         }
         return overview;
-      } on DioException catch (error) {
-        if (cached != null && OfflineRequestQueue.isNetworkFailure(error)) {
-          return cached;
-        }
+      } catch (error) {
+        if (cached != null && isOfflineError(error)) return cached;
         rethrow;
       } finally {
         if (generation == _generation) _operation = null;
@@ -80,7 +76,7 @@ class DriverOverviewService {
     final results = await Future.wait<dynamic>([
       profileService.getProfile(),
       apiClient.dio.get<dynamic>('/api/v1/delivery/entregadores/'),
-    ]);
+    ]).timeout(OfflineDeadline.read);
     final profile = results[0] as DeliveryProfile;
     final response = results[1];
     final data = response.data;

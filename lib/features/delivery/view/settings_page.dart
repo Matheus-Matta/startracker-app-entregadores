@@ -4,7 +4,6 @@ import '../../../app/app_dependencies.dart';
 import '../../../core/notifications/app_notification_manager.dart';
 import '../../../core/presentation/failure_log_panel.dart';
 import '../../../core/notifications/notification_preferences.dart';
-import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../../auth/data/profile_service.dart';
 import '../../auth/data/auth_service.dart';
 import '../../auth/data/delivery_configuration.dart';
@@ -111,10 +110,32 @@ class _SettingsPageState extends State<SettingsPage> {
 
   Future<void> _logout() async {
     final dependencies = AppDependencies.instance;
-    await AppNotificationManager.instance.stop();
-    await FleetRealtimeChannel.instance.stop();
-    dependencies.clearSessionCaches();
-    await dependencies.storage.clear();
+    final pending = dependencies.apiClient.offlineRequests.pendingCount;
+    if (pending > 0) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Há ações ainda não enviadas'),
+          content: Text(
+            '${pending == 1 ? '1 ação está salva' : '$pending ações estão salvas'} '
+            'no aparelho aguardando sinal. Elas não serão perdidas: '
+            'serão enviadas quando você entrar novamente com esta conta.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Continuar conectado'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Sair mesmo assim'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+    }
+    await dependencies.signOut();
     if (!mounted) return;
     Navigator.of(context).pushAndRemoveUntil(
       MaterialPageRoute<void>(builder: (_) => const LoginPage()),

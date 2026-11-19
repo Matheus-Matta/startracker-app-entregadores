@@ -1,6 +1,11 @@
+import 'dart:async';
+
 import '../../../core/network/api_client.dart';
 import '../../../core/network/api_collection.dart';
+import '../../../core/network/offline_deadline.dart';
 import '../../../core/network/paged_result.dart';
+import '../../../core/sync/mobile_sync.dart';
+import '../../waves/data/route_snapshot_store.dart';
 
 class OrderListItem {
   const OrderListItem({
@@ -168,14 +173,42 @@ class _CachedOrderPage {
 }
 
 class OrderService {
-  OrderService(this.apiClient);
+  OrderService(
+    this.apiClient, {
+    this.sync,
+    RouteSnapshotStore? detailStore,
+    RouteSnapshotStore? pageStore,
+    RouteSnapshotStore? routeStore,
+  }) : _routeStore = routeStore ?? RouteSnapshotStore(),
+       _detailStore =
+           detailStore ?? RouteSnapshotStore(folder: 'orders', prefix: 'order'),
+       _pageStore =
+           pageStore ??
+           RouteSnapshotStore(folder: 'order_pages', prefix: 'page');
+
   final ApiClient apiClient;
+
+  /// Baixas/falhas feitas no aparelho: a aba Pedidos mostra o mesmo status
+  /// que o mapa e a carga, sem esperar a sincronização.
+  final MobileSync? sync;
+  final RouteSnapshotStore _detailStore;
+  final RouteSnapshotStore _pageStore;
+
+  /// Cópias das rotas (as mesmas do mapa): trazem os pedidos completos.
+  final RouteSnapshotStore _routeStore;
   static const _cacheDuration = Duration(seconds: 30);
   List<Map<String, dynamic>>? _cachedOrders;
   DateTime? _cacheCreatedAt;
+
+  /// Início da leitura que gerou [_cachedOrders] (ver MobileSync.localEvents):
+  /// com a hora do fim, uma baixa confirmada durante o download ficava fora
+  /// da sobreposição e o pedido "voltava" a Em entrega.
+  DateTime? _cacheReadAt;
+  DateTime? _loadOperationStartedAt;
   Future<List<Map<String, dynamic>>>? _loadOperation;
   final Map<String, _CachedOrderPage> _pageCache = {};
   final Map<String, Future<PagedResult<OrderListItem>>> _pageOperations = {};
+  final Map<String, DateTime> _pageOperationStartedAt = {};
   final Map<String, int> _pageOperationGenerations = {};
   int? _loadOperationGeneration;
   String? _loadOperationStatus;
@@ -192,12 +225,20 @@ class OrderService {
     if (query.isEmpty) {
       // Sem texto, o filtro de status é feito pelo servidor, página a página.
       // Antes, escolher um status baixava todos os pedidos da conta.
-      return _getOrderPage(page, refresh: refresh, status: status);
+      final (result, fetchedAt) = await _getOrderPage(
+        page,
+        refresh: refresh,
+        status: status,
+      );
+      return _withLocalStatuses(result, fetchedAt);
     }
 
     // A API não tem busca por texto; a busca local baixa só o status pedido.
     const pageSize = 20;
-    final rawItems = await _getOrders(refresh: refresh, status: status);
+    final (rawItems, readAt) = await _getOrders(
+      refresh: refresh,
+      status: status,
+    );
     final items = _parseItems(rawItems, query: query, status: status);
 
     final start = (page - 1) * pageSize;
@@ -208,12 +249,60 @@ class OrderService {
             start + pageSize < items.length ? start + pageSize : items.length,
           );
 
+    return _withLocalStatuses(
+      PagedResult(
+        items: pageItems,
+        count: items.length,
+        page: page,
+        hasNext: start + pageSize < items.length,
+        hasPrevious: page > 1,
+      ),
+      readAt,
+    );
+  }
+
+  /// Status que o aparelho já sabe e o servidor (ou a cópia) ainda não.
+  Map<int, String> _localStatuses(DateTime? fetchedAt) {
+    final statuses = <int, String>{};
+    for (final event in sync?.localEvents(fetchedAt: fetchedAt) ?? const []) {
+      final orderId = event.intField('order_id');
+      final status = event.fields['local_order_status']?.toString();
+      if (orderId != null && status != null && status.isNotEmpty) {
+        statuses[orderId] = status;
+      }
+    }
+    return statuses;
+  }
+
+  PagedResult<OrderListItem> _withLocalStatuses(
+    PagedResult<OrderListItem> result,
+    DateTime? fetchedAt,
+  ) {
+    final local = _localStatuses(fetchedAt);
+    if (local.isEmpty) return result;
     return PagedResult(
-      items: pageItems,
-      count: items.length,
-      page: page,
-      hasNext: start + pageSize < items.length,
-      hasPrevious: page > 1,
+      items: [
+        for (final item in result.items)
+          local[item.id] == null || local[item.id] == item.status
+              ? item
+              : OrderListItem(
+                  id: item.id,
+                  number: item.number,
+                  customerName: item.customerName,
+                  address: item.address,
+                  city: item.city,
+                  state: item.state,
+                  status: local[item.id]!,
+                  units: item.units,
+                  weightGrams: item.weightGrams,
+                  priority: item.priority,
+                  createdAt: item.createdAt,
+                ),
+      ],
+      count: result.count,
+      page: result.page,
+      hasNext: result.hasNext,
+      hasPrevious: result.hasPrevious,
     );
   }
 
@@ -270,7 +359,9 @@ class OrderService {
     _pageCache.clear();
   }
 
-  Future<PagedResult<OrderListItem>> _getOrderPage(
+  /// Página e o instante em que a leitura começou (para sobrepor só o que
+  /// o aparelho confirmou depois dela).
+  Future<(PagedResult<OrderListItem>, DateTime?)> _getOrderPage(
     int page, {
     required bool refresh,
     String status = '',
@@ -280,27 +371,49 @@ class OrderService {
     if (!refresh &&
         cached != null &&
         DateTime.now().difference(cached.createdAt) < _cacheDuration) {
-      return cached.result;
+      return (cached.result, cached.createdAt);
     }
 
-    final ongoing = _pageOperations[key];
-    if (ongoing != null && _pageOperationGenerations[key] == _cacheGeneration) {
-      return ongoing;
-    }
     final generation = _cacheGeneration;
-    final operation = _loadOrderPage(page, status);
-    _pageOperations[key] = operation;
-    _pageOperationGenerations[key] = generation;
+    final ongoing = _pageOperations[key];
+    final shared =
+        ongoing != null && _pageOperationGenerations[key] == generation;
+    // Leitura já em andamento (atualizar duas vezes seguidas): espera a
+    // mesma, mas com o mesmo prazo e a mesma cópia do aparelho — antes a
+    // segunda ficava presa na rede ruim e perdia a hora da leitura.
+    final startedAt = shared
+        ? _pageOperationStartedAt[key] ?? DateTime.now()
+        : DateTime.now();
+    final operation = shared ? ongoing : _loadOrderPage(page, status);
+    if (!shared) {
+      _pageOperations[key] = operation;
+      _pageOperationGenerations[key] = generation;
+      _pageOperationStartedAt[key] = startedAt;
+    }
     try {
-      final result = await operation;
-      if (generation == _cacheGeneration) {
-        _pageCache[key] = _CachedOrderPage(DateTime.now(), result);
+      final PagedResult<OrderListItem> result;
+      try {
+        result = await operation.timeout(OfflineDeadline.read);
+      } catch (error) {
+        // Sem sinal: a última cópia da lista principal salva no aparelho.
+        final stored = status.isEmpty && isOfflineError(error)
+            ? await _pageStore.read(page)
+            : null;
+        if (stored == null) rethrow;
+        return (
+          _pageFrom(stored['data'], page),
+          DateTime.tryParse(stored['fetched_at']?.toString() ?? ''),
+        );
       }
-      return result;
+      if (generation == _cacheGeneration) {
+        _pageCache[key] = _CachedOrderPage(startedAt, result);
+      }
+      return (result, startedAt);
     } finally {
       if (identical(_pageOperations[key], operation)) {
         _pageOperations.remove(key);
         _pageOperationGenerations.remove(key);
+        _pageOperationStartedAt.remove(key);
       }
     }
   }
@@ -309,6 +422,7 @@ class OrderService {
     int page,
     String status,
   ) async {
+    final fetchedAt = DateTime.now().toUtc().toIso8601String();
     final response = await apiClient.dio.get<dynamic>(
       '/api/v1/delivery/pedidos/',
       // Mais novos primeiro: sem isso a página 1 trazia os pedidos mais
@@ -320,6 +434,18 @@ class OrderService {
       },
     );
     final data = response.data;
+    if (status.isEmpty && data is Map) {
+      unawaited(
+        _pageStore.save(page, {
+          'fetched_at': fetchedAt,
+          'data': Map<String, dynamic>.from(data),
+        }),
+      );
+    }
+    return _pageFrom(data, page);
+  }
+
+  PagedResult<OrderListItem> _pageFrom(Object? data, int page) {
     final items = _parseItems(collectionItems(data));
     return PagedResult(
       items: items,
@@ -332,7 +458,11 @@ class OrderService {
 
   static String? _nonEmpty(String value) => value.isEmpty ? null : value;
 
-  Future<List<Map<String, dynamic>>> _getOrders({
+  /// Todos os pedidos (busca por texto) e o início da leitura.
+  ///
+  /// Sem sinal (ou rede "zumbi"), as páginas salvas no aparelho: antes a
+  /// busca pelo número do pedido na rua esperava minutos e dava erro.
+  Future<(List<Map<String, dynamic>>, DateTime?)> _getOrders({
     required bool refresh,
     String status = '',
   }) async {
@@ -343,37 +473,73 @@ class OrderService {
         _cachedOrdersStatus == status &&
         createdAt != null &&
         DateTime.now().difference(createdAt) < _cacheDuration;
-    if (!refresh && cacheIsFresh) return cached;
+    if (!refresh && cacheIsFresh) return (cached, _cacheReadAt);
 
     final ongoing = _loadOperation;
-    if (ongoing != null &&
+    final shared =
+        ongoing != null &&
         _loadOperationGeneration == _cacheGeneration &&
-        _loadOperationStatus == status) {
-      return ongoing;
-    }
-
+        _loadOperationStatus == status;
     final generation = _cacheGeneration;
-    final operation = apiClient.getAllPages(
-      '/api/v1/delivery/pedidos/',
-      queryParameters: {'status': ?_nonEmpty(status)},
-    );
-    _loadOperationStatus = status;
-    _loadOperation = operation;
-    _loadOperationGeneration = generation;
+    final startedAt = shared
+        ? _loadOperationStartedAt ?? DateTime.now()
+        : DateTime.now();
+    final operation = shared
+        ? ongoing
+        : apiClient.getAllPages(
+            '/api/v1/delivery/pedidos/',
+            queryParameters: {'status': ?_nonEmpty(status)},
+          );
+    if (!shared) {
+      _loadOperationStatus = status;
+      _loadOperation = operation;
+      _loadOperationGeneration = generation;
+      _loadOperationStartedAt = startedAt;
+    }
     try {
-      final orders = await operation;
+      final orders = await operation.timeout(OfflineDeadline.read * 2);
       if (generation == _cacheGeneration) {
         _cachedOrders = orders;
         _cachedOrdersStatus = status;
         _cacheCreatedAt = DateTime.now();
+        _cacheReadAt = startedAt;
       }
-      return orders;
+      return (orders, startedAt);
+    } catch (error) {
+      if (!isOfflineError(error)) rethrow;
+      final stored = await _storedOrders();
+      if (stored == null) rethrow;
+      return stored;
     } finally {
       if (identical(_loadOperation, operation)) {
         _loadOperation = null;
         _loadOperationGeneration = null;
+        _loadOperationStartedAt = null;
       }
     }
+  }
+
+  /// Páginas da lista salvas no aparelho, com a leitura mais antiga delas.
+  Future<(List<Map<String, dynamic>>, DateTime?)?> _storedOrders() async {
+    final orders = <Map<String, dynamic>>[];
+    DateTime? oldest;
+    // Página sem data: sobrepõe todas as ações confirmadas (nunca mais velho).
+    var unknownDate = false;
+    var found = false;
+    for (var page = 1; page <= 50; page++) {
+      final stored = await _pageStore.read(page);
+      if (stored == null) break;
+      found = true;
+      orders.addAll(collectionItems(stored['data']));
+      final readAt = DateTime.tryParse(stored['fetched_at']?.toString() ?? '');
+      if (readAt == null) {
+        unknownDate = true;
+      } else if (oldest == null || readAt.isBefore(oldest)) {
+        oldest = readAt;
+      }
+    }
+    if (!found) return null;
+    return (orders, unknownDate ? null : oldest);
   }
 
   int _compareNewest(DateTime? first, DateTime? second) {
@@ -383,11 +549,87 @@ class OrderService {
     return second.compareTo(first);
   }
 
+  /// Detalhe do pedido. Sem sinal, a última cópia salva no aparelho (o
+  /// "Ver pedido" do mapa precisa funcionar na rua), com o status local.
   Future<OrderDetails> getOrderDetails(int orderId) async {
-    final response = await apiClient.dio.get<dynamic>(
-      '/api/v1/delivery/pedidos/$orderId/',
-    );
-    return OrderService.parseOrderDetails(response.data, orderId);
+    final fetchedAt = DateTime.now();
+    Map<String, dynamic> order;
+    DateTime? readAt = fetchedAt;
+    try {
+      final response = await apiClient.dio
+          .get<dynamic>('/api/v1/delivery/pedidos/$orderId/')
+          .timeout(OfflineDeadline.read);
+      order = response.data is Map
+          ? Map<String, dynamic>.from(response.data as Map)
+          : <String, dynamic>{};
+      if (order.isNotEmpty) {
+        unawaited(
+          _detailStore.save(orderId, {
+            ...order,
+            'fetched_at': fetchedAt.toUtc().toIso8601String(),
+          }),
+        );
+      }
+    } catch (error) {
+      final stored = isOfflineError(error)
+          ? await _storedOrderDetails(orderId)
+          : null;
+      if (stored == null) rethrow;
+      (order, readAt) = stored;
+    }
+    final local = _localStatuses(readAt)[orderId];
+    if (local != null) order['status'] = local;
+    return OrderService.parseOrderDetails(order, orderId);
+  }
+
+  /// Cópia mais nova do pedido no aparelho: a do detalhe, a da lista ou a
+  /// da rota do mapa (a API usa o mesmo formato). Sem isso, o "Ver pedido"
+  /// sem sinal só abria pedidos já abertos antes com rede.
+  Future<(Map<String, dynamic>, DateTime?)?> _storedOrderDetails(
+    int orderId,
+  ) async {
+    Map<String, dynamic>? best;
+    DateTime? bestAt;
+    void consider(Map<String, dynamic> candidate, Object? fetchedAt) {
+      final at = DateTime.tryParse(fetchedAt?.toString() ?? '');
+      final newer =
+          best == null ||
+          (at != null && (bestAt == null || at.isAfter(bestAt!)));
+      if (!newer) return;
+      best = candidate;
+      bestAt = at;
+    }
+
+    final detail = await _detailStore.read(orderId);
+    if (detail != null) consider(detail, detail['fetched_at']);
+    for (var page = 1; page <= 50; page++) {
+      final stored = await _pageStore.read(page);
+      if (stored == null) break;
+      for (final item in collectionItems(stored['data'])) {
+        if (_asInt(item['id']) == orderId) {
+          consider(Map<String, dynamic>.from(item), stored['fetched_at']);
+        }
+      }
+    }
+    // Só as rotas mais recentes: o pedido aberto na rua é da rota de hoje.
+    for (final routeId in (await _routeStore.savedIds()).take(5)) {
+      final stored = await _routeStore.read(routeId);
+      final orders = stored?['orders'];
+      if (orders is! List) continue;
+      for (final item in orders.whereType<Map>()) {
+        if (_asInt(item['id']) == orderId) {
+          consider(Map<String, dynamic>.from(item), stored?['fetched_at']);
+        }
+      }
+    }
+    final found = best;
+    return found == null ? null : (found, bestAt);
+  }
+
+  /// Logout/troca de conta sem nada pendente: não deixa cópias para trás.
+  Future<void> clearStoredCopies() async {
+    await _detailStore.clear();
+    await _pageStore.clear();
   }
 
   static OrderDetails parseOrderDetails(dynamic data, int orderId) {

@@ -11,6 +11,7 @@ import 'package:maplibre_gl/maplibre_gl.dart';
 import '../../../app/app_dependencies.dart';
 import '../../../core/async/debouncer.dart';
 import '../../../core/network/api_failure.dart';
+import '../../../core/network/offline_deadline.dart';
 import '../../../core/network/offline_request_queue.dart';
 import '../../../core/realtime/fleet_realtime_channel.dart';
 import '../../orders/view/order_detail_page.dart';
@@ -210,6 +211,14 @@ class _ActiveWavePageState extends State<ActiveWavePage>
         _error = error.message;
         _loading = false;
       });
+    } catch (_) {
+      // Resposta fora do formato esperado: sem isto o carregamento girava
+      // para sempre (e o erro escapava sem tratamento).
+      if (!mounted) return;
+      setState(() {
+        _error = 'Não foi possível carregar a rota. Tente novamente.';
+        _loading = false;
+      });
     } finally {
       _routeRequestRunning = false;
       if (_routeReloadPending && mounted) {
@@ -284,25 +293,43 @@ class _ActiveWavePageState extends State<ActiveWavePage>
           permission == LocationPermission.deniedForever) {
         return;
       }
-      final first = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          timeLimit: Duration(seconds: 12),
-        ),
-      );
-      if (!mounted || generation != _locationGeneration) return;
-      _positionNotifier.value = first;
+      try {
+        final first = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            timeLimit: Duration(seconds: 12),
+          ),
+        );
+        if (!mounted || generation != _locationGeneration) return;
+        _positionNotifier.value = first;
+      } catch (_) {
+        // GPS frio (garagem, primeira posição do dia) passa dos 12 s: antes
+        // o acompanhamento nem começava e o mapa ficava sem a posição até o
+        // app ir para segundo plano e voltar. Segue para o acompanhamento,
+        // que entrega a posição quando ela sair.
+        if (!mounted || generation != _locationGeneration) return;
+      }
       _positionSubscription =
           Geolocator.getPositionStream(
             locationSettings: const LocationSettings(
               accuracy: LocationAccuracy.high,
               distanceFilter: 10,
             ),
-          ).listen((position) {
-            if (mounted && generation == _locationGeneration) {
-              _positionNotifier.value = position;
-            }
-          });
+          ).listen(
+            (position) {
+              if (mounted && generation == _locationGeneration) {
+                _positionNotifier.value = position;
+              }
+            },
+            // GPS desligado no meio da rota: o acompanhamento termina e,
+            // liberado, volta a ser ligado quando o app voltar à frente.
+            onError: (Object _) {},
+            onDone: () {
+              if (generation == _locationGeneration) {
+                _positionSubscription = null;
+              }
+            },
+          );
     } catch (_) {
       // O destino continua visível mesmo quando o GPS está indisponível.
     }
@@ -330,17 +357,13 @@ class _ActiveWavePageState extends State<ActiveWavePage>
       }
     });
     try {
-      final result = await action();
-      if (!result.queued) {
-        await _loadRoute(postponedStopId: postponedStopId);
-      }
-      if (mounted) {
-        if (result.queued) {
-          _message('Sem internet. Alteracao salva para envio automatico.');
-        } else if (successMessage != null) {
-          _message(successMessage);
-        }
-      }
+      await action();
+      // A ação já está salva no aparelho: a tela mostra o resultado na hora
+      // (regras do servidor aplicadas localmente) e o envio segue sozinho.
+      final local = _service.cachedRoute(widget.routeId);
+      if (mounted && local != null) setState(() => _route = local);
+      if (mounted && successMessage != null) _message(successMessage);
+      unawaited(_loadRoute(postponedStopId: postponedStopId));
     } on ActiveRouteException catch (error) {
       if (mounted) {
         setState(() => _route = previousRoute);
@@ -385,7 +408,11 @@ class _ActiveWavePageState extends State<ActiveWavePage>
     setState(() => _performingAction = true);
     ActiveRouteStop effectiveStop;
     try {
-      effectiveStop = await _service.refreshCompletionPolicy(stop);
+      // Com sinal ruim a atualização da política travava a abertura da baixa;
+      // passado o prazo vale a política já conhecida da parada.
+      effectiveStop = await _service
+          .refreshCompletionPolicy(stop)
+          .timeout(OfflineDeadline.policy);
     } catch (_) {
       effectiveStop = stop;
     } finally {
@@ -412,15 +439,14 @@ class _ActiveWavePageState extends State<ActiveWavePage>
       await _loadRoute();
       return;
     }
+    // Sem esperar a rede: a baixa já está no aparelho e a cópia local já
+    // aplica as regras do servidor (rota e carga fecham quando é a última).
     setState(
-      () => _route = _withStopStatus(
-        stop.stopId,
-        'completed',
-        orderStatus: 'delivered',
-      ),
+      () => _route =
+          _service.cachedRoute(widget.routeId) ??
+          _withStopStatus(stop.stopId, 'completed', orderStatus: 'delivered'),
     );
-    await _loadRoute();
-    if (!mounted) return;
+    unawaited(_loadRoute());
     // Ainda há pedidos na carga: continua no mapa, já na próxima entrega.
     // Era o último: volta para a tela de cargas.
     // A parada recém-finalizada é ignorada caso uma leitura antiga da API
@@ -434,7 +460,13 @@ class _ActiveWavePageState extends State<ActiveWavePage>
       _message('Entrega finalizada. Próxima entrega carregada.');
       return;
     }
-    _message('Entrega finalizada. Todos os pedidos da carga foram concluídos.');
+    final pending = AppDependencies.instance.apiClient.offlineRequests;
+    _message(
+      pending.pendingCount > 0
+          ? 'Rota concluída. As baixas estão salvas no aparelho e serão '
+                'enviadas assim que houver sinal.'
+          : 'Entrega finalizada. Todos os pedidos da carga foram concluídos.',
+    );
     Navigator.of(context).pop(false);
   }
 
@@ -508,6 +540,16 @@ class _ActiveWavePageState extends State<ActiveWavePage>
     if (_performingAction) return;
     if (_route?.status != 'started') {
       _message('Inicie a rota antes de avançar para a próxima entrega.');
+      return;
+    }
+    // Mesma regra do servidor (`postpone_stop`): com uma só pendente não há
+    // para onde adiar. Antes a tela dizia "Pedido adiado" e nada mudava.
+    final pendingStops =
+        _route?.stops.where((item) => !item.isTerminal).length ?? 0;
+    if (pendingStops < 2) {
+      _message(
+        'Esta é a última entrega pendente: não há outra para fazer antes.',
+      );
       return;
     }
     final confirmed = await showModalBottomSheet<bool>(

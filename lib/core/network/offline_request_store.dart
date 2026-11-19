@@ -14,11 +14,24 @@ class PersistedOfflineRequest {
     required this.type,
     required this.payload,
     this.files = const {},
+    this.fileKeys = const [],
   });
 
   final String type;
   final Map<String, dynamic> payload;
+
+  /// Bytes em memória (antes de gravar). Depois de gravados ficam só no
+  /// disco, listados em [fileKeys], e são lidos na hora do envio.
   final Map<String, Uint8List> files;
+  final List<String> fileKeys;
+
+  bool get hasFiles => files.isNotEmpty || fileKeys.isNotEmpty;
+
+  PersistedOfflineRequest withoutFiles() => PersistedOfflineRequest(
+    type: type,
+    payload: payload,
+    fileKeys: [...fileKeys, ...files.keys],
+  );
 }
 
 class StoredOfflineRequest {
@@ -29,6 +42,8 @@ class StoredOfflineRequest {
     required this.idempotencyKey,
     required this.createdAt,
     required this.request,
+    this.owner,
+    this.rejection,
   });
 
   final String id;
@@ -37,6 +52,12 @@ class StoredOfflineRequest {
   final String idempotencyKey;
   final DateTime createdAt;
   final PersistedOfflineRequest request;
+
+  /// `usuario:conta` de quem fez a ação (ver `SessionStorage.readIdentity`).
+  final String? owner;
+
+  /// Motivo da recusa definitiva do servidor; `null` enquanto pendente.
+  final String? rejection;
 }
 
 /// Guarda as requisições pendentes no diretório privado do app.
@@ -80,11 +101,22 @@ class OfflineRequestStore {
     return _root = root;
   }
 
+  /// Pastas sendo gravadas agora: sem `request.json` ainda, mas não são lixo.
+  final Set<String> _saving = {};
+
   Future<void> save(StoredOfflineRequest stored) async {
+    final name = _safe(stored.id);
+    _saving.add(name);
+    try {
+      await _save(stored, name);
+    } finally {
+      _saving.remove(name);
+    }
+  }
+
+  Future<void> _save(StoredOfflineRequest stored, String name) async {
     final root = await _rootDirectory();
-    final folder = Directory(
-      '${root.path}${Platform.pathSeparator}${_safe(stored.id)}',
-    );
+    final folder = Directory('${root.path}${Platform.pathSeparator}$name');
     await folder.create(recursive: true);
     final fileNames = <String, String>{};
     var index = 0;
@@ -96,8 +128,9 @@ class OfflineRequestStore {
       ).writeAsBytes(entry.value, flush: true);
     }
     final json = jsonEncode({
-      'version': 1,
+      'version': 2,
       'id': stored.id,
+      'owner': ?stored.owner,
       'resource_key': stored.resourceKey,
       'description': stored.description,
       'idempotency_key': stored.idempotencyKey,
@@ -111,74 +144,28 @@ class OfflineRequestStore {
     await temp.rename('${folder.path}${Platform.pathSeparator}request.json');
   }
 
+  /// Pastas lidas ao mesmo tempo na abertura: uma por vez, a fila de um
+  /// dia sem sinal (900 ações) segurava a tela de abertura.
+  static const _readBatch = 16;
+
   Future<List<StoredOfflineRequest>> readAll() async {
+    if (_deletions.isNotEmpty) await Future.wait([..._deletions]);
     final root = await _rootDirectory();
     final result = <StoredOfflineRequest>[];
     final discarded = <DiscardedOfflineRequest>[];
+    final folders = <Directory>[];
     await for (final entity in root.list()) {
-      if (entity is! Directory) continue;
-      final requestFile = File(
-        '${entity.path}${Platform.pathSeparator}request.json',
-      );
-      Map<String, dynamic>? data;
-      try {
-        if (!await requestFile.exists()) {
-          await entity.delete(recursive: true);
-          continue;
+      if (entity is Directory) folders.add(entity);
+    }
+    for (var start = 0; start < folders.length; start += _readBatch) {
+      final batch = folders.skip(start).take(_readBatch);
+      for (final item in await Future.wait(batch.map(_readFolder))) {
+        switch (item) {
+          case StoredOfflineRequest stored:
+            result.add(stored);
+          case DiscardedOfflineRequest lost:
+            discarded.add(lost);
         }
-        final decoded = jsonDecode(await requestFile.readAsString());
-        if (decoded is! Map) throw const FormatException('json inválido');
-        final record = data = Map<String, dynamic>.from(decoded);
-        final files = <String, Uint8List>{};
-        final rawFiles = record['files'];
-        if (rawFiles is Map) {
-          for (final entry in rawFiles.entries) {
-            final file = File(
-              '${entity.path}${Platform.pathSeparator}${entry.value}',
-            );
-            if (!await file.exists()) {
-              throw FileSystemException('anexo "${entry.key}" ausente');
-            }
-            files[entry.key.toString()] = await file.readAsBytes();
-          }
-        }
-        final payload = data['payload'];
-        result.add(
-          StoredOfflineRequest(
-            id: data['id']?.toString() ?? '',
-            resourceKey: data['resource_key']?.toString() ?? '',
-            description: data['description']?.toString() ?? '',
-            idempotencyKey: data['idempotency_key']?.toString() ?? '',
-            createdAt:
-                DateTime.tryParse(data['created_at']?.toString() ?? '') ??
-                DateTime.now(),
-            request: PersistedOfflineRequest(
-              type: data['type']?.toString() ?? '',
-              payload: payload is Map
-                  ? Map<String, dynamic>.from(payload)
-                  : const {},
-              files: files,
-            ),
-          ),
-        );
-      } catch (error) {
-        // Um registro corrompido não pode travar a fila inteira, mas o
-        // descarte precisa chegar à interface e ao diagnóstico.
-        discarded.add(
-          DiscardedOfflineRequest(
-            resourceKey: data?['resource_key']?.toString() ?? '',
-            description:
-                data?['description']?.toString() ?? 'Alteração salva offline',
-            reason: switch (error) {
-              FileSystemException(:final message) => message,
-              FormatException() => 'registro corrompido',
-              _ => error.runtimeType.toString(),
-            },
-          ),
-        );
-        try {
-          await entity.delete(recursive: true);
-        } catch (_) {}
       }
     }
     lastDiscarded = List.unmodifiable(discarded);
@@ -186,7 +173,146 @@ class OfflineRequestStore {
     return result.where((item) => item.id.isNotEmpty).toList();
   }
 
-  Future<void> delete(String id) async {
+  /// Uma ação salva: o registro, o descarte (corrompido, sem anexo) ou
+  /// `null` (gravação em andamento ou interrompida).
+  Future<Object?> _readFolder(Directory entity) async {
+    // Ação sendo gravada agora (fotos antes do JSON): quem grava a põe na
+    // fila; apagá-la como "gravação interrompida" perdia a baixa.
+    final name = entity.path.split(Platform.pathSeparator).last;
+    if (_saving.contains(name)) return null;
+    final requestFile = File(
+      '${entity.path}${Platform.pathSeparator}request.json',
+    );
+    Map<String, dynamic>? data;
+    try {
+      if (!await requestFile.exists()) {
+        await entity.delete(recursive: true);
+        return null;
+      }
+      final decoded = jsonDecode(await requestFile.readAsString());
+      if (decoded is! Map) throw const FormatException('json inválido');
+      final record = data = Map<String, dynamic>.from(decoded);
+      final fileKeys = <String>[];
+      final rawFiles = record['files'];
+      if (rawFiles is Map) {
+        for (final entry in rawFiles.entries) {
+          final file = File(
+            '${entity.path}${Platform.pathSeparator}${entry.value}',
+          );
+          if (!await file.exists()) {
+            throw FileSystemException('anexo "${entry.key}" ausente');
+          }
+          fileKeys.add(entry.key.toString());
+        }
+      }
+      final payload = record['payload'];
+      return StoredOfflineRequest(
+        id: record['id']?.toString() ?? '',
+        resourceKey: record['resource_key']?.toString() ?? '',
+        description: record['description']?.toString() ?? '',
+        idempotencyKey: record['idempotency_key']?.toString() ?? '',
+        createdAt:
+            DateTime.tryParse(record['created_at']?.toString() ?? '') ??
+            DateTime.now(),
+        owner: record['owner']?.toString(),
+        rejection: await _readRejection(entity),
+        request: PersistedOfflineRequest(
+          type: record['type']?.toString() ?? '',
+          payload: payload is Map
+              ? Map<String, dynamic>.from(payload)
+              : const {},
+          fileKeys: fileKeys,
+        ),
+      );
+    } catch (error) {
+      // Um registro corrompido não pode travar a fila inteira, mas o
+      // descarte precisa chegar à interface e ao diagnóstico.
+      try {
+        await entity.delete(recursive: true);
+      } catch (_) {}
+      return DiscardedOfflineRequest(
+        resourceKey: data?['resource_key']?.toString() ?? '',
+        description:
+            data?['description']?.toString() ?? 'Alteração salva offline',
+        reason: switch (error) {
+          FileSystemException(:final message) => message,
+          FormatException() => 'registro corrompido',
+          _ => error.runtimeType.toString(),
+        },
+      );
+    }
+  }
+
+  /// Anexos de um registro, lidos do disco só na hora do envio.
+  Future<Map<String, Uint8List>> readFiles(String id) async {
+    final folder = await _folder(id);
+    final requestFile = File(
+      '${folder.path}${Platform.pathSeparator}request.json',
+    );
+    final decoded = jsonDecode(await requestFile.readAsString());
+    final rawFiles = decoded is Map ? decoded['files'] : null;
+    final files = <String, Uint8List>{};
+    if (rawFiles is Map) {
+      for (final entry in rawFiles.entries) {
+        final file = File(
+          '${folder.path}${Platform.pathSeparator}${entry.value}',
+        );
+        if (!await file.exists()) {
+          throw FileSystemException(
+            'a foto/assinatura "${entry.key}" foi apagada do aparelho',
+          );
+        }
+        files[entry.key.toString()] = await file.readAsBytes();
+      }
+    }
+    return files;
+  }
+
+  /// Recusa definitiva: o registro (com fotos) fica guardado para o
+  /// entregador ver o motivo e decidir reenviar ou descartar.
+  Future<void> markRejected(String id, String reason) async {
+    try {
+      final folder = await _folder(id);
+      if (!await folder.exists()) return;
+      await File(
+        '${folder.path}${Platform.pathSeparator}rejected.txt',
+      ).writeAsString(reason, flush: true);
+    } catch (_) {}
+  }
+
+  /// Volta o registro recusado para a fila de envio.
+  Future<void> clearRejection(String id) async {
+    try {
+      final file = File(
+        '${(await _folder(id)).path}${Platform.pathSeparator}rejected.txt',
+      );
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
+  }
+
+  Future<Directory> _folder(String id) async {
+    final root = await _rootDirectory();
+    return Directory('${root.path}${Platform.pathSeparator}${_safe(id)}');
+  }
+
+  static Future<String?> _readRejection(Directory folder) async {
+    final file = File('${folder.path}${Platform.pathSeparator}rejected.txt');
+    if (!await file.exists()) return null;
+    return file.readAsString();
+  }
+
+  /// Exclusões em andamento: a fila não espera por elas (o envio seguinte
+  /// sai na hora), mas a releitura do disco espera, para não pegar de volta
+  /// uma ação já enviada.
+  final Set<Future<void>> _deletions = {};
+
+  Future<void> delete(String id) {
+    final deletion = _delete(id);
+    _deletions.add(deletion);
+    return deletion.whenComplete(() => _deletions.remove(deletion));
+  }
+
+  Future<void> _delete(String id) async {
     try {
       final root = await _rootDirectory();
       final folder = Directory(

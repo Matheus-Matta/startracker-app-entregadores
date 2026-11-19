@@ -5,10 +5,10 @@ import 'dart:typed_data';
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:star_tracker/core/network/api_client.dart';
+import 'package:star_tracker/core/network/offline_request_store.dart';
 import 'package:star_tracker/core/storage/session_storage.dart';
 import 'package:star_tracker/features/waves/data/active_route_service.dart';
 import 'package:star_tracker/features/waves/data/route_snapshot_store.dart';
-import 'package:star_tracker/features/auth/data/delivery_configuration.dart';
 
 void main() {
   test('currentStop respeita a sequencia depois de adiar uma parada', () {
@@ -58,126 +58,65 @@ void main() {
     expect(route.currentStop, isNull);
   });
 
-  test(
-    'conclui usando URL, metodo e campos publicados no contrato v6',
-    () async {
+  test('baixa sem sinal continua aparecendo depois de reabrir o app e fecha a '
+      'rota pela regra do servidor', () async {
+    final directory = await Directory.systemTemp.createTemp('offline_flow');
+    addTearDown(() => directory.delete(recursive: true));
+    ActiveRouteService open(HttpClientAdapter adapter) {
       final client = ApiClient(
         baseUrl: 'https://api.example.test',
         storage: const _EmptyStorage(),
-      );
-      final adapter = _CompletionAdapter();
+        offlineStore: OfflineRequestStore(
+          baseDirectory: () async => Directory('${directory.path}/q'),
+        ),
+      )..readRetryDelays = const [];
       client.dio.httpClientAdapter = adapter;
-      final service = ActiveRouteService(
+      return ActiveRouteService(
         client,
         storage: const _EmptyStorage(),
-      );
-      final stop = _stop(id: 42, sequence: 1, status: 'delivering').copyWith();
-      final configuredStop = ActiveRouteStop(
-        stopId: stop.stopId,
-        orderId: stop.orderId,
-        sequence: stop.sequence,
-        status: stop.status,
-        orderStatus: stop.orderStatus,
-        isManual: stop.isManual,
-        plannedEta: stop.plannedEta,
-        orderNumber: stop.orderNumber,
-        customerName: stop.customerName,
-        customerPhone: stop.customerPhone,
-        fullAddress: stop.fullAddress,
-        latitude: stop.latitude,
-        longitude: stop.longitude,
-        units: stop.units,
-        weightGrams: stop.weightGrams,
-        contents: stop.contents,
-        proofOverrides: stop.proofOverrides,
-        policy: stop.policy,
-        existingProofId: stop.existingProofId,
-        existingPhotoCount: stop.existingPhotoCount,
-        hasSignature: stop.hasSignature,
-        existingRecipientName: stop.existingRecipientName,
-        existingRecipientDocument: stop.existingRecipientDocument,
-        existingNotes: stop.existingNotes,
-        confirmationLocation: ConfirmationLocationPolicy.fromConfiguration(
-          const {
-            'confirmation_location': {
-              'enabled': true,
-              'request_fresh_location': true,
-              'complete_url_template': '/api/v1/custom/stops/{stop_id}/finish/',
-              'method': 'PATCH',
-              'latitude_field': 'mobile_lat',
-              'longitude_field': 'mobile_lng',
-            },
-          },
+        snapshotStore: RouteSnapshotStore(
+          baseDirectory: () async => Directory('${directory.path}/s'),
         ),
       );
+    }
 
-      final result = await service.complete(
-        DeliveryProofSubmission(
-          stop: configuredStop,
-          recipientName: 'Maria',
-          recipientDocument: '',
-          notes: '',
-          photos: const [],
-          signatureBytes: null,
-          latitude: -22.8301,
-          longitude: -43.0402,
-          itemResults: const [DeliveryItemResult(id: 9, status: 'delivered')],
-        ),
-      );
+    // Com sinal: a rota é baixada e fica salva no aparelho.
+    await open(_OnlineRouteAdapter()).getRoute(20);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
 
-      expect(result.queued, isFalse);
-      expect(result.value?.trackerValidationLabel, 'Compatível');
-      expect(adapter.completionMethod, 'PATCH');
-      expect(adapter.completionData?['mobile_lat'], -22.8301);
-      expect(adapter.completionData?['mobile_lng'], -43.0402);
-      expect(adapter.completionData, contains('item_results'));
-      expect(adapter.completionData, isNot(contains('items')));
-      expect(adapter.proofFields, isNot(contains('lat')));
-      expect(adapter.proofFields, isNot(contains('lon')));
-    },
-  );
+    // Sem sinal: chegada e baixa ficam salvas, a tela muda na hora.
+    final offline = open(_OfflineAdapter());
+    await offline.apiClient.offlineRequests.restorePersisted();
+    await offline.getRoute(20);
+    await offline.arrive(30);
+    final saved = await offline.complete(
+      DeliveryProofSubmission(
+        stop: _stop(id: 30, sequence: 1, status: 'arrived'),
+        recipientName: 'Maria',
+        recipientDocument: '',
+        notes: '',
+        photos: [DeliveryPhotoUpload(bytes: Uint8List(4), filename: 'a.jpg')],
+        signatureBytes: null,
+        latitude: null,
+        longitude: null,
+        itemResults: const [],
+      ),
+    );
+    expect(saved.queued, isTrue);
+    final now = offline.cachedRoute(20)!;
+    expect(now.stops.single.status, 'completed');
+    expect(now.stops.single.orderStatus, 'delivered');
+    expect(now.status, 'completed', reason: 'última parada fecha a rota');
+    expect(now.waveStatus, 'completed', reason: 'e a carga');
 
-  test(
-    'reenvio retoma comprovante e fotos ja gravados em vez de recria-los',
-    () async {
-      final client = ApiClient(
-        baseUrl: 'https://api.example.test',
-        storage: const _EmptyStorage(),
-      );
-      final adapter = _FlakyCompletionAdapter();
-      client.dio.httpClientAdapter = adapter;
-      final service = ActiveRouteService(
-        client,
-        storage: const _EmptyStorage(),
-      );
-
-      final first = await service.complete(
-        DeliveryProofSubmission(
-          stop: _stop(id: 42, sequence: 1, status: 'delivering'),
-          recipientName: 'Maria',
-          recipientDocument: '',
-          notes: '',
-          photos: [
-            DeliveryPhotoUpload(bytes: Uint8List(4), filename: 'a.jpg'),
-            DeliveryPhotoUpload(bytes: Uint8List(4), filename: 'b.jpg'),
-          ],
-          signatureBytes: null,
-          latitude: null,
-          longitude: null,
-          itemResults: const [],
-        ),
-      );
-      expect(first.queued, isTrue);
-
-      await client.offlineRequests.retryNow(manual: true);
-
-      expect(client.offlineRequests.pendingCount, 0);
-      expect(adapter.proofCreates, 1);
-      expect(adapter.proofPatches, 1);
-      expect(adapter.photoSequences, ['1', '2']);
-      expect(adapter.completions, 1);
-    },
-  );
+    // App encerrado pelo sistema e reaberto, ainda sem sinal.
+    final reopened = open(_OfflineAdapter());
+    await reopened.apiClient.offlineRequests.restorePersisted();
+    expect(reopened.apiClient.offlineRequests.pendingCount, 2);
+    final route = await reopened.getRoute(20);
+    expect(route.stops.single.status, 'completed');
+    expect(route.status, 'completed');
+  });
 
   test(
     'mapa abre da copia em disco sem rede depois de o app reabrir',
@@ -363,117 +302,6 @@ class _CancelledStopAdapter implements HttpClientAdapter {
     };
     return ResponseBody.fromString(
       jsonEncode(data),
-      200,
-      headers: {
-        Headers.contentTypeHeader: [Headers.jsonContentType],
-      },
-    );
-  }
-
-  @override
-  void close({bool force = false}) {}
-}
-
-class _CompletionAdapter implements HttpClientAdapter {
-  String? completionMethod;
-  Map<String, dynamic>? completionData;
-  final Set<String> proofFields = {};
-
-  @override
-  Future<ResponseBody> fetch(
-    RequestOptions options,
-    Stream<Uint8List>? requestStream,
-    Future<void>? cancelFuture,
-  ) async {
-    late final Map<String, dynamic> response;
-    if (options.path == '/api/v1/delivery/comprovantes/') {
-      final form = options.data as FormData;
-      proofFields.addAll(form.fields.map((entry) => entry.key));
-      response = {'id': 15};
-    } else if (options.path == '/api/v1/custom/stops/42/finish/') {
-      completionMethod = options.method;
-      completionData = Map<String, dynamic>.from(options.data as Map);
-      response = {
-        'proof': {
-          'tracker_validation_status': 'MATCH',
-          'tracker_validation_label': 'Compatível',
-        },
-      };
-    } else {
-      response = {};
-    }
-    return ResponseBody.fromString(
-      jsonEncode(response),
-      200,
-      headers: {
-        Headers.contentTypeHeader: [Headers.jsonContentType],
-      },
-    );
-  }
-
-  @override
-  void close({bool force = false}) {}
-}
-
-/// Simula o 4G: o comprovante e a 1a foto chegam ao servidor, a 2a foto cai.
-class _FlakyCompletionAdapter implements HttpClientAdapter {
-  int proofCreates = 0;
-  int proofPatches = 0;
-  int completions = 0;
-  final List<String> photoSequences = [];
-  final List<String> _storedSequences = [];
-  bool _dropped = false;
-
-  @override
-  Future<ResponseBody> fetch(
-    RequestOptions options,
-    Stream<Uint8List>? requestStream,
-    Future<void>? cancelFuture,
-  ) async {
-    final path = options.path;
-    Object response = <String, dynamic>{};
-    if (path == '/api/v1/delivery/comprovantes/' && options.method == 'POST') {
-      proofCreates++;
-      response = {'id': 15};
-    } else if (path == '/api/v1/delivery/comprovantes/15/') {
-      proofPatches++;
-      response = {'id': 15};
-    } else if (path == '/api/v1/delivery/fotos-comprovante/' &&
-        options.method == 'POST') {
-      final form = options.data as FormData;
-      final sequence = form.fields
-          .firstWhere((entry) => entry.key == 'sequence')
-          .value;
-      if (sequence == '2' && !_dropped) {
-        _dropped = true;
-        throw DioException.connectionError(
-          requestOptions: options,
-          reason: 'Connection closed while receiving data',
-        );
-      }
-      photoSequences.add(sequence);
-      _storedSequences.add(sequence);
-      response = {'id': 100 + photoSequences.length};
-    } else if (path == '/api/v1/delivery/fotos-comprovante/') {
-      response = {
-        'results': [
-          for (final sequence in _storedSequences)
-            {'delivery_proof': 15, 'sequence': int.parse(sequence)},
-        ],
-        'next': null,
-      };
-    } else if (path == '/api/v1/delivery/paradas/42/') {
-      response = {
-        'id': 42,
-        'status': 'delivering',
-        'proof': {'id': 15},
-      };
-    } else if (path == '/api/v1/delivery/paradas/42/complete/') {
-      completions++;
-      response = {'status': 'completed', 'proof': <String, dynamic>{}};
-    }
-    return ResponseBody.fromString(
-      jsonEncode(response),
       200,
       headers: {
         Headers.contentTypeHeader: [Headers.jsonContentType],

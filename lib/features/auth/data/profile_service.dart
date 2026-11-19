@@ -1,4 +1,5 @@
 import '../../../core/network/api_client.dart';
+import '../../../core/network/offline_deadline.dart';
 
 class DeliveryProfile {
   const DeliveryProfile({
@@ -25,9 +26,9 @@ class ProfileService {
       final cached = _cachedProfile;
       if (cached != null) return cached;
     }
-    final response = await apiClient.dio.get<Map<String, dynamic>>(
-      '/api/v1/auth/me/',
-    );
+    final response = await apiClient.dio
+        .get<Map<String, dynamic>>('/api/v1/auth/me/')
+        .timeout(OfflineDeadline.read);
     final data = response.data ?? const <String, dynamic>{};
     final user = data['user'] is Map
         ? Map<String, dynamic>.from(data['user'] as Map)

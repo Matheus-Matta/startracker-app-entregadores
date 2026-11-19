@@ -2,8 +2,12 @@ import 'dart:async';
 
 import '../core/config/app_config.dart';
 import '../core/network/api_client.dart';
+import '../core/notifications/app_notification_manager.dart';
+import '../core/realtime/fleet_realtime_channel.dart';
 import '../core/location/location_service.dart';
 import '../core/storage/session_storage.dart';
+import '../core/sync/mobile_sync.dart';
+import '../core/sync/sync_status_reporter.dart';
 import '../features/auth/data/auth_service.dart';
 import '../features/auth/data/profile_service.dart';
 import '../features/delivery/data/active_wave_service.dart';
@@ -21,11 +25,15 @@ class AppDependencies {
       await auth.deliveryConfig(refresh: true);
       activeRoutes.invalidateCache();
     };
+    sync = MobileSync(apiClient);
+    syncReporter = SyncStatusReporter(apiClient);
     profile = ProfileService(apiClient);
-    orders = OrderService(apiClient);
-    waves = WaveService(apiClient);
-    activeRoutes = ActiveRouteService(apiClient, storage: storage);
-    activeWave = ActiveWaveService(apiClient);
+    orders = OrderService(apiClient, sync: sync);
+    waves = WaveService(apiClient, sync: sync);
+    activeRoutes = ActiveRouteService(apiClient, storage: storage, sync: sync);
+    waves.activeRoutes = activeRoutes;
+    activeRoutes.startBlocker = waves.otherRouteInProgress;
+    activeWave = ActiveWaveService(apiClient, activeRoutes: activeRoutes);
     driverOverview = DriverOverviewService(apiClient, profileService: profile);
     notifications = NotificationService(apiClient);
     location = LocationService();
@@ -35,6 +43,8 @@ class AppDependencies {
 
   final SessionStorage storage = const SessionStorage();
   late final ApiClient apiClient;
+  late final MobileSync sync;
+  late final SyncStatusReporter syncReporter;
   late final AuthService auth;
   late final ProfileService profile;
   late final OrderService orders;
@@ -45,14 +55,34 @@ class AppDependencies {
   late final NotificationService notifications;
   late final LocationService location;
 
+  /// Sair da conta (Configurações ou sessão encerrada pelo servidor). O que
+  /// está na fila fica no aparelho e é enviado quando o entregador voltar.
+  Future<void> signOut() async {
+    await AppNotificationManager.instance.stop();
+    await FleetRealtimeChannel.instance.stop();
+    clearSessionCaches();
+    await storage.clear();
+  }
+
   void clearSessionCaches() {
-    apiClient.offlineRequests.clear();
+    // As cópias (rota, conferência, lista) só são apagadas sem ação
+    // pendente: com ela, o entregador precisa delas ao entrar de novo.
+    activeRoutes.clearSessionData();
+    final keepOffline = apiClient.offlineRequests.pendingCount > 0;
+    waves.clearSessionData(keepOffline: keepOffline);
+    if (!keepOffline) {
+      unawaited(orders.clearStoredCopies());
+      unawaited(sync.clearSession());
+    }
+    // A fila nunca é apagada aqui: o que ficou pendente continua no
+    // aparelho e é enviado quando o mesmo entregador entrar.
+    syncReporter.resetSession();
+    unawaited(apiClient.offlineRequests.reloadSession());
     orders.invalidateCache();
     profile.invalidateCache();
-    activeRoutes.clearSessionData();
-    waves.invalidateCache();
-    activeWave.invalidateCache();
+    activeWave.clearSessionData(keepOffline: keepOffline);
     driverOverview.invalidateCache();
+    notifications.clearCache();
     unawaited(storage.clearOpenActiveRoute());
   }
 }

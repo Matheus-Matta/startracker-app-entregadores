@@ -29,6 +29,33 @@ void main() {
       expect(throttle.allow(event, start), isTrue);
     });
 
+    test('reconexao segurada chega no fim do intervalo: o que mudou no '
+        'portal durante a queda nao fica de fora', () async {
+      final throttle = ReconnectReconcileThrottle(
+        interval: const Duration(milliseconds: 100),
+      );
+      final emitted = <FleetRealtimeEvent>[];
+      throttle.forward(connected(), emitted.add);
+      throttle.forward(connected(), emitted.add);
+      throttle.forward(connected(), emitted.add);
+      expect(emitted, hasLength(1));
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      expect(emitted, hasLength(2));
+      expect(emitted.last.isConnected, isTrue);
+    });
+
+    test('tempo real parado nao recebe a reconexao segurada', () async {
+      final throttle = ReconnectReconcileThrottle(
+        interval: const Duration(milliseconds: 100),
+      );
+      final emitted = <FleetRealtimeEvent>[];
+      throttle.forward(connected(), emitted.add);
+      throttle.forward(connected(), emitted.add);
+      throttle.cancel();
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      expect(emitted, hasLength(1));
+    });
+
     test('eventos de rota e pedido nunca sao filtrados', () {
       final throttle = ReconnectReconcileThrottle();
       throttle.allow(connected(), start);

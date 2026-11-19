@@ -1,7 +1,10 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart';
 
 import '../../../core/network/api_client.dart';
 import '../../../core/network/api_collection.dart';
+import '../../../core/network/offline_deadline.dart';
 import '../../../core/presentation/delivery_terminology.dart';
 
 class DeliveryNotification {
@@ -78,50 +81,80 @@ class NotificationServiceException implements Exception {
 }
 
 class NotificationService {
-  const NotificationService(this.apiClient);
+  NotificationService(this.apiClient);
 
   final ApiClient apiClient;
 
+  /// Última lista lida: sem sinal a central continua mostrando o que já
+  /// tinha (antes trocava por uma tela de erro).
+  List<DeliveryNotification>? _last;
+
+  /// Logout: a central do próximo entregador não mostra as deste.
+  void clearCache() => _last = null;
+
   Future<List<DeliveryNotification>> getNotifications() async {
     try {
-      // A central móvel mantém somente as notificações recentes. A ação de
-      // marcar todas continua sendo executada pelo backend sobre o conjunto
-      // completo do usuário.
-      final rawItems = await apiClient.getAllPages(
-        '/api/v1/notificacoes/',
-        maximumPages: 5,
-        pageSize: 50,
-      );
-      final notifications = rawItems
-          .map(DeliveryNotification.tryParse)
-          .whereType<DeliveryNotification>()
-          .toList();
-      notifications.sort((a, b) {
-        final left = a.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
-        final right = b.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
-        return right.compareTo(left);
-      });
+      final notifications = await _fetch().timeout(OfflineDeadline.read * 2);
+      _last = notifications;
       return notifications;
-    } on DioException catch (error) {
-      throw NotificationServiceException(_errorMessage(error));
+    } catch (error) {
+      final last = _last;
+      if (last != null && isOfflineError(error)) return last;
+      if (error is TimeoutException) {
+        throw const NotificationServiceException(_offlineMessage);
+      }
+      if (error is DioException) {
+        throw NotificationServiceException(_errorMessage(error));
+      }
+      rethrow;
     }
+  }
+
+  static const _offlineMessage =
+      'Sem conexão no momento. Tente novamente quando houver sinal.';
+
+  Future<List<DeliveryNotification>> _fetch() async {
+    // A central móvel mantém somente as notificações recentes. A ação de
+    // marcar todas continua sendo executada pelo backend sobre o conjunto
+    // completo do usuário.
+    final rawItems = await apiClient.getAllPages(
+      '/api/v1/notificacoes/',
+      maximumPages: 5,
+      pageSize: 50,
+    );
+    final notifications = rawItems
+        .map(DeliveryNotification.tryParse)
+        .whereType<DeliveryNotification>()
+        .toList();
+    notifications.sort((a, b) {
+      final left = a.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+      final right = b.createdAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+      return right.compareTo(left);
+    });
+    return notifications;
   }
 
   Future<void> markRead(int notificationId) async {
     try {
-      await apiClient.dio.post<dynamic>(
-        '/api/v1/notificacoes/$notificationId/ler/',
-      );
+      await apiClient.dio
+          .post<dynamic>('/api/v1/notificacoes/$notificationId/ler/')
+          .timeout(OfflineDeadline.read);
     } on DioException catch (error) {
       throw NotificationServiceException(_errorMessage(error));
+    } on TimeoutException {
+      throw const NotificationServiceException(_offlineMessage);
     }
   }
 
   Future<void> markAllRead() async {
     try {
-      await apiClient.dio.post<dynamic>('/api/v1/notificacoes/ler-todas/');
+      await apiClient.dio
+          .post<dynamic>('/api/v1/notificacoes/ler-todas/')
+          .timeout(OfflineDeadline.read);
     } on DioException catch (error) {
       throw NotificationServiceException(_errorMessage(error));
+    } on TimeoutException {
+      throw const NotificationServiceException(_offlineMessage);
     }
   }
 

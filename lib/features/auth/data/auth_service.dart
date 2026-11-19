@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:dio/dio.dart';
 
 import '../../../core/network/api_client.dart';
+import '../../../core/network/offline_deadline.dart';
 import '../../../core/network/offline_request_queue.dart';
 import '../../../core/storage/session_storage.dart';
 import 'delivery_configuration.dart';
@@ -12,8 +13,6 @@ class AuthService {
 
   final ApiClient apiClient;
   final SessionStorage storage;
-
-  static const _restoreTimeout = Duration(seconds: 8);
 
   Future<void> login({
     required String identifier,
@@ -55,7 +54,7 @@ class AuthService {
   }
 
   Future<bool> restoreSession() async {
-    if (!await storage.shouldRememberSession()) {
+    if (!await storage.shouldRememberSession() && !await _hasUnsentWork()) {
       await storage.clear();
       return false;
     }
@@ -69,7 +68,7 @@ class AuthService {
       // requisição que receber 401.
       await apiClient.dio
           .post<void>('/api/v1/auth/token/verify/', data: {'token': access})
-          .timeout(_restoreTimeout);
+          .timeout(OfflineDeadline.read);
       return true;
     } on TimeoutException {
       return true;
@@ -136,8 +135,35 @@ class AuthService {
     }
   }
 
+  /// Sem "lembrar sessão" o app sai da conta ao reabrir — mas não com
+  /// trabalho em andamento. O Android encerra o app (câmera, memória) e,
+  /// sem sinal, o entregador não consegue entrar de novo: as ações salvas
+  /// ficavam presas e a foto em andamento era apagada.
+  Future<bool> _hasUnsentWork() async {
+    try {
+      final queue = apiClient.offlineRequests;
+      await queue.restorePersisted();
+      if (queue.pendingCount > 0 || queue.rejectedRequests.isNotEmpty) {
+        return true;
+      }
+      return await storage.readPendingDeliveryCapture() != null;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<bool> _refreshSession() async {
-    final access = await apiClient.refreshAccessToken();
+    final String? access;
+    try {
+      // Rede "zumbi": a renovação esperava os 30 s + 45 s da conexão com a
+      // tela de carregamento parada. Ela segue em segundo plano; o app abre.
+      access = await apiClient.refreshAccessToken().timeout(
+        OfflineDeadline.read,
+      );
+    } on TimeoutException {
+      final refresh = await storage.readRefreshToken();
+      return refresh != null && refresh.isNotEmpty;
+    }
     if (access == null || access.isEmpty) {
       // O ApiClient apaga os tokens somente quando a API confirma que o
       // refresh e invalido (400/401/403). Em falhas de rede ou servidor, o

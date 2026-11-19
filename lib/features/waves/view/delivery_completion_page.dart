@@ -168,13 +168,24 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
         ),
       );
       if (!mounted) return;
-      if (result.queued) {
+      if (result.queued && result.savedOnDevice) {
+        // Aviso sem bloquear: no 4G fraco isto é o normal, e um diálogo
+        // pedia um toque a mais em cada entrega.
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Entrega salva no aparelho. O envio das fotos continua em '
+              'segundo plano; pode seguir para a próxima.',
+            ),
+          ),
+        );
+      } else if (result.queued) {
         await showDialog<void>(
           context: context,
           builder: (context) => AlertDialog(
-            title: const Text('Entrega salva'),
+            title: const Text('Memória do celular cheia'),
             content: const Text(
-              'Você está sem conexão. A confirmação ficou na fila e será enviada automaticamente.',
+              'Não foi possível guardar a entrega no aparelho. Ela será enviada assim que houver sinal, mas NÃO feche o app até o envio terminar. Libere espaço no celular (fotos e vídeos antigos).',
             ),
             actions: [
               TextButton(
@@ -287,6 +298,8 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
   Future<({bool proceed, Position? position})> _confirmWithoutLocation(
     String message,
   ) async {
+    // Saiu da tela enquanto o GPS procurava: nada a confirmar.
+    if (!mounted) return (proceed: false, position: null);
     final required = widget.stop.confirmationLocation.required;
     final proceed = await showDialog<bool>(
       context: context,

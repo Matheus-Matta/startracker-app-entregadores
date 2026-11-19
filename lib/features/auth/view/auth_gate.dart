@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import '../../../core/network/offline_deadline.dart';
 import '../../../core/presentation/app_messages.dart';
 
 import '../../../app/app_dependencies.dart';
@@ -18,6 +19,9 @@ class AuthGate extends StatefulWidget {
   State<AuthGate> createState() => _AuthGateState();
 }
 
+/// Um só para o app inteiro, criado depois que o Flutter está pronto.
+AppLifecycleListener? _resumeListener;
+
 class _AuthGateState extends State<AuthGate> {
   late final Future<_AuthBootstrap> _session;
 
@@ -28,21 +32,36 @@ class _AuthGateState extends State<AuthGate> {
   }
 
   Future<_AuthBootstrap> _restoreSafely(AuthService authService) async {
+    var loggedIn = false;
     try {
       final dependencies = AppDependencies.instance;
-      final loggedIn = await authService.restoreSession();
+      loggedIn = await authService.restoreSession();
       if (!loggedIn) return const _AuthBootstrap(loggedIn: false);
       // Com uma cópia local da configuração, o app abre na hora e atualiza
       // em segundo plano; só o primeiro acesso precisa esperar a API.
       final cachedConfig = await authService.deliveryConfig();
       if (cachedConfig.isEmpty) {
-        await authService.deliveryConfig(refresh: true);
+        // Sem cópia (o sinal caiu logo após o login) e com rede "zumbi",
+        // a abertura esperava todos os timeouts. Segue e atualiza depois.
+        await authService
+            .deliveryConfig(refresh: true)
+            .timeout(OfflineDeadline.read, onTimeout: () => cachedConfig);
       } else {
         unawaited(authService.deliveryConfig(refresh: true));
       }
-      // Requisições que falharam sem rede antes do app ser fechado voltam
-      // para a fila e são reenviadas automaticamente.
-      unawaited(dependencies.apiClient.offlineRequests.restorePersisted());
+      // Ações salvas no aparelho antes de o app ser fechado voltam para a
+      // fila ANTES da primeira tela: sem isso o mapa abria mostrando a
+      // entrega como pendente até a fila terminar de carregar.
+      await dependencies.apiClient.offlineRequests.restorePersisted();
+      await dependencies.sync.ready;
+      // Conta ao portal o que ficou pendente/recusado neste aparelho.
+      dependencies.syncReporter.start();
+      _resumeListener ??= AppLifecycleListener(
+        // Voltou à frente (rede costuma voltar junto): tenta enviar já.
+        onResume: () => unawaited(
+          AppDependencies.instance.apiClient.offlineRequests.retryNow(),
+        ),
+      );
       final recovery = await DeliveryPhotoRecovery(
         dependencies.storage,
       ).recoverLostCapture();
@@ -53,7 +72,18 @@ class _AuthGateState extends State<AuthGate> {
         openRouteId: openRouteId,
       );
     } catch (_) {
-      return const _AuthBootstrap(loggedIn: false);
+      // Sessão válida e falha numa etapa seguinte (leitura do aparelho):
+      // segue para o app em vez de pedir login a cada abertura.
+      if (loggedIn) {
+        final dependencies = AppDependencies.instance;
+        unawaited(
+          dependencies.apiClient.offlineRequests.restorePersisted().catchError(
+            (Object _) {},
+          ),
+        );
+        dependencies.syncReporter.start();
+      }
+      return _AuthBootstrap(loggedIn: loggedIn);
     }
   }
 

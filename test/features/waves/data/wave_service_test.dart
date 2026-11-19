@@ -129,10 +129,13 @@ void main() {
       ],
     );
 
-    test('ignora caixa e espacos apenas nas extremidades', () {
+    test('compara como o servidor: sem caixa e sem espaco nenhum', () {
+      // pickup._match no servidor ignora todo espaço; com a conferência
+      // feita sem rede o app precisa aceitar o mesmo que a API aceita.
       expect(order.matchesCode(' ped-81-1 '), isTrue);
       expect(order.matchesCode(' ext abc '), isTrue);
-      expect(order.matchesCode('EXTABC'), isFalse);
+      expect(order.matchesCode('EXTABC'), isTrue);
+      expect(order.matchesCode('EXT-ABC'), isFalse);
     });
 
     test('nao deduz codigo-base pelo numero do pedido', () {
@@ -141,7 +144,7 @@ void main() {
   });
 
   test(
-    'registerPickup envia somente a etiqueta lida em um unico POST',
+    'registerPickup confere na copia local e envia a leitura pela fila',
     () async {
       final client = ApiClient(
         baseUrl: 'https://api.example.test',
@@ -153,18 +156,32 @@ void main() {
 
       final progress = await service.registerPickup(
         waveId: 42,
-        code: '  PED 100  ',
+        code: '  ped100  ',
       );
 
-      expect(adapter.requests.length, 1);
-      expect(adapter.requests.single.method, 'POST');
-      expect(
-        adapter.requests.single.path,
-        '/api/v1/delivery/waves/42/retirada/',
-      );
-      expect(adapter.requests.single.data, {'code': 'PED 100'});
-      expect(progress.waveId, 42);
+      // Confirmada na hora, sem esperar o servidor.
+      expect(progress.isComplete, isTrue);
+      expect(progress.orders.single.isPickedUp, isTrue);
       expect(progress.labelGranularity, PickupLabelScope.order);
+      for (var i = 0; i < 50 && client.offlineRequests.pendingCount > 0; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      final sync = adapter.requests
+          .where((request) => request.path == '/api/v1/delivery/sincronizacao/')
+          .toList();
+      expect(sync, hasLength(1));
+      final fields = {
+        for (final entry in (sync.single.data as FormData).fields)
+          entry.key: entry.value,
+      };
+      expect(fields['kind'], 'pickup.scan');
+      expect(fields['wave_id'], '42');
+      expect(fields['code'], 'PED 100');
+      expect(
+        adapter.requests.where((request) => request.method == 'POST'),
+        hasLength(1),
+        reason: 'a leitura nao usa mais o POST direto da retirada',
+      );
     },
   );
 
@@ -245,6 +262,18 @@ class _PickupAdapter implements HttpClientAdapter {
     Future<void>? cancelFuture,
   ) async {
     requests.add(options);
+    if (options.path == '/api/v1/delivery/sincronizacao/') {
+      return ResponseBody.fromString(
+        jsonEncode({
+          'outcome': 'applied',
+          'wave': {'id': 42},
+        }),
+        200,
+        headers: {
+          Headers.contentTypeHeader: [Headers.jsonContentType],
+        },
+      );
+    }
     return ResponseBody.fromString(
       jsonEncode({
         'wave_id': 42,
@@ -252,18 +281,18 @@ class _PickupAdapter implements HttpClientAdapter {
         'barcode_source': 'order_number',
         'label_granularity': 'order',
         'total': 1,
-        'picked_up': 1,
-        'pending': 0,
-        'is_complete': true,
+        'picked_up': 0,
+        'pending': 1,
+        'is_complete': false,
         'orders': [
           {
             'order_id': 81,
             'order_number': 'PED 100',
             'customer': 'Cliente',
             'codes': [
-              {'code': 'PED 100', 'scanned_at': '2026-09-09T10:00:00-03:00'},
+              {'code': 'PED 100', 'scanned_at': null},
             ],
-            'picked_up_at': '2026-09-09T10:00:00-03:00',
+            'picked_up_at': null,
           },
         ],
       }),

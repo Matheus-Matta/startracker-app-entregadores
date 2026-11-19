@@ -1,9 +1,13 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:star_tracker/core/network/api_client.dart';
+import 'package:star_tracker/core/network/offline_deadline.dart';
+import 'package:star_tracker/core/network/offline_request_store.dart';
 import 'package:star_tracker/core/storage/session_storage.dart';
 import 'package:star_tracker/features/auth/data/auth_service.dart';
 
@@ -101,6 +105,88 @@ void main() {
     expect(await storage.readRefreshToken(), 'refresh-salvo');
   });
 
+  group('sem "lembrar sessão"', () {
+    test('app reaberto sem trabalho pendente sai da conta', () async {
+      final storage = _AuthStorage()..remember = false;
+      final auth = _authService(storage, refreshStatus: 503);
+      expect(await auth.restoreSession(), isFalse);
+      expect(storage.clearCalls, 1);
+    });
+
+    test('com foto de baixa em andamento (Android fechou o app na câmera) '
+        'continua na conta', () async {
+      final storage = _AuthStorage()
+        ..remember = false
+        ..capture = {'stop_id': 31};
+      final client = ApiClient(
+        baseUrl: 'https://api.example.test',
+        storage: storage,
+      );
+      client.dio.httpClientAdapter = _OfflineAdapter();
+      final auth = AuthService(apiClient: client, storage: storage);
+      expect(await auth.restoreSession(), isTrue);
+      expect(storage.clearCalls, 0);
+    });
+
+    test('com ação salva sem sinal continua na conta', () async {
+      final directory = Directory.systemTemp.createTempSync('auth_queue');
+      addTearDown(() => directory.deleteSync(recursive: true));
+      final store = OfflineRequestStore(baseDirectory: () async => directory);
+      await store.save(
+        StoredOfflineRequest(
+          id: 'a1',
+          resourceKey: 'stop:31',
+          description: 'Registrar chegada',
+          idempotencyKey: 'a1',
+          createdAt: DateTime.now(),
+          request: const PersistedOfflineRequest(
+            type: 'mobile_sync.event',
+            payload: {'kind': 'stop.arrive'},
+          ),
+        ),
+      );
+      final storage = _AuthStorage()..remember = false;
+      final client = ApiClient(
+        baseUrl: 'https://api.example.test',
+        storage: storage,
+        offlineStore: store,
+      );
+      client.offlineRequests.registerRestoreHandler(
+        'mobile_sync.event',
+        (_, _, _) async => null,
+      );
+      client.dio.httpClientAdapter = _OfflineAdapter();
+      final auth = AuthService(apiClient: client, storage: storage);
+      expect(await auth.restoreSession(), isTrue);
+      expect(storage.clearCalls, 0);
+      client.offlineRequests.dispose();
+    });
+  });
+
+  test('token vencido e renovação presa em rede zumbi: o app abre em '
+      'segundos, sem perder a sessão', () async {
+    OfflineDeadline.read = const Duration(milliseconds: 300);
+    addTearDown(() => OfflineDeadline.read = const Duration(seconds: 8));
+    final storage = _AuthStorage();
+    final hang = Completer<void>();
+    addTearDown(hang.complete);
+    final refreshDio = Dio(BaseOptions(baseUrl: 'https://api.example.test'))
+      ..httpClientAdapter = _HangingAdapter(hang.future);
+    final client = ApiClient(
+      baseUrl: 'https://api.example.test',
+      storage: storage,
+      refreshClient: refreshDio,
+    );
+    client.dio.httpClientAdapter = const _StatusAdapter(401);
+    final auth = AuthService(apiClient: client, storage: storage);
+
+    final restored = await auth.restoreSession().timeout(
+      const Duration(seconds: 3),
+    );
+    expect(restored, isTrue);
+    expect(storage.clearCalls, 0);
+  });
+
   test('encerra a sessao quando a API rejeita o refresh', () async {
     final storage = _AuthStorage();
     final auth = _authService(storage, refreshStatus: 401);
@@ -133,8 +219,14 @@ class _AuthStorage extends SessionStorage {
   @override
   int get sessionGeneration => _generation;
 
+  bool remember = true;
+  Map<String, dynamic>? capture;
+
   @override
-  Future<bool> shouldRememberSession() async => true;
+  Future<bool> shouldRememberSession() async => remember;
+
+  @override
+  Future<Map<String, dynamic>?> readPendingDeliveryCapture() async => capture;
 
   @override
   Future<String?> readToken() async => access;
@@ -175,6 +267,43 @@ class _JsonAdapter implements HttpClientAdapter {
     headers: {
       Headers.contentTypeHeader: [Headers.jsonContentType],
     },
+  );
+
+  @override
+  void close({bool force = false}) {}
+}
+
+class _HangingAdapter implements HttpClientAdapter {
+  const _HangingAdapter(this.until);
+
+  final Future<void> until;
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    await until;
+    throw DioException.connectionError(
+      requestOptions: options,
+      reason: 'zumbi',
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+class _OfflineAdapter implements HttpClientAdapter {
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async => throw DioException.connectionError(
+    requestOptions: options,
+    reason: 'Network is unreachable',
   );
 
   @override

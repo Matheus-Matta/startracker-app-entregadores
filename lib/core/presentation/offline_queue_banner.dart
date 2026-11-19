@@ -8,18 +8,29 @@ const _ink = Color(0xFF171713);
 const _yellow = Color(0xFFF8E94E);
 const _danger = Color(0xFFB3261E);
 
-/// Faixa no topo do app que mostra o estado das requisições guardadas sem
-/// rede: quantas estão pendentes, a tentativa atual (de no máximo 3) e quando
-/// será a próxima. Quando as tentativas acabam, oferece o reenvio manual.
+/// Faixa no topo do app com o que ainda não chegou ao servidor.
+///
+/// Tudo que o entregador faz é salvo no aparelho primeiro; a faixa mostra
+/// quantas ações aguardam envio, quando será a próxima tentativa e, se o
+/// servidor recusou alguma, um atalho para resolver.
 class OfflineQueueBanner extends StatefulWidget {
   const OfflineQueueBanner({
     required this.queue,
     required this.child,
+    this.onOpenAttention,
+    this.onLogin,
     super.key,
   });
 
   final OfflineRequestQueue queue;
   final Widget child;
+
+  /// Abre a lista de ações recusadas.
+  final VoidCallback? onOpenAttention;
+
+  /// Sessão encerrada pelo servidor: leva ao login (antes o texto pedia
+  /// "entre novamente" sem caminho até lá, fora das Configurações).
+  final VoidCallback? onLogin;
 
   @override
   State<OfflineQueueBanner> createState() => _OfflineQueueBannerState();
@@ -44,8 +55,7 @@ class _OfflineQueueBannerState extends State<OfflineQueueBanner> {
 
   void _onStatus() {
     final status = widget.queue.status.value;
-    final needsTicker =
-        status.hasPending && !status.exhausted && status.nextRetryAt != null;
+    final needsTicker = status.hasPending && status.nextRetryAt != null;
     if (needsTicker && _ticker == null) {
       _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
         if (mounted) setState(() {});
@@ -60,12 +70,14 @@ class _OfflineQueueBannerState extends State<OfflineQueueBanner> {
   @override
   Widget build(BuildContext context) {
     final status = widget.queue.status.value;
-    if (!status.hasPending) return widget.child;
+    if (!status.isVisible) return widget.child;
     return Column(
       children: [
         _Banner(
           status: status,
           onRetry: () => unawaited(widget.queue.retryNow(manual: true)),
+          onOpenAttention: widget.onOpenAttention,
+          onLogin: widget.onLogin,
         ),
         Expanded(
           child: MediaQuery.removePadding(
@@ -80,39 +92,55 @@ class _OfflineQueueBannerState extends State<OfflineQueueBanner> {
 }
 
 class _Banner extends StatelessWidget {
-  const _Banner({required this.status, required this.onRetry});
+  const _Banner({
+    required this.status,
+    required this.onRetry,
+    required this.onOpenAttention,
+    required this.onLogin,
+  });
 
   final OfflineQueueStatus status;
   final VoidCallback onRetry;
+  final VoidCallback? onOpenAttention;
+  final VoidCallback? onLogin;
 
   @override
   Widget build(BuildContext context) {
     final count = status.pendingCount;
-    final items = count == 1 ? '1 envio pendente' : '$count envios pendentes';
+    final saved = count == 1
+        ? '1 ação salva no aparelho'
+        : '$count ações salvas no aparelho';
+    final rejected = status.rejectedCount;
     final String title;
     final String detail;
-    if (status.sending) {
+    final bool attention;
+    if (status.needsAttention && !status.sending) {
+      attention = true;
+      title = rejected == 1
+          ? '1 ação precisa de atenção'
+          : '$rejected ações precisam de atenção';
+      detail = count > 0
+          ? 'O servidor recusou. $saved aguardando envio.'
+          : 'O servidor recusou. Toque para ver o motivo.';
+    } else if (status.sending) {
+      attention = false;
       title = 'Enviando…';
-      detail = items;
-    } else if (status.exhausted) {
-      title = 'Sem conexão com o servidor';
-      detail =
-          '$items. As ${status.maxAttempts} tentativas automáticas falharam; os dados continuam salvos no aparelho.';
+      detail = saved;
+    } else if (status.needsLogin) {
+      attention = false;
+      title = 'Sessão expirada · $saved';
+      detail = 'Entre novamente para enviar. Nada foi perdido.';
     } else {
-      title = 'Sem conexão · $items';
+      attention = false;
+      title = 'Sem conexão · $saved';
       final next = status.nextRetryAt;
-      final seconds = next
-          ?.difference(DateTime.now())
-          .inSeconds
-          .clamp(0, 3600);
-      final attempt = (status.attempts + 1).clamp(1, status.maxAttempts);
+      final seconds = next?.difference(DateTime.now()).inSeconds.clamp(0, 3600);
       detail = seconds == null
-          ? 'Nova tentativa em breve.'
-          : 'Tentativa $attempt de ${status.maxAttempts} em ${_format(seconds)}.';
+          ? 'Será enviado assim que houver sinal.'
+          : 'Nova tentativa em ${_format(seconds)}. Pode continuar trabalhando.';
     }
-    final background = status.exhausted ? _danger : _ink;
     return Material(
-      color: background,
+      color: attention ? _danger : _ink,
       child: SafeArea(
         bottom: false,
         child: Padding(
@@ -120,7 +148,9 @@ class _Banner extends StatelessWidget {
           child: Row(
             children: [
               Icon(
-                status.sending
+                attention
+                    ? Icons.error_outline_rounded
+                    : status.sending
                     ? Icons.cloud_upload_outlined
                     : Icons.cloud_off_rounded,
                 color: _yellow,
@@ -150,16 +180,16 @@ class _Banner extends StatelessWidget {
                   ],
                 ),
               ),
-              if (!status.sending)
+              if (attention && onOpenAttention != null)
                 TextButton(
-                  onPressed: onRetry,
+                  onPressed: onOpenAttention,
                   style: TextButton.styleFrom(foregroundColor: _yellow),
-                  child: Text(
-                    status.exhausted ? 'Tentar novamente' : 'Enviar agora',
-                    style: const TextStyle(fontWeight: FontWeight.w800),
+                  child: const Text(
+                    'Ver',
+                    style: TextStyle(fontWeight: FontWeight.w800),
                   ),
                 )
-              else
+              else if (status.sending)
                 const Padding(
                   padding: EdgeInsets.all(12),
                   child: SizedBox.square(
@@ -168,6 +198,24 @@ class _Banner extends StatelessWidget {
                       strokeWidth: 2,
                       color: _yellow,
                     ),
+                  ),
+                )
+              else if (status.needsLogin && onLogin != null)
+                TextButton(
+                  onPressed: onLogin,
+                  style: TextButton.styleFrom(foregroundColor: _yellow),
+                  child: const Text(
+                    'Entrar',
+                    style: TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                )
+              else if (!status.needsLogin)
+                TextButton(
+                  onPressed: onRetry,
+                  style: TextButton.styleFrom(foregroundColor: _yellow),
+                  child: const Text(
+                    'Enviar agora',
+                    style: TextStyle(fontWeight: FontWeight.w800),
                   ),
                 ),
             ],

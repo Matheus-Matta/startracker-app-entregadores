@@ -3,12 +3,14 @@ import 'package:dio/dio.dart';
 import '../storage/session_storage.dart';
 import 'api_failure.dart';
 import 'offline_request_queue.dart';
+import 'offline_request_store.dart';
 
 class ApiClient {
   ApiClient({
     required String baseUrl,
     required SessionStorage storage,
     Dio? refreshClient,
+    OfflineRequestStore? offlineStore,
   }) : _storage = storage,
        _refreshClient =
            refreshClient ??
@@ -72,7 +74,27 @@ class ApiClient {
             return;
           }
 
-          final access = await _refreshAccessToken();
+          final String? access;
+          try {
+            access = await _refreshAccessToken();
+          } on _RefreshUnavailable catch (unavailable) {
+            // Renovação sem sinal (ou servidor fora): não é sessão expirada.
+            // Seguir com o 401 fazia a fila pedir login e as telas não
+            // usarem a cópia do aparelho.
+            final cause = unavailable.error;
+            handler.next(
+              DioException(
+                requestOptions: request,
+                response: cause.response,
+                type: cause.response == null
+                    ? cause.type
+                    : DioExceptionType.badResponse,
+                error: cause.error,
+                message: 'Não foi possível renovar a sessão agora.',
+              ),
+            );
+            return;
+          }
           if (access == null) {
             handler.next(error);
             return;
@@ -115,14 +137,18 @@ class ApiClient {
     dio.interceptors.add(
       InterceptorsWrapper(
         onError: (error, handler) {
-          if (error.type != DioExceptionType.cancel) {
+          // Sonda de conectividade sem sinal falha a cada tentativa; no log
+          // (40 entradas) ela empurrava para fora a falha real que o suporte
+          // precisa ver.
+          if (error.type != DioExceptionType.cancel &&
+              error.requestOptions.extra[noFailureLog] != true) {
             failureLog.record(ApiFailure.fromDio(error));
           }
           handler.next(error);
         },
       ),
     );
-    offlineRequests = OfflineRequestQueue(dio, storage);
+    offlineRequests = OfflineRequestQueue(dio, storage, store: offlineStore);
   }
 
   /// Histórico das últimas falhas (tela de diagnóstico).
@@ -158,6 +184,10 @@ class ApiClient {
   /// Marque `extra[ApiClient.noReadRetry] = true` em sondas que precisam
   /// falhar rápido (ex.: teste de alcance da fila offline).
   static const noReadRetry = 'noReadRetry';
+
+  /// Marque `extra[ApiClient.noFailureLog] = true` em requisições cuja falha
+  /// é esperada e não deve ir para o histórico de diagnóstico.
+  static const noFailureLog = 'noFailureLog';
 
   /// Espera antes de cada nova tentativa de leitura.
   List<Duration> readRetryDelays = const [
@@ -210,8 +240,14 @@ class ApiClient {
   }
 
   /// Renova o access token para clientes autenticados que não passam pelo
-  /// interceptor HTTP, como o handshake do WebSocket.
-  Future<String?> refreshAccessToken() => _refreshAccessToken();
+  /// interceptor HTTP, como o handshake do WebSocket. `null` se não deu.
+  Future<String?> refreshAccessToken() async {
+    try {
+      return await _refreshAccessToken();
+    } on _RefreshUnavailable {
+      return null;
+    }
+  }
 
   Future<String?> _requestNewAccessToken() async {
     final sessionGeneration = _storage.sessionGeneration;
@@ -241,12 +277,22 @@ class ApiClient {
       }
       return access;
     } on DioException catch (error) {
-      if (error.response?.statusCode == 400 ||
-          error.response?.statusCode == 401 ||
-          error.response?.statusCode == 403) {
+      final status = error.response?.statusCode ?? 0;
+      if (status == 400 || status == 401 || status == 403) {
         await _storage.clear();
+        return null;
+      }
+      if (OfflineRequestQueue.isNetworkFailure(error) || status >= 500) {
+        throw _RefreshUnavailable(error);
       }
       return null;
     }
   }
+}
+
+/// A renovação do token não chegou a uma resposta da API (sem sinal,
+/// servidor fora): a sessão continua válida no aparelho.
+class _RefreshUnavailable implements Exception {
+  const _RefreshUnavailable(this.error);
+  final DioException error;
 }

@@ -375,7 +375,10 @@ class _PickupPageState extends State<PickupPage> with WidgetsBindingObserver {
 
   bool _isAlreadyScannedMessage(String message) {
     final normalized = message.toLowerCase();
-    return normalized.contains('já retirado') ||
+    // Mensagens do servidor/cópia local: "já havia sido lida/retirado".
+    return normalized.contains('já havia sido') ||
+        normalized.contains('ja havia sido') ||
+        normalized.contains('já retirado') ||
         normalized.contains('ja retirado') ||
         normalized.contains('já foi retirado') ||
         normalized.contains('ja foi retirado') ||
@@ -550,6 +553,13 @@ class _PickupPageState extends State<PickupPage> with WidgetsBindingObserver {
     );
     if (!mounted) return;
     if (code != null && code.trim().isNotEmpty) {
+      // Uma atualização da tela (tempo real) pode ter começado enquanto o
+      // código era digitado; sem esperar, o código era descartado em
+      // silêncio e a câmera ficava desligada.
+      while (mounted && (_refreshing || _registering || _markingNotGoing)) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      if (!mounted) return;
       await _register(code);
       return;
     }

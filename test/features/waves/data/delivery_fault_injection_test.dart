@@ -10,106 +10,54 @@ import 'package:star_tracker/features/waves/data/active_route_service.dart';
 
 import '../../../support/fault_server.dart';
 
-const _stopPath = '/api/v1/delivery/paradas/42/';
-const _completePath = '/api/v1/delivery/paradas/42/complete/';
-const _proofsPath = '/api/v1/delivery/comprovantes/';
-const _photosPath = '/api/v1/delivery/fotos-comprovante/';
+const _syncPath = '/api/v1/delivery/sincronizacao/';
 
-/// Servidor falso com estado, que se comporta como o Django de verdade:
-/// comprovante é único por parada, a ordem da foto é única por comprovante
-/// (400 na repetição), conclusão repetida devolve 200 sem refazer nada.
-class _DeliveryBackend {
-  _DeliveryBackend() {
-    server
-      ..on(
-        'POST',
-        _proofsPath,
-        (request, _) => _step('proof', request, () {
-          if (proofId != null) {
-            return FaultReply.json({
-              'route_stop': ['Já existe comprovante para esta parada.'],
-            }, status: 400);
-          }
-          proofCreates++;
-          proofId = 15;
-          return {'id': proofId};
-        }),
-      )
-      ..on(
-        'PATCH',
-        '${_proofsPath}15/',
-        (request, _) => _step('proof', request, () {
-          proofPatches++;
-          return {'id': 15};
-        }),
-      )
-      ..on('POST', _photosPath, (request, _) {
-        final sequence = _field(request, 'sequence');
-        return _step('photo-$sequence', request, () {
-          if (!sequences.add(sequence)) {
-            return FaultReply.json({
-              'non_field_errors': ['Sequência já usada.'],
-            }, status: 400);
-          }
-          return {'id': 100 + sequences.length};
-        });
-      })
-      ..on(
-        'GET',
-        _photosPath,
-        (_, _) => {
-          'results': [
-            for (final sequence in sequences)
-              {'delivery_proof': 15, 'sequence': int.parse(sequence)},
-          ],
-          'next': null,
-        },
-      )
-      ..on(
-        'GET',
-        _stopPath,
-        (_, _) => {
-          'id': 42,
-          'status': completed ? 'completed' : 'delivering',
-          'proof': proofId == null ? null : {'id': proofId},
-        },
-      )
-      ..on(
-        'POST',
-        _completePath,
-        (request, _) => _step('complete', request, () {
-          if (!completed) completions++;
-          completed = true;
-          return {'id': 42, 'status': 'completed'};
-        }),
-      );
+/// Servidor falso que se comporta como `api_sync.py`: aplica cada
+/// `client_event_id` uma vez só e devolve o mesmo resultado no reenvio.
+class _SyncBackend {
+  _SyncBackend() {
+    server.on('POST', _syncPath, (request, _) {
+      final form = request.data as FormData;
+      String field(String name) =>
+          form.fields.where((entry) => entry.key == name).first.value;
+      final fault = faults.isEmpty ? null : faults.removeAt(0);
+      Object apply() {
+        final id = field('client_event_id');
+        eventIds.add(id);
+        if (applied.add(id)) {
+          lastForm = form;
+          photos = form.files.where((entry) => entry.key == 'photos').length;
+        }
+        return {
+          'client_event_id': id,
+          'outcome': 'applied',
+          'conflicts': <String>[],
+          'stop': {'id': 42, 'status': 'completed'},
+          'order': {'id': 42, 'status': 'delivered'},
+          'route': {'id': 7, 'status': 'completed'},
+          'wave': {'id': 3, 'status': 'completed'},
+          'stop_data': {
+            'proof': {
+              'delivery_within_planned_radius': true,
+              'tracker_validation_status': 'match',
+            },
+          },
+        };
+      }
+
+      return fault == null ? apply() : fault(request, apply);
+    });
   }
 
   final server = FaultServer();
-  int? proofId;
-  int proofCreates = 0;
-  int proofPatches = 0;
-  int completions = 0;
-  bool completed = false;
-  final Set<String> sequences = {};
+  final Set<String> applied = {};
+  final List<String> eventIds = [];
+  FormData? lastForm;
+  int photos = 0;
 
-  /// Falhas programadas por etapa ('proof', 'photo-1', 'photo-2',
-  /// 'complete'): devolvem a falha em vez da resposta normal.
-  final Map<
-    String,
-    Object Function(RequestOptions request, Object Function() apply)
-  >
-  faults = {};
-
-  Object _step(String step, RequestOptions request, Object Function() apply) {
-    final fault = faults.remove(step);
-    return fault == null ? apply() : fault(request, apply);
-  }
-
-  static String _field(RequestOptions request, String name) =>
-      (request.data as FormData).fields
-          .firstWhere((entry) => entry.key == name)
-          .value;
+  /// Falhas programadas para as próximas chamadas, em ordem.
+  final List<Object Function(RequestOptions request, Object Function() apply)>
+  faults = [];
 }
 
 ActiveRouteStop _stop() => ActiveRouteStop(
@@ -139,7 +87,10 @@ ActiveRouteStop _stop() => ActiveRouteStop(
   existingNotes: '',
 );
 
-DeliveryProofSubmission _submission() => DeliveryProofSubmission(
+DeliveryProofSubmission _submission({
+  double? latitude = -22.8,
+  double? longitude = -43.0,
+}) => DeliveryProofSubmission(
   stop: _stop(),
   recipientName: 'Maria',
   recipientDocument: '',
@@ -148,10 +99,12 @@ DeliveryProofSubmission _submission() => DeliveryProofSubmission(
     DeliveryPhotoUpload(bytes: Uint8List(8), filename: 'a.jpg'),
     DeliveryPhotoUpload(bytes: Uint8List(8), filename: 'b.jpg'),
   ],
-  signatureBytes: null,
-  latitude: -22.8,
-  longitude: -43.0,
-  itemResults: const [],
+  signatureBytes: Uint8List(4),
+  latitude: latitude,
+  longitude: longitude,
+  itemResults: const [
+    DeliveryItemResult(id: 5, status: 'failed', reason: 'avaria', notes: 'x'),
+  ],
 );
 
 FaultReply _echoRef(RequestOptions request, FaultReply reply) => FaultReply(
@@ -165,274 +118,283 @@ FaultReply _echoRef(RequestOptions request, FaultReply reply) => FaultReply(
 );
 
 void main() {
-  late _DeliveryBackend backend;
+  late _SyncBackend backend;
   late ApiClient client;
   late ActiveRouteService service;
+  late OfflineRequestQueue queue;
   late List<OfflineQueueEvent> events;
   late StreamSubscription<OfflineQueueEvent> subscription;
 
   setUp(() {
     ApiFailureLog.instance.clear();
-    backend = _DeliveryBackend();
+    backend = _SyncBackend();
     client = faultClient(backend.server);
     service = ActiveRouteService(client, storage: const FakeSessionStorage());
+    queue = client.offlineRequests;
     events = [];
     subscription = client.offlineRequests.events.listen(events.add);
   });
   tearDown(() => subscription.cancel());
 
-  /// Invariantes de uma baixa bem-sucedida, venha de quantas tentativas vier.
   void expectDeliveredExactlyOnce() {
-    expect(backend.completed, isTrue, reason: 'a baixa não chegou ao servidor');
-    expect(backend.completions, 1);
-    expect(backend.proofCreates, 1, reason: 'comprovante duplicado');
-    expect(backend.sequences, {'1', '2'});
-    expect(client.offlineRequests.pendingCount, 0);
+    expect(backend.applied, hasLength(1), reason: 'baixa duplicada/perdida');
+    expect(backend.photos, 2);
+    expect(queue.pendingCount, 0);
+    expect(queue.rejectedRequests, isEmpty);
     expect(
-      events.where((event) => event.type == OfflineQueueEventType.rejected),
-      isEmpty,
-      reason: 'a baixa foi descartada: ${events.map((e) => e.error)}',
+      backend.eventIds.toSet(),
+      hasLength(1),
+      reason: 'todo reenvio usa o mesmo client_event_id',
     );
   }
 
-  group('queda de rede em cada etapa da baixa', () {
-    // "antes": a requisição não chegou. "resposta perdida": o servidor
-    // gravou e a resposta se perdeu no 4G — o caso que desfazia a entrega.
-    for (final step in ['proof', 'photo-1', 'photo-2', 'complete']) {
-      for (final lost in [false, true]) {
-        final label = lost ? 'resposta perdida' : 'antes de chegar';
-        test('$step / $label: fica na fila e conclui uma vez só', () async {
-          backend.faults[step] = (request, apply) {
-            if (lost) apply();
-            return networkDown(request);
-          };
+  test('com sinal, uma requisição só e a auditoria volta na hora', () async {
+    final result = await service.complete(_submission());
 
-          final first = await service.complete(_submission());
-          expect(first.queued, isTrue);
-          expect(
-            service.cachedRoute(42),
-            isNull,
-            reason: 'sem rota em cache não há o que restaurar',
-          );
+    expect(result.queued, isFalse);
+    expect(result.value!.deliveryWithinPlannedRadius, isTrue);
+    expect(result.value!.trackerValidationStatus, 'match');
+    expect(backend.server.requestsTo('POST', _syncPath), hasLength(1));
+    final fields = {
+      for (final entry in backend.lastForm!.fields) entry.key: entry.value,
+    };
+    expect(fields['kind'], 'stop.complete');
+    expect(fields['stop_id'], '42');
+    expect(fields['recipient_name'], 'Maria');
+    // O servidor lê `items` (o app antigo mandava `item_results`).
+    expect(fields['items'], contains('"status":"failed"'));
+    expect(fields['occurred_at'], isNotEmpty);
+    expect(fields['sent_at'], isNotEmpty);
+    expect(
+      backend.lastForm!.files.map((entry) => entry.key),
+      containsAll(['photos', 'signature']),
+    );
+    expectDeliveredExactlyOnce();
+  });
 
-          await client.offlineRequests.retryNow(manual: true);
-
-          expectDeliveredExactlyOnce();
-          // O reenvio usa a mesma chave base de idempotência.
-          final keys = backend.server
-              .requestsTo('POST', _completePath)
-              .map((request) => request.idempotencyKey)
-              .toSet();
-          expect(keys, hasLength(1));
+  group('queda de rede na baixa', () {
+    for (final lost in [false, true]) {
+      final label = lost ? 'resposta perdida' : 'antes de chegar';
+      test('$label: salva no aparelho e conclui uma vez só', () async {
+        backend.faults.add((request, apply) {
+          if (lost) apply();
+          return networkDown(request);
         });
-      }
+
+        final first = await service.complete(_submission());
+        expect(first.queued, isTrue);
+        expect(queue.pendingCount, 1);
+
+        await queue.retryNow(manual: true);
+        expectDeliveredExactlyOnce();
+      });
     }
 
-    test('timeout no upload da foto e servidor ocupado em seguida', () async {
-      backend.faults['photo-1'] = (request, _) => uploadTimeout(request);
-      backend.faults['complete'] = (request, _) => FaultReply.json({
-        'detail': 'Servidor ocupado no momento. Tente novamente.',
-      }, status: 503);
+    test('timeout no upload e servidor ocupado em seguida', () async {
+      backend.faults
+        ..add((request, _) => uploadTimeout(request))
+        ..add(
+          (_, _) => FaultReply.json({
+            'detail': 'Servidor ocupado no momento. Tente novamente.',
+          }, status: 503),
+        );
 
       expect((await service.complete(_submission())).queued, isTrue);
-      await client.offlineRequests.retryNow(manual: true);
-      expect(client.offlineRequests.pendingCount, 1, reason: '503 mantém');
-      await client.offlineRequests.retryNow(manual: true);
+      await queue.retryNow(manual: true);
+      expect(queue.pendingCount, 1, reason: '503 mantém');
+      await queue.retryNow(manual: true);
 
       expectDeliveredExactlyOnce();
       final log = ApiFailureLog.instance.export();
-      expect(log, contains('ETEMPO Enviar foto 1 de 2'));
-      expect(log, contains('E503-OCUP Confirmar entrega'));
+      expect(log, contains('ETEMPO Enviar baixa'));
+      expect(log, contains('E503-OCUP Enviar baixa'));
+    });
+
+    test('sem sinal por muito tempo: nunca descarta e registra cada '
+        'tentativa com etapa e referência', () async {
+      backend.server.on(
+        'GET',
+        '/api/v1/',
+        (request, _) => networkDown(request),
+      );
+      backend.faults.add((request, _) => networkDown(request));
+
+      expect((await service.complete(_submission())).queued, isTrue);
+      for (var attempt = 0; attempt < 6; attempt++) {
+        await queue.retryNow(manual: attempt == 0);
+      }
+
+      expect(queue.pendingCount, 1, reason: 'nunca descarta');
+      expect(queue.rejectedRequests, isEmpty);
+      final entries = ApiFailureLog.instance.entries.value;
+      expect(
+        entries.every((entry) => entry.failure.requestId.startsWith('m')),
+        isTrue,
+      );
     });
   });
 
-  group('resposta que nao e da API', () {
-    test(
-      'portal da operadora na confirmacao nao conta como entregue',
-      () async {
-        backend.faults['complete'] = (_, _) => const FaultReply.captivePortal();
+  group('resposta que não é da API', () {
+    test('portal da operadora não conta como entregue', () async {
+      backend.faults.add((_, _) => const FaultReply.captivePortal());
 
-        final first = await service.complete(_submission());
+      final first = await service.complete(_submission());
 
-        expect(
-          first.queued,
-          isTrue,
-          reason: 'HTML 200 era aceito como sucesso',
-        );
-        expect(backend.completed, isFalse);
-        await client.offlineRequests.retryNow(manual: true);
-        expectDeliveredExactlyOnce();
-      },
-    );
-
-    test('portal depois de o servidor concluir: reenvio so confere', () async {
-      backend.faults['complete'] = (_, apply) {
-        apply();
-        return const FaultReply.captivePortal();
-      };
-
-      expect((await service.complete(_submission())).queued, isTrue);
-      await client.offlineRequests.retryNow(manual: true);
-
+      expect(first.queued, isTrue, reason: 'HTML 200 era aceito como sucesso');
+      expect(backend.applied, isEmpty);
+      await queue.retryNow(manual: true);
       expectDeliveredExactlyOnce();
-      expect(backend.server.requestsTo('POST', _completePath), hasLength(1));
     });
 
-    test(
-      'comprovante criado sem id fica na fila e retoma pelo servidor',
-      () async {
-        backend.faults['proof'] = (_, apply) {
-          apply();
-          return <String, dynamic>{};
-        };
+    test('portal depois de o servidor aplicar: reenvio não duplica', () async {
+      backend.faults.add((_, apply) {
+        apply();
+        return const FaultReply.captivePortal();
+      });
 
-        expect((await service.complete(_submission())).queued, isTrue);
-        await client.offlineRequests.retryNow(manual: true);
+      expect((await service.complete(_submission())).queued, isTrue);
+      await queue.retryNow(manual: true);
 
-        expectDeliveredExactlyOnce();
-        expect(backend.proofPatches, 1);
-      },
-    );
+      expectDeliveredExactlyOnce();
+    });
 
     test('Cloudflare bloqueando o IP da operadora fica na fila', () async {
-      backend.faults['proof'] = (_, _) => const FaultReply(
-        403,
-        body: '<html>challenge</html>',
-        contentType: 'text/html',
-        headers: {'cf-mitigated': 'challenge'},
+      backend.faults.add(
+        (_, _) => const FaultReply(
+          403,
+          body: '<html>challenge</html>',
+          contentType: 'text/html',
+          headers: {'cf-mitigated': 'challenge'},
+        ),
       );
 
       expect((await service.complete(_submission())).queued, isTrue);
-      await client.offlineRequests.retryNow(manual: true);
+      await queue.retryNow(manual: true);
+      expectDeliveredExactlyOnce();
+    });
+
+    test('erro interno (500) é tratado como passageiro, não apaga', () async {
+      backend.faults.add(
+        (_, _) => const FaultReply(
+          500,
+          body: '<h1>Server Error (500)</h1>',
+          contentType: 'text/html',
+        ),
+      );
+
+      expect((await service.complete(_submission())).queued, isTrue);
+      expect(queue.pendingCount, 1);
+      await queue.retryNow(manual: true);
       expectDeliveredExactlyOnce();
     });
   });
 
-  group('recusa definitiva diz etapa, campo, motivo e referencia', () {
+  group('recusa definitiva diz etapa, campo, motivo e referência', () {
     Future<String> refusal() async {
       try {
         await service.complete(_submission());
       } on ActiveRouteException catch (error) {
-        expect(client.offlineRequests.pendingCount, 0);
+        expect(queue.pendingCount, 0);
+        expect(queue.rejectedRequests, isEmpty, reason: 'já foi mostrada');
         return error.message;
       }
       fail('a baixa deveria ter sido recusada');
     }
 
-    test('foto 2 corrompida (400)', () async {
-      backend.faults['photo-2'] = (request, _) => _echoRef(
-        request,
-        FaultReply.json({
-          'file': [
+    test('foto corrompida (400)', () async {
+      backend.faults.add(
+        (request, _) => _echoRef(
+          request,
+          FaultReply.json([
             'Foto corrompida ou em formato inválido. Tire a foto novamente.',
-          ],
-        }, status: 400),
+          ], status: 400),
+        ),
       );
 
       final message = await refusal();
 
-      expect(message, startsWith('Enviar foto 2 de 2: Foto: Foto corrompida'));
+      expect(message, startsWith('Enviar baixa: Foto corrompida'));
       expect(message, matches(RegExp(r'\(E400-RECUSA · ref m[a-z2-9]{10}\)$')));
-      expect(backend.completed, isFalse);
+      expect(backend.applied, isEmpty);
     });
 
-    test('erro interno com pagina HTML (500)', () async {
-      backend.faults['complete'] = (_, _) => const FaultReply(
-        500,
-        body: '<h1>Server Error (500)</h1>',
-        contentType: 'text/html',
-      );
-
-      final message = await refusal();
-
-      expect(
-        message,
-        startsWith('Confirmar entrega: erro interno no servidor'),
-      );
-      expect(message, contains('E500-SRV · ref m'));
-      expect(message, isNot(contains('<h1>')));
-    });
-
-    test('comprovante grande demais para o proxy (413)', () async {
-      backend.faults['proof'] = (_, _) => const FaultReply(
-        413,
-        body: '<html>413 Request Entity Too Large</html>',
-        contentType: 'text/html',
+    test('baixa grande demais para o proxy (413)', () async {
+      backend.faults.add(
+        (_, _) => const FaultReply(
+          413,
+          body: '<html>413 Request Entity Too Large</html>',
+          contentType: 'text/html',
+        ),
       );
 
       expect(
         await refusal(),
-        startsWith('Enviar comprovante: arquivo grande demais'),
+        startsWith('Enviar baixa: arquivo grande demais'),
       );
     });
 
-    test('sessao expirada sem refresh (401)', () async {
-      backend.faults['proof'] = (_, _) => FaultReply.json({
-        'detail': 'Token inválido ou expirado.',
-      }, status: 401);
-
-      final message = await refusal();
-
-      expect(message, contains('Enviar comprovante: Token inválido'));
-      expect(message, contains('E401-SESSAO'));
-    });
-
     test('parada transferida para outro entregador (404)', () async {
-      backend.faults['complete'] = (_, _) =>
-          FaultReply.json({'detail': 'Não encontrado.'}, status: 404);
+      backend.faults.add(
+        (_, _) => FaultReply.json({'detail': 'Não encontrado.'}, status: 404),
+      );
 
-      expect(await refusal(), contains('Confirmar entrega: Não encontrado.'));
+      expect(await refusal(), contains('Enviar baixa: Não encontrado.'));
     });
 
-    test('coordenadas invalidas sao barradas antes da rede', () async {
+    test(
+      'recusa depois, com a tela fechada, fica em "precisa de atenção"',
+      () async {
+        backend.faults
+          ..add((request, _) => networkDown(request))
+          ..add(
+            (_, _) =>
+                FaultReply.json({'detail': 'Não encontrado.'}, status: 404),
+          );
+
+        expect((await service.complete(_submission())).queued, isTrue);
+        await queue.retryNow(manual: true);
+
+        expect(queue.pendingCount, 0);
+        expect(queue.rejectedRequests, hasLength(1));
+        expect(
+          queue.rejectedRequests.single.rejection,
+          contains('Não encontrado'),
+        );
+        await Future<void>.delayed(Duration.zero);
+        expect(
+          events.where((event) => event.type == OfflineQueueEventType.rejected),
+          hasLength(1),
+        );
+      },
+    );
+
+    test('sessão expirada (401): espera novo login, não descarta', () async {
+      backend.faults.add(
+        (_, _) => FaultReply.json({
+          'detail': 'Token inválido ou expirado.',
+        }, status: 401),
+      );
+
+      expect((await service.complete(_submission())).queued, isTrue);
+      expect(queue.status.value.needsLogin, isTrue);
+      expect(queue.pendingCount, 1);
+      expect(queue.rejectedRequests, isEmpty);
+    });
+
+    test('coordenadas inválidas são barradas antes da rede', () async {
       for (final (lat, lon) in [
         (double.nan, -43.0),
         (-22.8, double.infinity),
         (95.0, -43.0),
         (-22.8, 190.0),
       ]) {
-        final submission = _submission();
         await expectLater(
-          service.complete(
-            DeliveryProofSubmission(
-              stop: submission.stop,
-              recipientName: 'Maria',
-              recipientDocument: '',
-              notes: '',
-              photos: submission.photos,
-              signatureBytes: null,
-              latitude: lat,
-              longitude: lon,
-              itemResults: const [],
-            ),
-          ),
+          service.complete(_submission(latitude: lat, longitude: lon)),
           throwsA(isA<ActiveRouteException>()),
           reason: '$lat,$lon',
         );
       }
       expect(backend.server.seen, isEmpty);
     });
-  });
-
-  test('reenvio esgotado mantem a baixa e o diagnostico registra cada '
-      'tentativa com etapa e referencia', () async {
-    backend.server.on('GET', '/api/v1/', (request, _) => networkDown(request));
-    backend.faults['proof'] = (request, _) => networkDown(request);
-
-    expect((await service.complete(_submission())).queued, isTrue);
-    for (var attempt = 0; attempt < 3; attempt++) {
-      await client.offlineRequests.retryNow(manual: attempt == 0);
-    }
-
-    expect(client.offlineRequests.pendingCount, 1, reason: 'nunca descarta');
-    final entries = ApiFailureLog.instance.entries.value;
-    expect(
-      entries.map((entry) => entry.failure.stage),
-      contains('Enviar comprovante'),
-    );
-    expect(
-      entries.every((entry) => entry.failure.requestId.startsWith('m')),
-      isTrue,
-    );
   });
 }

@@ -1,17 +1,24 @@
+import 'dart:async';
+
 import 'package:dio/dio.dart';
 
 import '../../../core/network/api_collection.dart';
 import '../../../core/network/api_client.dart';
+import '../../../core/network/offline_deadline.dart';
 import '../../../core/network/offline_request_queue.dart';
 import '../../../core/network/paged_result.dart';
 import '../../../core/presentation/delivery_terminology.dart';
+import '../../../core/sync/mobile_sync.dart';
+import 'active_route_service.dart';
+import 'local_pickup_state.dart';
+import 'local_route_state.dart';
 import 'pickup_label_scope.dart';
+import 'route_snapshot_store.dart';
 
-/// Normaliza somente o que o contrato da retirada permite ao comparar no app.
-///
-/// Espacos internos fazem parte do codigo. A validacao definitiva continua
-/// sendo feita pela API.
-String normalizePickupCode(String code) => code.trim().toUpperCase();
+/// Normaliza a etiqueta como o servidor compara (`pickup._match`): sem
+/// diferenciar caixa e sem espaço nenhum. Com a conferência feita sem rede,
+/// o app precisa aceitar e recusar exatamente o que a API aceita e recusa.
+String normalizePickupCode(String code) => pickupMatchKey(code);
 
 class WaveListItem {
   const WaveListItem({
@@ -186,6 +193,21 @@ class WaveOrderItem {
   final String state;
   final int units;
   final int weightGrams;
+
+  WaveOrderItem withStopStatus(String status) => WaveOrderItem(
+    stopId: stopId,
+    sequence: sequence,
+    stopStatus: status,
+    plannedEta: plannedEta,
+    orderId: orderId,
+    orderNumber: orderNumber,
+    customerName: customerName,
+    address: address,
+    city: city,
+    state: state,
+    units: units,
+    weightGrams: weightGrams,
+  );
 }
 
 class WaveServiceException implements Exception {
@@ -203,22 +225,46 @@ class _WaveListSnapshot {
 }
 
 class WaveService {
-  WaveService(this.apiClient) {
+  WaveService(
+    this.apiClient, {
+    MobileSync? sync,
+    RouteSnapshotStore? pickupStore,
+    RouteSnapshotStore? listStore,
+  }) : sync = sync ?? MobileSync(apiClient),
+       _pickupStore = pickupStore ?? RouteSnapshotStore.pickup(),
+       _listStore =
+           listStore ??
+           RouteSnapshotStore(folder: 'wave_list', prefix: 'list') {
     apiClient.offlineRequests.registerRestoreHandler(_prepareRouteType, (
       key,
       payload,
       _,
     ) async {
       final waveId = _asInt(payload['wave_id']);
-      if (waveId == null) return;
+      if (waveId == null) return null;
       await _postPrepareRoute(waveId, key);
       invalidateCache();
+      return null;
     });
+    _syncSubscription = this.sync.applied.listen(
+      (applied) => unawaited(_onSyncApplied(applied)),
+    );
   }
 
+  final MobileSync sync;
+  final RouteSnapshotStore _pickupStore;
+  final RouteSnapshotStore _listStore;
+  // Mantida viva durante todo o app (o serviço é um singleton).
+  // ignore: unused_field
+  late final StreamSubscription<SyncApplied> _syncSubscription;
+
+  /// Status calculado no aparelho para a lista (definido pelo app).
+  ActiveRouteService? activeRoutes;
+
+  /// Última conferência lida do servidor, por carga.
+  final Map<int, Map<String, dynamic>> _pickupRaw = {};
+
   static const _prepareRouteType = 'wave.prepare_route';
-  // Mesmo tipo registrado pelo ActiveRouteService para iniciar a rota.
-  static const _routeStartType = 'active_route.route_start';
   final ApiClient apiClient;
   static const _listCacheDuration = Duration(seconds: 30);
   _WaveListSnapshot? _listCache;
@@ -270,7 +316,7 @@ class WaveService {
         if (waveId == null) continue;
         final route = routesByWave[waveId];
         final item = _waveItem(waveId, wave, route);
-        if (_matches(item, query, status)) items.add(item);
+        if (_matches(item, query, '')) items.add(item);
       }
     } else {
       // Compatibilidade enquanto a API do entregador ainda não expõe waves.
@@ -280,10 +326,25 @@ class WaveService {
         if (waveId == null || routeId == null) continue;
         final item = _routeItem(waveId, routeId, route);
         if (!items.any((current) => current.waveId == waveId) &&
-            _matches(item, query, status)) {
+            _matches(item, query, '')) {
           items.add(item);
         }
       }
+    }
+
+    // Ler a cópia de cada rota do disco custa caro (centenas de ms com o
+    // histórico inteiro); só vale para cargas da página atual e quando há
+    // ação do aparelho que o servidor ainda pode não refletir.
+    final hasLocal = sync.localEvents().isNotEmpty;
+    final firstIndex = (page - 1) * pageSize;
+    for (var index = 0; index < items.length; index++) {
+      final onPage = index >= firstIndex && index < firstIndex + pageSize;
+      if (hasLocal && (onPage || status.isNotEmpty)) {
+        items[index] = await _withLocalStatus(items[index]);
+      }
+    }
+    if (status.isNotEmpty) {
+      items.removeWhere((item) => item.status != status);
     }
 
     final start = (page - 1) * pageSize;
@@ -306,6 +367,42 @@ class WaveService {
   void invalidateCache() {
     _listCacheGeneration++;
     _listCache = null;
+  }
+
+  /// Logout/troca de conta.
+  void clearSessionData({required bool keepOffline}) {
+    invalidateCache();
+    _pickupRaw.clear();
+    if (!keepOffline) {
+      unawaited(_pickupStore.clear());
+      unawaited(_listStore.clear());
+    }
+  }
+
+  /// Status da carga com o que foi feito no aparelho e ainda não chegou ao
+  /// servidor (rota iniciada, concluída), pela mesma regra do servidor.
+  Future<WaveListItem> _withLocalStatus(WaveListItem item) async {
+    final routeId = item.routeId;
+    if (routeId == null || activeRoutes == null) return item;
+    ActiveRoute? route;
+    try {
+      route = await activeRoutes!.storedRoute(routeId);
+    } catch (_) {}
+    if (route == null) return item;
+    final status = WaveService.displayStatus(
+      route.waveStatus.isNotEmpty ? route.waveStatus : item.status,
+      route.status,
+    );
+    if (status == item.status) return item;
+    return WaveListItem(
+      waveId: item.waveId,
+      routeId: item.routeId,
+      routeNumber: item.routeNumber,
+      status: status,
+      plannedDistanceMeters: item.plannedDistanceMeters,
+      plannedStart: item.plannedStart,
+      createdAt: item.createdAt,
+    );
   }
 
   Future<_WaveListSnapshot> _getListSnapshot({required bool refresh}) async {
@@ -338,11 +435,26 @@ class WaveService {
   Future<_WaveListSnapshot> _loadListSnapshot() async {
     // Só as mais recentes: a tela pagina localmente de 20 em 20 e o
     // histórico inteiro crescia uma página (uma ida e volta) a cada 100.
-    final results = await Future.wait([
-      apiClient.getRecentPages('/api/v1/delivery/rotas/'),
-      _getWavesAllowed(),
-    ]);
-    return _WaveListSnapshot(DateTime.now(), results[0], results[1]);
+    try {
+      final results = await Future.wait([
+        apiClient.getRecentPages('/api/v1/delivery/rotas/'),
+        _getWavesAllowed(),
+      ]).timeout(OfflineDeadline.read);
+      unawaited(
+        _listStore.save(0, {'routes': results[0], 'waves': results[1]}),
+      );
+      return _WaveListSnapshot(DateTime.now(), results[0], results[1]);
+    } catch (error) {
+      // Sem sinal: a última lista salva, com o status calculado no aparelho.
+      if (!isOfflineError(error)) rethrow;
+      final stored = await _listStore.read(0);
+      if (stored == null) rethrow;
+      List<Map<String, dynamic>> list(String key) => [
+        for (final item in stored[key] is List ? stored[key] as List : [])
+          if (item is Map) Map<String, dynamic>.from(item),
+      ];
+      return _WaveListSnapshot(DateTime.now(), list('routes'), list('waves'));
+    }
   }
 
   Future<List<Map<String, dynamic>>> _getWavesAllowed() async {
@@ -430,7 +542,129 @@ class WaveService {
     (wave['created_at'] ?? wave['opened_at'])?.toString() ?? '',
   );
 
+  /// Detalhe da carga. Sem sinal, monta a partir das cópias no aparelho
+  /// (rota e conferência) com as ações ainda não enviadas aplicadas.
   Future<WaveDetails> getWaveDetails(WaveListItem wave) async {
+    try {
+      final details = await _fetchWaveDetails(
+        wave,
+      ).timeout(OfflineDeadline.read);
+      // Deixa a rota salva no aparelho para o mapa abrir sem sinal depois.
+      final routeId = details.routeId;
+      if (routeId != null) {
+        unawaited(
+          activeRoutes?.getRoute(routeId).then((_) {}, onError: (_) {}),
+        );
+      }
+      return _withLocalDetails(details);
+    } catch (error) {
+      if (!isOfflineError(error)) rethrow;
+      final offline = await _offlineDetails(wave);
+      if (offline == null) rethrow;
+      return offline;
+    }
+  }
+
+  Future<WaveDetails> _withLocalDetails(WaveDetails details) async {
+    final local = await _withLocalStatus(
+      WaveListItem(
+        waveId: details.waveId,
+        routeId: details.routeId,
+        routeNumber: details.routeNumber,
+        status: details.status,
+        plannedDistanceMeters: details.plannedDistanceMeters,
+        plannedStart: details.plannedStart,
+        createdAt: null,
+      ),
+    );
+    final routeId = details.routeId;
+    final route = routeId == null
+        ? null
+        : await activeRoutes?.storedRoute(routeId).catchError((_) => null);
+    final stopStatus = {
+      for (final stop in route?.stops ?? const <ActiveRouteStop>[])
+        stop.stopId: stop.status,
+    };
+    return WaveDetails(
+      waveId: details.waveId,
+      routeId: details.routeId,
+      routeNumber: details.routeNumber,
+      status: local.status,
+      plannedDistanceMeters: details.plannedDistanceMeters,
+      plannedDurationSeconds: details.plannedDurationSeconds,
+      plannedStart: details.plannedStart,
+      plannedEnd: details.plannedEnd,
+      orders: [
+        for (final order in details.orders)
+          stopStatus[order.stopId] == null ||
+                  stopStatus[order.stopId] == order.stopStatus
+              ? order
+              : order.withStopStatus(stopStatus[order.stopId]!),
+      ],
+      pickup: details.pickup,
+    );
+  }
+
+  Future<WaveDetails?> _offlineDetails(WaveListItem wave) async {
+    final routeId = wave.routeId;
+    final route = routeId == null
+        ? null
+        : await activeRoutes?.storedRoute(routeId).catchError((_) => null);
+    final pickupRaw = await _storedPickup(wave.waveId);
+    if (route == null && pickupRaw == null) return null;
+    final pickup = pickupRaw == null
+        ? PickupProgress.disabled(wave.waveId)
+        : _localPickup(wave.waveId, pickupRaw);
+    final local = await _withLocalStatus(wave);
+    return WaveDetails(
+      waveId: wave.waveId,
+      routeId: routeId,
+      routeNumber: route?.routeNumber ?? wave.routeNumber,
+      status: local.status,
+      plannedDistanceMeters: wave.plannedDistanceMeters,
+      plannedDurationSeconds: 0,
+      plannedStart: wave.plannedStart,
+      plannedEnd: null,
+      orders: route != null
+          ? [
+              for (final stop in route.stops)
+                WaveOrderItem(
+                  stopId: stop.stopId,
+                  sequence: stop.sequence,
+                  stopStatus: stop.status,
+                  plannedEta: stop.plannedEta,
+                  orderId: stop.orderId,
+                  orderNumber: stop.orderNumber,
+                  customerName: stop.customerName,
+                  address: stop.fullAddress,
+                  city: '',
+                  state: '',
+                  units: stop.units,
+                  weightGrams: stop.weightGrams,
+                ),
+            ]
+          : [
+              for (final (index, order) in pickup.orders.indexed)
+                WaveOrderItem(
+                  stopId: 0,
+                  sequence: index + 1,
+                  stopStatus: order.isPickedUp ? 'ready' : 'awaiting_pickup',
+                  plannedEta: null,
+                  orderId: order.orderId,
+                  orderNumber: order.orderNumber,
+                  customerName: order.customer,
+                  address: '',
+                  city: '',
+                  state: '',
+                  units: order.totalLabels,
+                  weightGrams: 0,
+                ),
+            ],
+      pickup: pickup,
+    );
+  }
+
+  Future<WaveDetails> _fetchWaveDetails(WaveListItem wave) async {
     final routeId = wave.routeId;
     final refreshToken = DateTime.now().microsecondsSinceEpoch;
     final freshQuery = {'_detail_refresh': refreshToken};
@@ -650,79 +884,173 @@ class WaveService {
     );
   }
 
+  /// Conferência da carga. Sem sinal, usa a última cópia salva no aparelho
+  /// com as leituras ainda não enviadas por cima.
   Future<PickupProgress> getPickupProgress(int waveId) async {
+    // Antes da requisição: leitura confirmada depois disto é sobreposta.
+    final fetchedAt = DateTime.now().toUtc().toIso8601String();
     try {
-      final response = await apiClient.dio.get<dynamic>(
-        '/api/v1/delivery/waves/$waveId/retirada/',
-        queryParameters: {
-          '_detail_refresh': DateTime.now().microsecondsSinceEpoch,
-        },
-        options: Options(
-          headers: const {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'},
-        ),
+      final response = await apiClient.dio
+          .get<dynamic>(
+            '/api/v1/delivery/waves/$waveId/retirada/',
+            queryParameters: {
+              '_detail_refresh': DateTime.now().microsecondsSinceEpoch,
+            },
+            options: Options(
+              headers: const {
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
+              },
+            ),
+          )
+          .timeout(OfflineDeadline.read);
+      if (response.data is Map) {
+        final raw = applyLocalPickup(
+          Map<String, dynamic>.from(response.data as Map),
+          waveId,
+          sync.confirmedEvents(fetchedAt: DateTime.parse(fetchedAt)),
+        )..['fetched_at'] = fetchedAt;
+        _pickupRaw[waveId] = raw;
+        unawaited(_pickupStore.save(waveId, raw));
+      }
+      return _localPickup(waveId, _pickupRaw[waveId] ?? response.data);
+    } on TimeoutException {
+      final raw = await _storedPickup(waveId);
+      if (raw != null) return _localPickup(waveId, raw);
+      throw const WaveServiceException(
+        'Sem conexão e sem cópia desta carga no aparelho. Abra a '
+        'conferência uma vez com internet para poder conferir sem sinal.',
       );
-      return WaveService.parsePickupProgress(response.data, waveId);
     } on DioException catch (error) {
       if (error.response?.statusCode == 405) {
         return PickupProgress.disabled(waveId);
+      }
+      if (OfflineRequestQueue.isNetworkFailure(error)) {
+        final raw = await _storedPickup(waveId);
+        if (raw != null) return _localPickup(waveId, raw);
+        throw const WaveServiceException(
+          'Sem conexão e sem cópia desta carga no aparelho. Abra a '
+          'conferência uma vez com internet para poder conferir sem sinal.',
+        );
       }
       throw WaveServiceException(_errorMessage(error));
     }
   }
 
+  Future<Map<String, dynamic>?> _storedPickup(int waveId) async {
+    final cached = _pickupRaw[waveId];
+    if (cached != null) return cached;
+    final stored = await _pickupStore.read(waveId);
+    // Uma leitura do servidor chegou enquanto o disco era lido: vale ela.
+    final newer = _pickupRaw[waveId];
+    if (newer != null) return newer;
+    if (stored != null) _pickupRaw[waveId] = stored;
+    return stored;
+  }
+
+  Map<String, dynamic> _localPickupRaw(int waveId, Object? raw) {
+    final data = raw is Map
+        ? Map<String, dynamic>.from(raw)
+        : <String, dynamic>{};
+    return applyLocalPickup(
+      data,
+      waveId,
+      sync.localEvents(
+        fetchedAt: DateTime.tryParse(data['fetched_at']?.toString() ?? ''),
+      ),
+    );
+  }
+
+  PickupProgress _localPickup(int waveId, Object? raw) =>
+      WaveService.parsePickupProgress(_localPickupRaw(waveId, raw), waveId);
+
+  /// Bipa uma etiqueta. A validação usa a cópia local com as mesmas regras
+  /// da API; a leitura é salva no aparelho e enviada em segundo plano.
   Future<PickupProgress> registerPickup({
     required int waveId,
     required String code,
   }) async {
-    final scannedCode = code.trim();
-    if (scannedCode.isEmpty) {
+    if (code.trim().isEmpty) {
       throw const WaveServiceException('Informe o código da etiqueta.');
     }
-    try {
-      final response = await apiClient.dio.post<dynamic>(
-        '/api/v1/delivery/waves/$waveId/retirada/',
-        data: {'code': scannedCode},
-      );
-      invalidateCache();
-      return WaveService.parsePickupProgress(response.data, waveId);
-    } on DioException catch (error) {
-      if (OfflineRequestQueue.isNetworkFailure(error)) {
-        throw const WaveServiceException(
-          'Sem conexão. A conferência da retirada precisa de internet.',
-        );
-      }
-      throw WaveServiceException(_errorMessage(error));
+    var raw = await _storedPickup(waveId);
+    if (raw == null) {
+      await getPickupProgress(waveId);
+      raw = await _storedPickup(waveId);
     }
+    var check = matchPickupCode(_localPickupRaw(waveId, raw), code);
+    if (check.match == null && check.refusal!.startsWith('Nenhum pedido')) {
+      // A carga pode ter mudado (pedido transferido para ela): com sinal,
+      // confere a versão atual antes de recusar.
+      try {
+        await getPickupProgress(waveId);
+        check = matchPickupCode(
+          _localPickupRaw(waveId, await _storedPickup(waveId)),
+          code,
+        );
+      } on WaveServiceException {
+        // Sem rede vale a cópia local.
+      }
+    }
+    final match = check.match;
+    if (match == null) throw WaveServiceException(check.refusal!);
+    await sync.record(
+      kind: SyncKind.pickupScan,
+      resourceKey: 'wave:$waveId',
+      description: 'Conferir etiqueta ${match.code}',
+      fields: {'wave_id': waveId, 'code': match.code},
+    );
+    invalidateCache();
+    return _localPickup(waveId, await _storedPickup(waveId));
   }
 
   /// Marca um pedido da carga como "não vai".
   ///
   /// A API tira o pedido desta carga e desmembra o que ficou numa nota nova em
-  /// `manual_assignment`, liberando a roteirização do restante.
+  /// `manual_assignment`. Sem sinal, o pedido sai da conferência na hora e a
+  /// nota nova é criada quando a ação chegar ao servidor.
   Future<PickupProgress> markOrderNotGoing({
     required int waveId,
     required int orderId,
   }) async {
-    try {
-      final response = await apiClient.dio.post<dynamic>(
-        '/api/v1/delivery/waves/$waveId/nao-vai/',
-        data: {'order_id': orderId},
+    final raw = await _storedPickup(waveId);
+    final local = _localPickup(waveId, raw);
+    if (!local.orders.any((order) => order.orderId == orderId)) {
+      throw const WaveServiceException(
+        'Este pedido não pertence a esta carga.',
       );
-      invalidateCache();
-      final data = response.data;
-      if (data is Map && data['orders'] is List) {
-        return WaveService.parsePickupProgress(data, waveId);
-      }
-      return getPickupProgress(waveId);
-    } on DioException catch (error) {
-      if (OfflineRequestQueue.isNetworkFailure(error)) {
-        throw const WaveServiceException(
-          'Sem conexão. Marcar "não vai" precisa de internet para gerar a '
-          'nova nota do pedido.',
-        );
-      }
-      throw WaveServiceException(_errorMessage(error));
     }
+    await sync.record(
+      kind: SyncKind.pickupNotGoing,
+      resourceKey: 'wave:$waveId',
+      description: 'Marcar pedido que não vai',
+      fields: {'wave_id': waveId, 'order_id': orderId},
+    );
+    invalidateCache();
+    return _localPickup(waveId, raw);
+  }
+
+  /// Leitura confirmada pelo servidor: a cópia salva passa a contê-la.
+  Future<void> _onSyncApplied(SyncApplied applied) async {
+    final kind = applied.event.kind;
+    if (kind != SyncKind.pickupScan && kind != SyncKind.pickupNotGoing) {
+      return;
+    }
+    final waveId = applied.event.intField('wave_id');
+    if (waveId == null) return;
+    final raw = await _storedPickup(waveId);
+    if (raw == null) return;
+    if (kind == SyncKind.pickupScan) {
+      markPickupScanned(
+        raw,
+        applied.event.fields['code']?.toString() ?? '',
+        applied.event.occurredAt,
+      );
+    } else {
+      removePickupOrder(raw, applied.event.intField('order_id'));
+    }
+    _pickupRaw[waveId] = raw;
+    await _pickupStore.save(waveId, raw);
   }
 
   Future<Map<String, dynamic>> _getOptionalMap(
@@ -773,11 +1101,17 @@ class WaveService {
     return _asInt(value);
   }
 
+  /// Quanto esperar a roteirização antes de seguir com ela na fila.
+  static const prepareWait = Duration(seconds: 45);
+
+  /// Roteirizar depende do servidor. A ação entra na fila **depois** das
+  /// leituras de retirada feitas sem sinal: o servidor só roteiriza a carga
+  /// com a conferência completa, então a ordem de envio importa.
   Future<OfflineMutationResult<WaveListItem>> optimizeAndRelease(
     WaveListItem wave,
   ) async {
     try {
-      return await apiClient.offlineRequests.execute<WaveListItem>(
+      return await apiClient.offlineRequests.enqueue<WaveListItem>(
         resourceKey: 'wave:${wave.waveId}',
         description: 'Preparar rota da carga',
         operation: (key) => _optimizeAndReleaseRequest(wave, key),
@@ -785,6 +1119,7 @@ class WaveService {
           type: _prepareRouteType,
           payload: {'wave_id': wave.waveId},
         ),
+        waitFor: prepareWait,
       );
     } on WaveServiceException {
       rethrow;
@@ -868,27 +1203,64 @@ class WaveService {
     }
   }
 
-  Future<OfflineMutationResult<void>> startRoute(int routeId) async {
+  static const routeInProgressMessage =
+      'Você já tem uma rota em andamento. Conclua-a antes de iniciar outra.';
+
+  /// Mesma regra do servidor (`execution.start_route`): uma rota em
+  /// andamento por vez. Sem ela, sem sinal o app iniciava a segunda rota e o
+  /// servidor recusava depois — a rota nunca constava como iniciada.
+  /// Devolve o motivo da recusa, ou `null` se pode iniciar.
+  Future<String?> otherRouteInProgress(int routeId) async {
+    final serverStatus = <int, String>{};
     try {
-      final result = await apiClient.offlineRequests.execute<void>(
-        resourceKey: 'route:$routeId',
-        description: 'Iniciar rota',
-        operation: (key) async {
-          await apiClient.dio.post<dynamic>(
-            '/api/v1/delivery/rotas/$routeId/start/',
-            options: apiClient.offlineRequests.requestOptions(key),
-          );
-        },
-        persisted: PersistedOfflineRequest(
-          type: _routeStartType,
-          payload: {'route_id': routeId},
-        ),
-      );
-      invalidateCache();
-      return result;
-    } on DioException catch (error) {
-      throw WaveServiceException(_errorMessage(error));
+      final snapshot = await _getListSnapshot(refresh: true);
+      for (final route in snapshot.routes) {
+        final id = _asInt(route['id']);
+        if (id != null && id != routeId) {
+          serverStatus[id] = route['status']?.toString() ?? '';
+        }
+      }
+    } catch (_) {
+      // Sem lista nenhuma: vale o que o aparelho sabe.
     }
+    // Só as ainda não enviadas: uma confirmada já está na lista do servidor.
+    final startedHere = {
+      for (final event in sync.pending)
+        if (event.kind == SyncKind.routeStart) ?event.intField('route_id'),
+    }..remove(routeId);
+    final candidates = {
+      for (final entry in serverStatus.entries)
+        if (entry.value == 'started') entry.key,
+      ...startedHere,
+    };
+    for (final id in candidates) {
+      ActiveRoute? local;
+      try {
+        local = await activeRoutes?.storedRoute(id);
+      } catch (_) {}
+      // A cópia traz as baixas feitas no aparelho (a rota pode já ter
+      // terminado aqui, ainda sem o servidor saber). Só libera se a rota
+      // estiver encerrada: uma cópia antiga ainda "liberada" não desmente o
+      // servidor dizendo que ela está em andamento.
+      if (liveRouteStatuses.contains(local?.status ?? 'started')) {
+        return routeInProgressMessage;
+      }
+    }
+    return null;
+  }
+
+  /// Iniciar a rota vale na hora no aparelho; o servidor recebe depois.
+  Future<OfflineMutationResult<void>> startRoute(int routeId) async {
+    final blocked = await otherRouteInProgress(routeId);
+    if (blocked != null) throw WaveServiceException(blocked);
+    await sync.record(
+      kind: SyncKind.routeStart,
+      resourceKey: 'route:$routeId',
+      description: 'Iniciar rota',
+      fields: {'route_id': routeId},
+    );
+    invalidateCache();
+    return const OfflineMutationResult.queued();
   }
 
   Future<List<Map<String, dynamic>>> _getAll(

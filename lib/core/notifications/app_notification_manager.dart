@@ -7,10 +7,12 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import '../../app/app_dependencies.dart';
 import '../../features/notifications/data/notification_service.dart';
 import '../config/app_config.dart';
+import '../network/offline_request_queue.dart';
 import '../realtime/fleet_realtime_channel.dart';
 import '../realtime/notification_realtime_channel.dart';
 import '../storage/session_storage.dart';
 import 'notification_preferences.dart';
+import 'own_activity_filter.dart';
 
 class AppNotificationManager {
   AppNotificationManager({
@@ -18,7 +20,11 @@ class AppNotificationManager {
     FlutterLocalNotificationsPlugin? localNotifications,
     FleetRealtimeChannel? fleetChannel,
     NotificationRealtimeChannel? notificationChannel,
-  }) : _localNotifications =
+    this.ownActions,
+    OwnActivityFilter? ownActivity,
+    this.fleetNoticeDelay = const Duration(seconds: 4),
+  }) : _ownActivity = ownActivity ?? OwnActivityFilter(),
+       _localNotifications =
            localNotifications ?? FlutterLocalNotificationsPlugin(),
        _fleetChannel = fleetChannel ?? FleetRealtimeChannel.instance,
        _notificationChannel =
@@ -32,6 +38,15 @@ class AppNotificationManager {
   final FlutterLocalNotificationsPlugin _localNotifications;
   final FleetRealtimeChannel _fleetChannel;
   final NotificationRealtimeChannel _notificationChannel;
+
+  /// Ações do próprio entregador (fila de sincronização).
+  final Stream<OfflineQueueEvent>? ownActions;
+  final OwnActivityFilter _ownActivity;
+
+  /// Espera antes de decidir um aviso de rota/pedido: o evento do servidor
+  /// pode chegar antes da resposta da ação que o causou.
+  final Duration fleetNoticeDelay;
+  StreamSubscription<OfflineQueueEvent>? _ownActionsSubscription;
   final StreamController<DeliveryNotification> _personalEvents =
       StreamController<DeliveryNotification>.broadcast();
 
@@ -39,6 +54,10 @@ class AppNotificationManager {
   StreamSubscription<DeliveryNotification>? _notificationSubscription;
   NotificationPreferences _preferences = NotificationPreferences.defaults;
   bool _started = false;
+
+  /// Muda a cada start/stop: um start antigo que ainda lia as preferências
+  /// ou um aviso atrasado da sessão anterior não age na sessão nova.
+  int _generation = 0;
   bool _localInitialized = false;
 
   Stream<DeliveryNotification> get personalEvents => _personalEvents.stream;
@@ -47,9 +66,15 @@ class AppNotificationManager {
   Future<void> start() async {
     if (_started || !AppConfig.notificationsEnabled) return;
     _started = true;
-    _preferences = await storage.readNotificationPreferences();
-    if (!_started) return;
+    final generation = ++_generation;
+    final preferences = await storage.readNotificationPreferences();
+    if (!_started || generation != _generation) return;
+    _preferences = preferences;
 
+    _ownActionsSubscription =
+        (ownActions ??
+                AppDependencies.instance.apiClient.offlineRequests.events)
+            .listen(_ownActivity.record);
     _fleetSubscription = _fleetChannel.events.listen(_onFleetEvent);
     _notificationSubscription = _notificationChannel.events.listen(
       _onPersonalNotification,
@@ -57,19 +82,23 @@ class AppNotificationManager {
     unawaited(_notificationChannel.start());
 
     await _initializeLocalNotifications();
-    if (_started && _preferences.anyEnabled) {
+    if (_started && generation == _generation && _preferences.anyEnabled) {
       await requestPermission();
     }
   }
 
   Future<void> stop() async {
     _started = false;
+    _generation++;
+    _ownActivity.clear();
     await Future.wait([
+      if (_ownActionsSubscription != null) _ownActionsSubscription!.cancel(),
       if (_fleetSubscription != null) _fleetSubscription!.cancel(),
       if (_notificationSubscription != null)
         _notificationSubscription!.cancel(),
       _notificationChannel.stop(),
     ]);
+    _ownActionsSubscription = null;
     _fleetSubscription = null;
     _notificationSubscription = null;
   }
@@ -159,7 +188,21 @@ class AppNotificationManager {
   }
 
   void _onFleetEvent(FleetRealtimeEvent event) {
-    if (event.isRouteChange && _preferences.routeChanges) {
+    if (!event.isRouteChange && !event.isOrderChange) return;
+    final generation = _generation;
+    unawaited(
+      Future<void>.delayed(
+        fleetNoticeDelay,
+        () => _noticeFleetEvent(event, generation),
+      ),
+    );
+  }
+
+  void _noticeFleetEvent(FleetRealtimeEvent event, int generation) {
+    if (!_started || generation != _generation) return;
+    if (event.isRouteChange &&
+        _preferences.routeChanges &&
+        !_ownActivity.isOwn('route', event.routeId)) {
       final route = _displayIdentifier(
         event.data,
         keys: const ['route_number', 'number', 'name'],
@@ -178,7 +221,9 @@ class AppNotificationManager {
         ),
       );
     }
-    if (event.isOrderChange && _preferences.orderUpdates) {
+    if (event.isOrderChange &&
+        _preferences.orderUpdates &&
+        !_ownActivity.isOwn('order', event.orderId)) {
       final order = _displayIdentifier(
         event.data,
         keys: const ['order_number', 'number', 'name'],

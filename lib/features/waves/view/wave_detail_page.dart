@@ -153,7 +153,10 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
         final result = await _service.optimizeAndRelease(_currentWave);
         if (!mounted) return;
         if (result.queued) {
-          _message('Sem internet. Preparacao da carga salva para envio.');
+          _message(
+            'Sem conexão. A rota será preparada assim que houver sinal: '
+            'roteirizar depende do servidor.',
+          );
           return;
         }
         final prepared = result.value!;
@@ -169,13 +172,10 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
         );
       }
       setState(() => _currentStatus = 'started');
-      final startResult = await _service.startRoute(routeId);
+      // Salvo no aparelho na hora; o servidor recebe quando houver sinal.
+      await _service.startRoute(routeId);
       if (!mounted) return;
-      if (startResult.queued) {
-        _message('Sem internet. Inicio da rota salvo para envio automatico.');
-        return;
-      }
-      showAppMessage(context, 'Rota iniciada com sucesso.');
+      showAppMessage(context, 'Rota iniciada.');
       await _openActiveRoute();
     } on WaveServiceException catch (error) {
       if (!mounted) return;
@@ -184,6 +184,16 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
         _currentStatus = previousStatus;
       });
       showAppMessage(context, error.message);
+      unawaited(_refresh());
+    } catch (error) {
+      // Recusa do servidor ao preparar a rota (vem como o erro original):
+      // antes a tela ficava em "Roteirizando carga" com o botão travado.
+      if (!mounted) return;
+      setState(() {
+        _currentWave = previousWave;
+        _currentStatus = previousStatus;
+      });
+      showAppMessage(context, describeFailure(error));
       unawaited(_refresh());
     } finally {
       if (mounted) setState(() => _startingRoute = false);

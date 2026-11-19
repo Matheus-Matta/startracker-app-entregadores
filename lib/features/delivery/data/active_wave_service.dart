@@ -1,8 +1,10 @@
-import 'package:dio/dio.dart';
+import 'dart:async';
 
 import '../../../core/network/api_client.dart';
 import '../../../core/network/api_collection.dart';
-import '../../../core/network/offline_request_queue.dart';
+import '../../../core/network/offline_deadline.dart';
+import '../../waves/data/active_route_service.dart';
+import '../../waves/data/route_snapshot_store.dart';
 
 class ActiveWave {
   const ActiveWave({
@@ -25,7 +27,19 @@ class ActiveWave {
 }
 
 class ActiveWaveService {
-  ActiveWaveService(this.apiClient);
+  ActiveWaveService(
+    this.apiClient, {
+    this.activeRoutes,
+    RouteSnapshotStore? store,
+  }) : _store =
+           store ?? RouteSnapshotStore(folder: 'active_wave', prefix: 'routes');
+
+  /// Última lista de rotas ativas: reaberto sem sinal, o app ainda mostra a
+  /// carga em andamento (antes a tela inicial dava erro de conexão).
+  final RouteSnapshotStore _store;
+
+  /// Fonte do status calculado no aparelho (ações ainda não enviadas).
+  final ActiveRouteService? activeRoutes;
 
   static const _cacheDuration = Duration(seconds: 20);
 
@@ -68,11 +82,24 @@ class ActiveWaveService {
           _hasCache = true;
         }
         return wave;
-      } on DioException catch (error) {
-        if (_hasCache && OfflineRequestQueue.isNetworkFailure(error)) {
-          return _cached;
+      } catch (error) {
+        if (!isOfflineError(error)) rethrow;
+        if (_hasCache) {
+          final cached = _cached;
+          // Rota fechada no aparelho deixa de ser a carga ativa, mesmo sem
+          // o servidor ter confirmado ainda.
+          if (cached != null && await _locallyFinished(cached.routeId)) {
+            return null;
+          }
+          return cached;
         }
-        rethrow;
+        final stored = await _store.read(0);
+        final routes = stored?['routes'];
+        if (routes is! List) rethrow;
+        return _pick([
+          for (final item in routes)
+            if (item is Map) Map<String, dynamic>.from(item),
+        ]);
       } finally {
         if (generation == _generation) _operation = null;
       }
@@ -81,8 +108,19 @@ class ActiveWaveService {
     return operation;
   }
 
+  /// Logout: sem ação pendente, a carga do entregador não fica no aparelho.
+  void clearSessionData({required bool keepOffline}) {
+    invalidateCache();
+    if (!keepOffline) unawaited(_store.clear());
+  }
+
   Future<ActiveWave?> _loadActiveWave() async {
-    final routes = await _getAllRoutes();
+    final routes = await _getAllRoutes().timeout(OfflineDeadline.read);
+    unawaited(_store.save(0, {'routes': routes}));
+    return _pick(routes);
+  }
+
+  Future<ActiveWave?> _pick(List<Map<String, dynamic>> routes) async {
     const activeStatuses = {'released', 'accepted', 'started'};
 
     routes.sort((first, second) {
@@ -107,12 +145,17 @@ class ActiveWaveService {
     });
 
     for (final item in routes) {
-      final status = item['status']?.toString() ?? '';
+      var status = item['status']?.toString() ?? '';
       final waveId = _asInt(item['wave']);
       final routeId = _asInt(item['id']);
       if (activeStatuses.contains(status) &&
           waveId != null &&
           routeId != null) {
+        final local = await _localStatus(routeId);
+        // Só a rota fechada no aparelho sai da tela. Uma cópia antiga ainda
+        // "planejada" (salva antes da liberação) escondia a carga ativa.
+        if (local != null && !_openRouteStatuses.contains(local)) continue;
+        if (local == 'started') status = 'started';
         return ActiveWave(
           waveId: waveId,
           routeId: routeId,
@@ -127,6 +170,26 @@ class ActiveWaveService {
       }
     }
     return null;
+  }
+
+  Future<String?> _localStatus(int routeId) async {
+    try {
+      return (await activeRoutes?.storedRoute(routeId))?.status;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static const _openRouteStatuses = {
+    'planned',
+    'released',
+    'accepted',
+    'started',
+  };
+
+  Future<bool> _locallyFinished(int routeId) async {
+    final status = await _localStatus(routeId);
+    return status != null && !_openRouteStatuses.contains(status);
   }
 
   Future<List<Map<String, dynamic>>> _getAllRoutes() async {

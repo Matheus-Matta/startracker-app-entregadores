@@ -3,12 +3,17 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 
 import '../core/presentation/offline_queue_banner.dart';
+import '../core/presentation/sync_attention_page.dart';
 import '../core/theme/app_theme.dart';
 import 'app_dependencies.dart';
 import '../features/auth/view/auth_gate.dart';
+import '../features/auth/view/login_page.dart';
 
 class StarTrackerApp extends StatelessWidget {
   const StarTrackerApp({super.key});
+
+  /// O banner de envio fica acima do Navigator; abre telas por aqui.
+  static final navigatorKey = GlobalKey<NavigatorState>();
 
   @override
   Widget build(BuildContext context) {
@@ -43,6 +48,7 @@ class StarTrackerApp extends StatelessWidget {
         );
 
         return MaterialApp(
+          navigatorKey: navigatorKey,
           title: 'Star Tracker Entregas',
           debugShowCheckedModeBanner: false,
           theme: materialTheme,
@@ -58,6 +64,20 @@ class StarTrackerApp extends StatelessWidget {
           builder: (context, child) => ShadAppBuilder(
             child: OfflineQueueBanner(
               queue: AppDependencies.instance.apiClient.offlineRequests,
+              onOpenAttention: () => navigatorKey.currentState?.push(
+                MaterialPageRoute<void>(
+                  builder: (_) => SyncAttentionPage(
+                    queue: AppDependencies.instance.apiClient.offlineRequests,
+                  ),
+                ),
+              ),
+              onLogin: () async {
+                await AppDependencies.instance.signOut();
+                await navigatorKey.currentState?.pushAndRemoveUntil(
+                  MaterialPageRoute<void>(builder: (_) => const LoginPage()),
+                  (_) => false,
+                );
+              },
               child: child!,
             ),
           ),

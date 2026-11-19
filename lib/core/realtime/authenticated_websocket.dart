@@ -42,6 +42,11 @@ class AuthenticatedWebSocket<T> {
 
   static const int _maximumMessageLength = 256 * 1024;
 
+  /// Prazo para o canal abrir. O `connectTimeout` do conector cobre só o
+  /// TCP: com a rede "zumbi" a resposta do upgrade nunca chegava, o canal
+  /// ficava "conectando" para sempre e nunca mais tentava de novo.
+  static Duration readyTimeout = const Duration(seconds: 20);
+
   Stream<T> get events => _events.stream;
 
   Future<void> start() async {
@@ -84,7 +89,12 @@ class AuthenticatedWebSocket<T> {
       final connectedChannel = _connector(uri, token);
       channel = connectedChannel;
       _channel = connectedChannel;
-      await connectedChannel.ready;
+      try {
+        await connectedChannel.ready.timeout(readyTimeout);
+      } on TimeoutException {
+        unawaited(connectedChannel.sink.close().catchError((_) {}));
+        rethrow;
+      }
       if (!_started || generation != _generation) {
         await connectedChannel.sink.close();
         return;
@@ -139,8 +149,14 @@ class AuthenticatedWebSocket<T> {
       final refreshed = await apiClient.refreshAccessToken();
       if (!_started || generation != _generation) return;
       if (refreshed == null || refreshed.isEmpty) {
-        _started = false;
-        return;
+        // Sem sinal na renovação a sessão continua: tenta de novo depois.
+        // Só para quando a API encerrou a sessão (refresh apagado).
+        final refresh = await storage.readRefreshToken();
+        if (!_started || generation != _generation) return;
+        if (refresh == null || refresh.isEmpty) {
+          _started = false;
+          return;
+        }
       }
     }
     _scheduleReconnect(generation);

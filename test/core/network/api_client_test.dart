@@ -44,6 +44,57 @@ void main() {
     expect(storage.access, isNull);
     expect(storage.refresh, isNull);
   });
+
+  test('renovação barrada pelo limite (429) não vira "sessão expirada": '
+      'a sessão continua e o erro é passageiro', () async {
+    final storage = _MemorySessionStorage(
+      access: 'access-vencido',
+      refresh: 'refresh-valido',
+    );
+    final refreshDio = Dio(BaseOptions(baseUrl: 'https://api.example.test'))
+      ..httpClientAdapter = _StatusAdapter(429);
+    final client = ApiClient(
+      baseUrl: 'https://api.example.test',
+      storage: storage,
+      refreshClient: refreshDio,
+    );
+    client.dio.httpClientAdapter = _StatusAdapter(401);
+    addTearDown(client.offlineRequests.dispose);
+
+    final error = await client.dio
+        .get<dynamic>('/api/v1/delivery/rotas/')
+        .then<DioException?>(
+          (_) => null,
+          onError: (Object e) => e as DioException,
+        );
+
+    expect(error?.response?.statusCode, 429);
+    expect(storage.refresh, 'refresh-valido');
+    expect(await client.refreshAccessToken(), isNull);
+    expect(storage.refresh, 'refresh-valido');
+  });
+}
+
+class _StatusAdapter implements HttpClientAdapter {
+  _StatusAdapter(this.status);
+
+  final int status;
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async => ResponseBody.fromString(
+    jsonEncode({'detail': 'x'}),
+    status,
+    headers: {
+      Headers.contentTypeHeader: [Headers.jsonContentType],
+    },
+  );
+
+  @override
+  void close({bool force = false}) {}
 }
 
 ApiClient _client(

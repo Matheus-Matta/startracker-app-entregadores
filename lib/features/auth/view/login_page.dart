@@ -54,6 +54,8 @@ class _LoginPageState extends State<LoginPage> {
         accountId: _selectedAccountId,
       );
       AppDependencies.instance.clearSessionCaches();
+      // Também quando o app abriu sem sessão (o AuthGate não chegou a ligar).
+      AppDependencies.instance.syncReporter.start();
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
         MaterialPageRoute<void>(builder: (_) => const DeliveryPage()),

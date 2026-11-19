@@ -7,9 +7,12 @@ import 'package:dio/dio.dart';
 import '../../../core/network/api_collection.dart';
 import '../../../core/network/api_failure.dart';
 import '../../../core/network/api_client.dart';
+import '../../../core/network/offline_deadline.dart';
 import '../../../core/network/offline_request_queue.dart';
 import '../../../core/storage/session_storage.dart';
+import '../../../core/sync/mobile_sync.dart';
 import '../../auth/data/delivery_configuration.dart';
+import 'local_route_state.dart';
 import 'route_snapshot_store.dart';
 
 class ActiveRoute {
@@ -22,6 +25,10 @@ class ActiveRoute {
     required this.deliveryWaypoints,
     required this.warehouse,
     required this.stops,
+    this.waveStatus = '',
+    this.cancelledStops = const [],
+    this.otherWaveOrderStatuses = const [],
+    this.fetchedAt,
   });
 
   final int routeId;
@@ -33,6 +40,30 @@ class ActiveRoute {
   final RoutePlace? warehouse;
   final List<ActiveRouteStop> stops;
 
+  /// Status da carga conhecido pelo app (servidor ou calculado no aparelho
+  /// com a mesma regra); vazio quando ainda não se sabe.
+  final String waveStatus;
+
+  /// Paradas canceladas no portal (fora de [stops]). Contam como "não
+  /// concluídas" na regra que fecha a rota, e uma baixa feita sem sinal numa
+  /// delas volta para a tela (o servidor aceita a baixa).
+  final List<ActiveRouteStop> cancelledStops;
+
+  int get cancelledStopCount => cancelledStops.length;
+
+  /// Quando a cópia começou a ser lida do servidor (`null`: cópia antiga).
+  final DateTime? fetchedAt;
+
+  /// Status dos pedidos da carga que não têm parada nesta rota.
+  final List<String> otherWaveOrderStatuses;
+
+  bool get isTerminal => const {
+    'completed',
+    'partially_completed',
+    'cancelled',
+    'superseded',
+  }.contains(status);
+
   ActiveRouteStop? get currentStop {
     // A lista ja vem ordenada por sequence. Depois de um skip, a parada
     // anterior pode continuar temporariamente como approaching na resposta;
@@ -43,17 +74,25 @@ class ActiveRoute {
     return null;
   }
 
-  ActiveRoute copyWith({String? status, List<ActiveRouteStop>? stops}) =>
-      ActiveRoute(
-        routeId: routeId,
-        waveId: waveId,
-        routeNumber: routeNumber,
-        status: status ?? this.status,
-        path: path,
-        deliveryWaypoints: deliveryWaypoints,
-        warehouse: warehouse,
-        stops: stops ?? this.stops,
-      );
+  ActiveRoute copyWith({
+    String? status,
+    List<ActiveRouteStop>? stops,
+    String? waveStatus,
+    List<ActiveRouteStop>? cancelledStops,
+  }) => ActiveRoute(
+    routeId: routeId,
+    waveId: waveId,
+    routeNumber: routeNumber,
+    status: status ?? this.status,
+    path: path,
+    deliveryWaypoints: deliveryWaypoints,
+    warehouse: warehouse,
+    stops: stops ?? this.stops,
+    waveStatus: waveStatus ?? this.waveStatus,
+    cancelledStops: cancelledStops ?? this.cancelledStops,
+    otherWaveOrderStatuses: otherWaveOrderStatuses,
+    fetchedAt: fetchedAt,
+  );
 }
 
 class RouteCoordinate {
@@ -177,34 +216,37 @@ class ActiveRouteStop {
     confirmationLocation: confirmationLocation ?? this.confirmationLocation,
   );
 
-  ActiveRouteStop copyWith({String? status, String? orderStatus}) =>
-      ActiveRouteStop(
-        stopId: stopId,
-        orderId: orderId,
-        sequence: sequence,
-        status: status ?? this.status,
-        orderStatus: orderStatus ?? this.orderStatus,
-        isManual: isManual,
-        plannedEta: plannedEta,
-        orderNumber: orderNumber,
-        customerName: customerName,
-        customerPhone: customerPhone,
-        fullAddress: fullAddress,
-        latitude: latitude,
-        longitude: longitude,
-        units: units,
-        weightGrams: weightGrams,
-        contents: contents,
-        proofOverrides: proofOverrides,
-        policy: policy,
-        existingProofId: existingProofId,
-        existingPhotoCount: existingPhotoCount,
-        hasSignature: hasSignature,
-        existingRecipientName: existingRecipientName,
-        existingRecipientDocument: existingRecipientDocument,
-        existingNotes: existingNotes,
-        confirmationLocation: confirmationLocation,
-      );
+  ActiveRouteStop copyWith({
+    String? status,
+    String? orderStatus,
+    int? sequence,
+  }) => ActiveRouteStop(
+    stopId: stopId,
+    orderId: orderId,
+    sequence: sequence ?? this.sequence,
+    status: status ?? this.status,
+    orderStatus: orderStatus ?? this.orderStatus,
+    isManual: isManual,
+    plannedEta: plannedEta,
+    orderNumber: orderNumber,
+    customerName: customerName,
+    customerPhone: customerPhone,
+    fullAddress: fullAddress,
+    latitude: latitude,
+    longitude: longitude,
+    units: units,
+    weightGrams: weightGrams,
+    contents: contents,
+    proofOverrides: proofOverrides,
+    policy: policy,
+    existingProofId: existingProofId,
+    existingPhotoCount: existingPhotoCount,
+    hasSignature: hasSignature,
+    existingRecipientName: existingRecipientName,
+    existingRecipientDocument: existingRecipientDocument,
+    existingNotes: existingNotes,
+    confirmationLocation: confirmationLocation,
+  );
 }
 
 class CompletionPolicy {
@@ -410,10 +452,12 @@ class ActiveRouteService {
     this.apiClient, {
     this.storage = const SessionStorage(),
     RouteSnapshotStore? snapshotStore,
-  }) : _snapshotStore = snapshotStore ?? RouteSnapshotStore() {
+    MobileSync? sync,
+  }) : _snapshotStore = snapshotStore ?? RouteSnapshotStore(),
+       sync = sync ?? MobileSync(apiClient) {
     _registerOfflineHandlers();
-    _queueSubscription = apiClient.offlineRequests.events.listen(
-      _onOfflineQueueEvent,
+    _syncSubscription = this.sync.applied.listen(
+      (applied) => unawaited(_onSyncApplied(applied)),
     );
   }
 
@@ -425,20 +469,18 @@ class ActiveRouteService {
 
   final ApiClient apiClient;
   final SessionStorage storage;
+  final MobileSync sync;
   final RouteSnapshotStore _snapshotStore;
   Map<String, dynamic>? _configurationCache;
   Future<String>? _mapStyleOperation;
   // Mantida viva durante todo o app (o serviço é um singleton).
   // ignore: unused_field
-  late final StreamSubscription<OfflineQueueEvent> _queueSubscription;
+  late final StreamSubscription<SyncApplied> _syncSubscription;
 
   /// Última rota carregada com sucesso, por id. Serve para abrir o mapa
   /// instantaneamente e para continuar operando sem rede.
   final Map<int, ActiveRoute> _routeSnapshots = {};
   final Map<int, Future<ActiveRoute>> _routeOperations = {};
-
-  /// Status aplicados localmente enquanto a alteração está na fila offline.
-  final Map<int, String> _pendingStopStatuses = {};
 
   List<Map<String, dynamic>>? _warehouseCache;
   DateTime? _warehouseCacheAt;
@@ -459,14 +501,18 @@ class ActiveRouteService {
     invalidateCache();
     _routeSnapshots.clear();
     _routeOperations.clear();
-    _pendingStopStatuses.clear();
-    unawaited(_snapshotStore.clear());
+    _savedSnapshotHash.clear();
+    // Com ação ainda não enviada, a cópia da rota fica: sem ela o entregador
+    // não veria a rota sem sinal ao entrar de novo.
+    if (apiClient.offlineRequests.pendingCount == 0) {
+      unawaited(_snapshotStore.clear());
+    }
   }
 
   /// Rota em cache para exibição imediata enquanto a versão atual carrega.
   ActiveRoute? cachedRoute(int routeId) {
     final route = _routeSnapshots[routeId];
-    return route == null ? null : _withPendingStatuses(route);
+    return route == null ? null : _withLocal(route);
   }
 
   /// Igual a [cachedRoute], mas também procura a cópia em disco (app reaberto
@@ -474,39 +520,155 @@ class ActiveRouteService {
   Future<ActiveRoute?> storedRoute(int routeId) async {
     final route =
         _routeSnapshots[routeId] ?? await _restoreRouteSnapshot(routeId);
-    return route == null ? null : _withPendingStatuses(route);
+    return route == null ? null : _withLocal(route);
   }
 
-  void _onOfflineQueueEvent(OfflineQueueEvent event) {
-    if (event.type == OfflineQueueEventType.queued ||
-        event.type == OfflineQueueEventType.exhausted) {
+  /// Ações ainda não confirmadas pelo servidor, na ordem em que aconteceram
+  /// (inclui registros da fila da versão anterior do app).
+  List<PendingSyncEvent> _localEvents(DateTime? fetchedAt) {
+    final events = <PendingSyncEvent>[];
+    for (final info in apiClient.offlineRequests.pendingRequests) {
+      final payload = info.payload;
+      final event = switch (info.type) {
+        _stopActionType => _legacyEvent(info, 'stop.${payload['action']}', {
+          'stop_id': payload['stop_id'],
+        }),
+        _stopFailType => _legacyEvent(info, SyncKind.stopFail, {
+          'stop_id': payload['stop_id'],
+        }),
+        _stopCompleteType => _legacyEvent(info, SyncKind.stopComplete, {
+          'stop_id': payload['stop_id'],
+        }),
+        routeStartType => _legacyEvent(info, SyncKind.routeStart, {
+          'route_id': payload['route_id'],
+        }),
+        _ => null,
+      };
+      if (event != null) events.add(event);
+    }
+    return [...events, ...sync.localEvents(fetchedAt: fetchedAt)];
+  }
+
+  static PendingSyncEvent _legacyEvent(
+    QueuedRequestInfo info,
+    String kind,
+    Map<String, dynamic> fields,
+  ) => PendingSyncEvent(
+    id: info.id,
+    kind: kind,
+    fields: fields,
+    occurredAt: info.createdAt,
+  );
+
+  /// Conteúdo (sem a hora da leitura) da última cópia gravada por rota.
+  final Map<int, int> _savedSnapshotHash = {};
+
+  /// O mapa recarrega a rota a cada evento em tempo real; regravar a cópia
+  /// inteira (com o trajeto) toda vez gastava disco à toa quando nada mudou.
+  /// A hora da leitura antiga que fica no disco só faz sobrepor mais ações
+  /// confirmadas, o que nunca mostra estado mais velho.
+  void _saveSnapshotIfChanged(int routeId, _RouteBundle bundle) {
+    final json = bundle.toJson();
+    final content = Map<String, dynamic>.from(json)..remove('fetched_at');
+    final hash = jsonEncode(content).hashCode;
+    if (_savedSnapshotHash[routeId] == hash) return;
+    _savedSnapshotHash[routeId] = hash;
+    unawaited(_snapshotStore.save(routeId, json));
+  }
+
+  /// Aplica a resposta de uma ação confirmada à cópia da rota.
+  static void _patchBundle(_RouteBundle bundle, Map<String, dynamic> response) {
+    Map<String, dynamic> section(String name) => response[name] is Map
+        ? Map<String, dynamic>.from(response[name] as Map)
+        : const <String, dynamic>{};
+    final routeSection = section('route');
+    if (_asInt(routeSection['id']) != _asInt(bundle.route['id'])) return;
+    final stop = section('stop');
+    final order = section('order');
+    final wave = section('wave');
+    if (routeSection['status'] != null) {
+      bundle.route['status'] = routeSection['status'];
+    }
+    if (wave['status'] != null) bundle.route['wave_status'] = wave['status'];
+    for (final item in bundle.stops) {
+      if (stop['id'] != null && _asInt(item['id']) == _asInt(stop['id'])) {
+        item['status'] = stop['status'];
+      }
+    }
+    for (final item in bundle.orders) {
+      if (order['id'] != null && _asInt(item['id']) == _asInt(order['id'])) {
+        item['status'] = order['status'];
+      }
+    }
+  }
+
+  int? _orderIdOf(int stopId) {
+    for (final route in _routeSnapshots.values) {
+      for (final stop in [...route.stops, ...route.cancelledStops]) {
+        if (stop.stopId == stopId) return stop.orderId;
+      }
+    }
+    return null;
+  }
+
+  ActiveRoute _withLocal(ActiveRoute route) =>
+      applyLocalEvents(route, _localEvents(route.fetchedAt));
+
+  /// O servidor aplicou uma ação: a cópia salva passa a refletir o resultado
+  /// (a ação sai da fila e deixaria de ser sobreposta à cópia antiga).
+  ///
+  /// Confirmações que chegam enquanto a cópia é gravada entram juntas na
+  /// próxima rodada: no envio da fila de um dia sem sinal, cada uma relia e
+  /// regravava a rota inteira (centenas de vezes seguidas).
+  Future<void> _onSyncApplied(SyncApplied applied) async {
+    final routeSection = applied.section('route');
+    final routeId = _asInt(routeSection['id']);
+    if (routeId == null) return;
+    (_pendingPatches[routeId] ??= []).add(applied.response);
+    if (!_patchingRoutes.add(routeId)) return;
+    try {
+      for (
+        var batch = _pendingPatches.remove(routeId);
+        batch != null;
+        batch = _pendingPatches.remove(routeId)
+      ) {
+        try {
+          await _applyConfirmed(routeId, batch);
+        } catch (_) {
+          // Cópia ilegível: a próxima leitura do servidor a substitui.
+        }
+      }
+    } finally {
+      _patchingRoutes.remove(routeId);
+    }
+  }
+
+  final Map<int, List<Map<String, dynamic>>> _pendingPatches = {};
+  final Set<int> _patchingRoutes = {};
+
+  Future<void> _applyConfirmed(
+    int routeId,
+    List<Map<String, dynamic>> responses,
+  ) async {
+    final data = await _snapshotStore.read(routeId);
+    if (data == null) return;
+    final bundle = _RouteBundle.fromJson(data);
+    for (final response in responses) {
+      _patchBundle(bundle, response);
+    }
+    // Uma leitura mais nova chegou enquanto a cópia era lida do disco: ela
+    // já traz (ou sobrepõe) esta confirmação. Gravar a antiga por cima
+    // desfazia o que mudou no portal até a próxima atualização do mapa.
+    final current = _routeSnapshots[routeId]?.fetchedAt;
+    final patched = bundle.fetchedAt;
+    if (current != null && (patched == null || current.isAfter(patched))) {
       return;
     }
-    final key = event.resourceKey;
-    if (!key.startsWith('stop:')) return;
-    final stopId = int.tryParse(key.substring(5));
-    if (stopId != null) _pendingStopStatuses.remove(stopId);
-  }
-
-  ActiveRoute _withPendingStatuses(ActiveRoute route) {
-    if (_pendingStopStatuses.isEmpty) return route;
-    var changed = false;
-    final stops = route.stops.map((stop) {
-      final status = _pendingStopStatuses[stop.stopId];
-      if (status == null || status == stop.status || stop.isTerminal) {
-        return stop;
-      }
-      changed = true;
-      return stop.copyWith(
-        status: status,
-        orderStatus: switch (status) {
-          'completed' => 'delivered',
-          'failed' => 'delivery_failed',
-          _ => null,
-        },
-      );
-    }).toList();
-    return changed ? route.copyWith(stops: stops) : route;
+    _savedSnapshotHash.remove(routeId);
+    await _snapshotStore.save(routeId, bundle.toJson());
+    try {
+      _routeSnapshots[routeId] = _buildRoute(routeId, bundle);
+    } catch (_) {}
   }
 
   void _registerOfflineHandlers() {
@@ -681,15 +843,35 @@ class ActiveRouteService {
     if (ongoing != null) return ongoing;
     final operation = () async {
       try {
-        final bundle = await _fetchRouteBundle(routeId);
+        final hasCopy =
+            _routeSnapshots.containsKey(routeId) ||
+            await _restoreRouteSnapshot(routeId) != null;
+        final fetch = _fetchRouteBundle(routeId);
+        final bundle = hasCopy
+            ? await fetch.timeout(
+                OfflineDeadline.read,
+                onTimeout: () => throw _RouteNetworkFailure(
+                  const ActiveRouteException(
+                    'Sem resposta do servidor. Mostrando a cópia do aparelho.',
+                  ),
+                ),
+              )
+            : await fetch;
+        // Leitura que saiu antes de uma confirmação e chegou depois: recebe
+        // o resultado confirmado antes de virar a cópia salva.
+        for (final response in sync.confirmedResponses(
+          fetchedAt: bundle.fetchedAt,
+        )) {
+          _patchBundle(bundle, response);
+        }
         final route = _buildRoute(routeId, bundle);
         _routeSnapshots[routeId] = route;
-        unawaited(_snapshotStore.save(routeId, bundle.toJson()));
-        return _withPendingStatuses(route);
+        _saveSnapshotIfChanged(routeId, bundle);
+        return _withLocal(route);
       } on _RouteNetworkFailure catch (failure) {
         final cached =
             _routeSnapshots[routeId] ?? await _restoreRouteSnapshot(routeId);
-        if (cached != null) return _withPendingStatuses(cached);
+        if (cached != null) return _withLocal(cached);
         throw failure.exception;
       } finally {
         _routeOperations.remove(routeId);
@@ -703,6 +885,9 @@ class ActiveRouteService {
   /// que o sistema encerrou o app.
   Future<ActiveRoute?> _restoreRouteSnapshot(int routeId) async {
     final data = await _snapshotStore.read(routeId);
+    // Uma leitura do servidor chegou enquanto o disco era lido: vale ela.
+    final newer = _routeSnapshots[routeId];
+    if (newer != null) return newer;
     if (data == null) return null;
     try {
       final route = _buildRoute(routeId, _RouteBundle.fromJson(data));
@@ -719,6 +904,9 @@ class ActiveRouteService {
   /// quatro rodadas em sequência (rota → paradas/pedidos → comprovantes →
   /// fotos) a cada atualização do mapa.
   Future<_RouteBundle> _fetchRouteBundle(int routeId) async {
+    // Antes de qualquer requisição: o que o servidor confirmar depois deste
+    // instante pode não estar na resposta (ver MobileSync.localEvents).
+    final fetchedAt = DateTime.now();
     try {
       final refreshToken = DateTime.now().microsecondsSinceEpoch;
       Future<List<Map<String, dynamic>>> orders(int? waveId) => _getAll(
@@ -759,12 +947,10 @@ class ActiveRouteService {
           ? results[4] as List<Map<String, dynamic>>
           : await orders(waveId);
       final deliveryConfig = results[1] as Map<String, dynamic>;
+      // As canceladas ficam na cópia: a regra que fecha a rota como
+      // parcialmente concluída conta com elas (route_completion.py).
       final stops = (results[2] as List<Map<String, dynamic>>)
-          .where(
-            (item) =>
-                _asInt(item['route']) == routeId &&
-                item['status']?.toString() != 'cancelled',
-          )
+          .where((item) => _asInt(item['route']) == routeId)
           .toList();
       // A parada já traz o comprovante embutido; a consulta separada só fica
       // para servidor antigo que não o envie.
@@ -808,6 +994,7 @@ class ActiveRouteService {
         warehouses: results[3] as List<Map<String, dynamic>>,
         proofs: proofItems,
         photos: photoItems,
+        fetchedAt: fetchedAt,
       );
     } on DioException catch (error) {
       final exception = ActiveRouteException(
@@ -849,7 +1036,11 @@ class ActiveRouteService {
 
     final activeStops = <ActiveRouteStop>[];
     final seenStops = <int>{};
+    final cancelledStops = <ActiveRouteStop>[];
     for (final stop in stops) {
+      final target = stop['status']?.toString() == 'cancelled'
+          ? cancelledStops
+          : activeStops;
       final stopId = _asInt(stop['id']);
       final orderId = _asInt(stop['order']);
       // Parada sem id/pedido não tem como receber baixa; repetida (página
@@ -867,7 +1058,7 @@ class ActiveRouteService {
       final overrides = order['proof_overrides'] is Map
           ? Map<String, dynamic>.from(order['proof_overrides'] as Map)
           : const <String, dynamic>{};
-      activeStops.add(
+      target.add(
         ActiveRouteStop(
           stopId: stopId,
           orderId: orderId,
@@ -920,11 +1111,20 @@ class ActiveRouteService {
     final warehouseData = warehouses[warehouseId] ?? embeddedWarehouse;
     final warehouseCoordinate = _parseCoordinate(warehouseData);
 
+    final routedOrders = {for (final stop in activeStops) stop.orderId};
     return ActiveRoute(
       routeId: _asInt(route['id']) ?? routeId,
       waveId: _asInt(route['wave']) ?? 0,
       routeNumber: route['route_number']?.toString() ?? 'Rota #$routeId',
       status: route['status']?.toString() ?? '',
+      waveStatus: route['wave_status']?.toString() ?? '',
+      cancelledStops: cancelledStops,
+      fetchedAt: bundle.fetchedAt,
+      otherWaveOrderStatuses: [
+        for (final entry in orders.entries)
+          if (!routedOrders.contains(entry.key))
+            entry.value['status']?.toString() ?? '',
+      ],
       path: path,
       deliveryWaypoints: deliveryWaypoints,
       warehouse:
@@ -940,28 +1140,29 @@ class ActiveRouteService {
   }
 
   Future<OfflineMutationResult<void>> arrive(int stopId) =>
-      _stopAction(stopId, 'arrive');
+      _stopAction(stopId, SyncKind.stopArrive, 'Registrar chegada');
 
   Future<OfflineMutationResult<void>> begin(int stopId) =>
-      _stopAction(stopId, 'begin');
+      _stopAction(stopId, SyncKind.stopBegin, 'Iniciar entrega');
 
   Future<OfflineMutationResult<void>> skip({required int stopId}) =>
-      _stopAction(stopId, 'skip');
+      _stopAction(stopId, SyncKind.stopPostpone, 'Próxima entrega');
 
+  /// Regra do servidor para iniciar a rota (uma em andamento por vez); ver
+  /// `WaveService.otherRouteInProgress`. Devolve o motivo da recusa.
+  Future<String?> Function(int routeId)? startBlocker;
+
+  /// Grava no aparelho e envia em segundo plano; a tela não espera a rede.
   Future<OfflineMutationResult<void>> startRoute(int routeId) async {
-    try {
-      return await apiClient.offlineRequests.execute<void>(
-        resourceKey: 'route:$routeId',
-        description: 'Iniciar rota',
-        operation: (key) => postRouteStart(routeId, key),
-        persisted: PersistedOfflineRequest(
-          type: routeStartType,
-          payload: {'route_id': routeId},
-        ),
-      );
-    } on DioException catch (error) {
-      throw ActiveRouteException(_errorMessage(error));
-    }
+    final blocked = await startBlocker?.call(routeId);
+    if (blocked != null) throw ActiveRouteException(blocked);
+    await sync.record(
+      kind: SyncKind.routeStart,
+      resourceKey: 'route:$routeId',
+      description: 'Iniciar rota',
+      fields: {'route_id': routeId},
+    );
+    return const OfflineMutationResult.queued();
   }
 
   Future<void> postRouteStart(int routeId, String idempotencyKey) async {
@@ -978,34 +1179,21 @@ class ActiveRouteService {
     double? latitude,
     double? longitude,
   }) async {
-    try {
-      final result = await apiClient.offlineRequests.execute<void>(
-        resourceKey: 'stop:$stopId',
-        description: 'Registrar falha na entrega',
-        operation: (key) => _postFailure(
-          stopId: stopId,
-          reason: reason,
-          notes: notes,
-          latitude: latitude,
-          longitude: longitude,
-          idempotencyKey: key,
-        ),
-        persisted: PersistedOfflineRequest(
-          type: _stopFailType,
-          payload: {
-            'stop_id': stopId,
-            'reason': reason,
-            'notes': notes,
-            'lat': ?latitude,
-            'lon': ?longitude,
-          },
-        ),
-      );
-      if (result.queued) _pendingStopStatuses[stopId] = 'failed';
-      return result;
-    } on DioException catch (error) {
-      throw ActiveRouteException(_errorMessage(error));
-    }
+    await sync.record(
+      kind: SyncKind.stopFail,
+      resourceKey: 'stop:$stopId',
+      description: 'Registrar falha na entrega',
+      fields: {
+        'stop_id': stopId,
+        'reason': reason,
+        'notes': notes,
+        'lat': ?latitude,
+        'lon': ?longitude,
+        'order_id': ?_orderIdOf(stopId),
+        'local_order_status': 'delivery_failed',
+      },
+    );
+    return const OfflineMutationResult.queued();
   }
 
   Future<void> _postFailure({
@@ -1028,6 +1216,15 @@ class ActiveRouteService {
     );
   }
 
+  /// Quanto a baixa espera pelo servidor antes de seguir como salva no
+  /// aparelho. Online a resposta traz a auditoria (raio, rastreador).
+  static const completionWait = Duration(seconds: 4);
+
+  /// Baixa: comprovante, fotos, assinatura e itens numa ação só.
+  ///
+  /// A ação é gravada no aparelho antes de qualquer envio. Com sinal, a
+  /// resposta chega em [completionWait] e uma recusa (foto corrompida, etc.)
+  /// volta como [ActiveRouteException] para o entregador corrigir na hora.
   Future<OfflineMutationResult<DeliveryAuditResult>> complete(
     DeliveryProofSubmission submission,
   ) async {
@@ -1046,48 +1243,50 @@ class ActiveRouteService {
         when !longitude.isFinite || longitude < -180 || longitude > 180) {
       throw const ActiveRouteException('Longitude da entrega inválida.');
     }
-    final plan = _CompletionPlan.fromSubmission(
-      submission,
-      endpoint: _completionEndpoint(
-        submission.stop.confirmationLocation,
-        submission.stop.stopId,
-      ),
-      method: _completionMethod(submission.stop.confirmationLocation),
-    );
+    final stop = submission.stop;
+    final sendLocation = stop.confirmationLocation.canRequestLocation;
     final files = <String, Uint8List>{
       if (submission.signatureBytes != null)
-        _CompletionPlan.signatureFile: submission.signatureBytes!,
+        'signature': submission.signatureBytes!,
       for (final (index, photo) in submission.photos.indexed)
-        _CompletionPlan.photoFile(index): photo.bytes,
+        'photo_$index': photo.bytes,
     };
-    var firstAttempt = true;
+    final fileNames = <String, String>{
+      if (submission.signatureBytes != null) 'signature': 'assinatura.png',
+      for (final (index, photo) in submission.photos.indexed)
+        'photo_$index': photo.filename,
+    };
     try {
-      final result = await apiClient.offlineRequests
-          .execute<DeliveryAuditResult>(
-            resourceKey: 'stop:${submission.stop.stopId}',
-            description: 'Finalizar entrega',
-            operation: (key) async {
-              _ServerCompletionState? resume;
-              if (!firstAttempt) {
-                // A tentativa anterior pode ter gravado parte da baixa antes
-                // de a resposta se perder no 4G: retoma do ponto em que o
-                // servidor parou em vez de recriar o comprovante (400).
-                resume = await _serverCompletionState(submission.stop.stopId);
-                if (resume.completed case final completed?) return completed;
-              }
-              firstAttempt = false;
-              return _runCompletionPlan(plan, files, key, resume: resume);
-            },
-            persisted: PersistedOfflineRequest(
-              type: _stopCompleteType,
-              payload: plan.toJson(),
-              files: files,
-            ),
-          );
+      final result = await sync.record(
+        kind: SyncKind.stopComplete,
+        resourceKey: 'stop:${stop.stopId}',
+        description: 'Finalizar entrega',
+        fields: {
+          'stop_id': stop.stopId,
+          'order_id': stop.orderId,
+          'local_order_status': completedOrderStatus(stop, [
+            for (final item in submission.itemResults) item.toJson(),
+          ]),
+          'recipient_name': submission.recipientName.trim(),
+          'recipient_document': submission.recipientDocument.trim(),
+          'notes': submission.notes.trim(),
+          if (submission.itemResults.isNotEmpty)
+            'items': [for (final item in submission.itemResults) item.toJson()],
+          if (sendLocation) 'lat': ?submission.latitude,
+          if (sendLocation) 'lon': ?submission.longitude,
+        },
+        files: files,
+        fileNames: fileNames,
+        waitFor: completionWait,
+      );
       if (result.queued) {
-        _pendingStopStatuses[submission.stop.stopId] = 'completed';
+        return OfflineMutationResult.queued(
+          savedOnDevice: result.savedOnDevice,
+        );
       }
-      return result;
+      return OfflineMutationResult.completed(
+        DeliveryAuditResult.fromResponse(result.value?['stop_data']),
+      );
     } on ActiveRouteException {
       rethrow;
     } on DioException catch (error) {
@@ -1237,57 +1436,18 @@ class ActiveRouteService {
     );
   }
 
-  static String _completionEndpoint(
-    ConfirmationLocationPolicy policy,
-    int stopId,
-  ) {
-    if (policy.completeUrlTemplate.isEmpty) {
-      // Compatibilidade com configuracoes anteriores ao contrato v6.
-      return '/api/v1/delivery/paradas/$stopId/complete/';
-    }
-    final endpoint = policy.completionUrl(stopId);
-    final uri = Uri.tryParse(endpoint);
-    if (uri == null ||
-        uri.isAbsolute ||
-        !uri.path.startsWith('/api/') ||
-        endpoint.contains('{stop_id}')) {
-      throw const ActiveRouteException(
-        'Endpoint de conclusão inválido. Atualize a configuração.',
-      );
-    }
-    return endpoint;
-  }
-
-  static String _completionMethod(ConfirmationLocationPolicy policy) {
-    if (policy.method.isEmpty) return 'POST';
-    if (!const {'POST', 'PUT', 'PATCH'}.contains(policy.method)) {
-      throw const ActiveRouteException(
-        'Método de conclusão inválido. Atualize a configuração.',
-      );
-    }
-    return policy.method;
-  }
-
   Future<OfflineMutationResult<void>> _stopAction(
     int stopId,
-    String action, {
-    Map<String, dynamic>? data,
-  }) async {
-    try {
-      return await apiClient.offlineRequests.execute<void>(
-        resourceKey: 'stop:$stopId',
-        description: 'Atualizar etapa da entrega',
-        operation: (key) => _postStopAction(stopId, action, key, data: data),
-        persisted: data == null
-            ? PersistedOfflineRequest(
-                type: _stopActionType,
-                payload: {'stop_id': stopId, 'action': action},
-              )
-            : null,
-      );
-    } on DioException catch (error) {
-      throw ActiveRouteException(_errorMessage(error));
-    }
+    String kind,
+    String description,
+  ) async {
+    await sync.record(
+      kind: kind,
+      resourceKey: 'stop:$stopId',
+      description: description,
+      fields: {'stop_id': stopId},
+    );
+    return const OfflineMutationResult.queued();
   }
 
   Future<void> _postStopAction(
@@ -1565,6 +1725,7 @@ class _RouteBundle {
     required this.warehouses,
     required this.proofs,
     required this.photos,
+    this.fetchedAt,
   });
 
   factory _RouteBundle.fromJson(Map<String, dynamic> json) {
@@ -1583,6 +1744,7 @@ class _RouteBundle {
       warehouses: list('warehouses'),
       proofs: list('proofs'),
       photos: list('photos'),
+      fetchedAt: DateTime.tryParse(json['fetched_at']?.toString() ?? ''),
     );
   }
 
@@ -1594,7 +1756,11 @@ class _RouteBundle {
   final List<Map<String, dynamic>> proofs;
   final List<Map<String, dynamic>> photos;
 
+  /// Início da leitura no servidor (ver `MobileSync.localEvents`).
+  final DateTime? fetchedAt;
+
   Map<String, dynamic> toJson() => {
+    'fetched_at': ?fetchedAt?.toUtc().toIso8601String(),
     'route': route,
     'delivery_config': deliveryConfig,
     'stops': stops,
@@ -1640,40 +1806,6 @@ class _CompletionPlan {
 
   static const signatureFile = 'signature';
   static String photoFile(int index) => 'photo_$index';
-
-  factory _CompletionPlan.fromSubmission(
-    DeliveryProofSubmission submission, {
-    required String endpoint,
-    required String method,
-  }) {
-    final locationPolicy = submission.stop.confirmationLocation;
-    return _CompletionPlan(
-      stopId: submission.stop.stopId,
-      endpoint: endpoint,
-      method: method,
-      existingProofId: submission.stop.existingProofId,
-      photoSequenceStart: submission.stop.existingPhotoCount + 1,
-      proofFields: {
-        'route_stop': submission.stop.stopId,
-        'recipient_name': submission.recipientName.trim(),
-        'recipient_document': submission.recipientDocument.trim(),
-        'notes': submission.notes.trim(),
-      },
-      photoFilenames: [for (final photo in submission.photos) photo.filename],
-      completionData: {
-        if (submission.itemResults.isNotEmpty)
-          'item_results': submission.itemResults
-              .map((result) => result.toJson())
-              .toList(),
-        if (locationPolicy.canRequestLocation &&
-            submission.latitude != null &&
-            submission.longitude != null) ...{
-          locationPolicy.latitudeField: submission.latitude,
-          locationPolicy.longitudeField: submission.longitude,
-        },
-      },
-    );
-  }
 
   factory _CompletionPlan.fromJson(Map<String, dynamic> json) {
     final proofFields = json['proof_fields'];

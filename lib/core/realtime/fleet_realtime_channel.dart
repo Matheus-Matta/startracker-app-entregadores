@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -116,19 +117,36 @@ class FleetRealtimeChannel {
   final AuthenticatedWebSocket<FleetRealtimeEvent> _socket;
 
   final ReconnectReconcileThrottle _throttle = ReconnectReconcileThrottle();
+  StreamSubscription<FleetRealtimeEvent>? _socketEvents;
+  late final StreamController<FleetRealtimeEvent> _events =
+      StreamController<FleetRealtimeEvent>.broadcast(
+        onListen: () => _socketEvents = _socket.events.listen(
+          (event) => _throttle.forward(event, _events.add),
+        ),
+        onCancel: () {
+          _throttle.cancel();
+          final subscription = _socketEvents;
+          _socketEvents = null;
+          unawaited(subscription?.cancel());
+        },
+      );
 
-  Stream<FleetRealtimeEvent> get events =>
-      _socket.events.where((event) => _throttle.allow(event, DateTime.now()));
+  Stream<FleetRealtimeEvent> get events => _events.stream;
 
   Future<void> start() => _socket.start();
 
-  Future<void> stop() => _socket.stop();
+  Future<void> stop() {
+    _throttle.cancel();
+    return _socket.stop();
+  }
 }
 
 /// No 4G a conexão cai e volta várias vezes por minuto. Cada `connected`
 /// fazia todas as telas abertas recarregarem tudo pela API. Este filtro deixa
 /// passar no máximo uma reconciliação a cada [interval]; os demais eventos
-/// passam sempre.
+/// passam sempre. Uma reconexão segurada é entregue no fim do intervalo: o
+/// que mudou no portal enquanto a conexão caiu chegaria só no próximo
+/// evento (as telas não consultam a API periodicamente).
 class ReconnectReconcileThrottle {
   ReconnectReconcileThrottle({this.interval = const Duration(seconds: 30)});
 
@@ -136,6 +154,32 @@ class ReconnectReconcileThrottle {
   DateTime? _lastReconcileAt;
   FleetRealtimeEvent? _lastDecidedEvent;
   bool _lastDecision = true;
+  Timer? _owed;
+
+  /// Repassa [event] a [emit], segurando reconexões seguidas.
+  void forward(
+    FleetRealtimeEvent event,
+    void Function(FleetRealtimeEvent) emit,
+  ) {
+    final now = DateTime.now();
+    if (allow(event, now)) {
+      if (event.isConnected) cancel();
+      emit(event);
+      return;
+    }
+    final last = _lastReconcileAt ?? now;
+    final wait = interval - now.difference(last);
+    _owed ??= Timer(wait.isNegative ? Duration.zero : wait, () {
+      _owed = null;
+      forward(FleetRealtimeEvent(type: 'connected', data: const {}), emit);
+    });
+  }
+
+  /// Desliga a reconciliação pendente (tempo real parado).
+  void cancel() {
+    _owed?.cancel();
+    _owed = null;
+  }
 
   bool allow(FleetRealtimeEvent event, DateTime now) {
     if (!event.isConnected) return true;

@@ -202,6 +202,15 @@ class SessionStorage {
     ),
   ]);
 
+  /// Dono das ações salvas sem rede: `usuario:conta`, lido do JWT.
+  ///
+  /// Ação feita por um entregador nunca é enviada com a sessão de outro; e
+  /// sobrevive ao logout para ser enviada quando o mesmo entregador voltar.
+  Future<String?> readIdentity() async {
+    final token = await readRefreshToken() ?? await readToken();
+    return token == null ? null : jwtIdentity(token);
+  }
+
   Future<void> clear() async {
     _tokenCacheGeneration++;
     _identityGeneration++;
@@ -220,3 +229,20 @@ bool _storedBool(String? value, {required bool fallback}) => switch (value) {
   'false' => false,
   _ => fallback,
 };
+
+/// `usuario:conta` das claims do JWT; `null` se o token não for um JWT.
+String? jwtIdentity(String token) {
+  final parts = token.split('.');
+  if (parts.length != 3) return null;
+  try {
+    final payload = jsonDecode(
+      utf8.decode(base64Url.decode(base64Url.normalize(parts[1]))),
+    );
+    if (payload is! Map) return null;
+    final user = payload['user_id']?.toString() ?? '';
+    if (user.isEmpty) return null;
+    return '$user:${payload['account_id'] ?? ''}';
+  } catch (_) {
+    return null;
+  }
+}

@@ -1,8 +1,10 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 import 'package:star_tracker/core/network/api_client.dart';
+import 'package:star_tracker/core/network/offline_request_store.dart';
 import 'package:star_tracker/core/storage/session_storage.dart';
 
 /// Resposta roteirizada: status, corpo cru e cabeçalhos.
@@ -160,10 +162,14 @@ class FakeSessionStorage extends SessionStorage {
 }
 
 /// Cliente com o servidor falso, sem espera entre repetições de leitura.
-ApiClient faultClient(FaultServer server) {
+ApiClient faultClient(FaultServer server, {Directory? queueDirectory}) {
+  // A fila grava de verdade no disco (como no aparelho), numa pasta própria.
+  final directory =
+      queueDirectory ?? Directory.systemTemp.createTempSync('fault_queue');
   final client = ApiClient(
     baseUrl: 'https://api.example.test',
     storage: const FakeSessionStorage(),
+    offlineStore: OfflineRequestStore(baseDirectory: () async => directory),
     refreshClient: Dio(BaseOptions(baseUrl: 'https://api.example.test'))
       ..httpClientAdapter = server,
   )..readRetryDelays = const [Duration.zero, Duration.zero];
