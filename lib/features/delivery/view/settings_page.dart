@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 
 import '../../../app/app_dependencies.dart';
 import '../../../core/notifications/app_notification_manager.dart';
+import '../../../core/network/offline_request_queue.dart';
 import '../../../core/presentation/failure_log_panel.dart';
+import '../../../core/presentation/send_queue_page.dart';
 import '../../../core/notifications/notification_preferences.dart';
 import '../../auth/data/profile_service.dart';
 import '../../auth/data/auth_service.dart';
@@ -334,6 +336,18 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ),
         const SizedBox(height: 14),
+        _SendQueueTile(
+          queue: AppDependencies.instance.apiClient.offlineRequests,
+          onOpen: () => Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (_) => SendQueuePage(
+                queue: AppDependencies.instance.apiClient.offlineRequests,
+                storage: AppDependencies.instance.storage,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 14),
         const _Panel(child: FailureLogPanel()),
         const SizedBox(height: 14),
         OutlinedButton.icon(
@@ -428,4 +442,62 @@ class _NotificationSwitch extends StatelessWidget {
     activeTrackColor: const Color(0xFFF8E94E),
     onChanged: onChanged,
   );
+}
+
+/// Atalho para a fila de envio, com a contagem atual.
+class _SendQueueTile extends StatelessWidget {
+  const _SendQueueTile({required this.queue, required this.onOpen});
+
+  final OfflineRequestQueue queue;
+  final VoidCallback onOpen;
+
+  @override
+  Widget build(BuildContext context) =>
+      ValueListenableBuilder<OfflineQueueStatus>(
+        valueListenable: queue.status,
+        builder: (context, status, _) {
+          final pending = status.pendingCount;
+          final rejected = status.rejectedCount;
+          final subtitle = rejected > 0
+              ? '$rejected recusada${rejected == 1 ? '' : 's'} · '
+                    '$pending aguardando envio'
+              : pending > 0
+              ? '$pending aguardando envio'
+              : 'Tudo enviado';
+          return Material(
+            color: Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(24),
+              side: const BorderSide(color: Color(0xFFE8E5DC)),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: ListTile(
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 18,
+                vertical: 6,
+              ),
+              onTap: onOpen,
+              leading: Icon(
+                rejected > 0
+                    ? Icons.error_outline_rounded
+                    : pending > 0
+                    ? Icons.cloud_upload_outlined
+                    : Icons.cloud_done_outlined,
+                color: rejected > 0
+                    ? const Color(0xFFB3261E)
+                    : const Color(0xFF171713),
+              ),
+              title: const Text(
+                'Fila de envio',
+                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w900),
+              ),
+              subtitle: Text(
+                subtitle,
+                style: const TextStyle(fontSize: 12, color: Color(0xFF858279)),
+              ),
+              trailing: const Icon(Icons.chevron_right_rounded),
+            ),
+          );
+        },
+      );
 }

@@ -10,9 +10,11 @@ const _danger = Color(0xFFB3261E);
 
 /// Faixa no topo do app com o que ainda não chegou ao servidor.
 ///
-/// Tudo que o entregador faz é salvo no aparelho primeiro; a faixa mostra
-/// quantas ações aguardam envio, quando será a próxima tentativa e, se o
-/// servidor recusou alguma, um atalho para resolver.
+/// Tudo que o entregador faz é salvo no aparelho primeiro e enviado em
+/// segundo plano. Por padrão a faixa só aparece quando há algo que depende
+/// dele: ação recusada pelo servidor ou sessão expirada. "Sem conexão" e
+/// "Enviando…" ficam escondidos, a não ser que ele ligue "Mostrar fila de
+/// envio no topo" nas Configurações (onde a fila também pode ser vista).
 class OfflineQueueBanner extends StatefulWidget {
   const OfflineQueueBanner({
     required this.queue,
@@ -32,6 +34,16 @@ class OfflineQueueBanner extends StatefulWidget {
   /// "entre novamente" sem caminho até lá, fora das Configurações).
   final VoidCallback? onLogin;
 
+  /// Preferência "Mostrar fila de envio no topo" (Configurações).
+  static final showPending = ValueNotifier<bool>(false);
+
+  /// Faixa visível para este estado da fila com a preferência atual.
+  static bool shows(OfflineQueueStatus status, {required bool showPending}) {
+    if (status.needsAttention && !status.sending) return true;
+    if (status.hasPending && status.needsLogin) return true;
+    return showPending && status.isVisible;
+  }
+
   @override
   State<OfflineQueueBanner> createState() => _OfflineQueueBannerState();
 }
@@ -43,19 +55,24 @@ class _OfflineQueueBannerState extends State<OfflineQueueBanner> {
   void initState() {
     super.initState();
     widget.queue.status.addListener(_onStatus);
+    OfflineQueueBanner.showPending.addListener(_onStatus);
     _onStatus();
   }
 
   @override
   void dispose() {
     widget.queue.status.removeListener(_onStatus);
+    OfflineQueueBanner.showPending.removeListener(_onStatus);
     _ticker?.cancel();
     super.dispose();
   }
 
   void _onStatus() {
     final status = widget.queue.status.value;
-    final needsTicker = status.hasPending && status.nextRetryAt != null;
+    final needsTicker =
+        OfflineQueueBanner.showPending.value &&
+        status.hasPending &&
+        status.nextRetryAt != null;
     if (needsTicker && _ticker == null) {
       _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
         if (mounted) setState(() {});
@@ -70,7 +87,12 @@ class _OfflineQueueBannerState extends State<OfflineQueueBanner> {
   @override
   Widget build(BuildContext context) {
     final status = widget.queue.status.value;
-    if (!status.isVisible) return widget.child;
+    if (!OfflineQueueBanner.shows(
+      status,
+      showPending: OfflineQueueBanner.showPending.value,
+    )) {
+      return widget.child;
+    }
     return Column(
       children: [
         _Banner(

@@ -17,6 +17,7 @@ class SessionStorage {
   static const _pendingDeliveryCaptureKey = 'pending_delivery_capture';
   static const _openActiveRouteKey = 'open_active_route';
   static const _mapStyleKey = 'map_style';
+  static const _showSendQueueKey = 'show_send_queue';
   static String? _cachedAccessToken;
   static String? _cachedRefreshToken;
   static bool _accessTokenLoaded = false;
@@ -162,6 +163,14 @@ class SessionStorage {
     final value = await _storage.read(key: _mapStyleKey);
     return value == null || value.isEmpty ? null : value;
   }
+
+  /// Faixa "Sem conexão · N ações salvas" no topo. Desligada por padrão: o
+  /// envio acontece em segundo plano e a fila fica nas Configurações.
+  Future<void> saveShowSendQueue(bool show) =>
+      _storage.write(key: _showSendQueueKey, value: show.toString());
+
+  Future<bool> readShowSendQueue() async =>
+      await _storage.read(key: _showSendQueueKey) == 'true';
 
   Future<NotificationPreferences> readNotificationPreferences() async {
     final values = await Future.wait([

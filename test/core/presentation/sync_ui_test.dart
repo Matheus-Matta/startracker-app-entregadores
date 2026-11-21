@@ -20,6 +20,7 @@ void main() {
   });
 
   tearDown(() {
+    OfflineQueueBanner.showPending.value = false;
     app.dispose();
     try {
       directory.deleteSync(recursive: true);
@@ -45,7 +46,7 @@ void main() {
     expect(find.textContaining('salva'), findsNothing);
   });
 
-  testWidgets('sem sinal mostra quantas ações estão salvas e "Enviar agora"', (
+  testWidgets('sem sinal a fila fica em segundo plano por padrão', (
     tester,
   ) async {
     await tester.runAsync(() async {
@@ -53,15 +54,34 @@ void main() {
       await app.routes.getRoute(20);
       server.online = false;
       await app.routes.arrive(31);
-      await app.routes.arrive(32);
       await Future<void>.delayed(const Duration(milliseconds: 100));
     });
     await tester.pumpWidget(banner(app.client.offlineRequests));
     await tester.pump();
-    expect(find.textContaining('2 ações salvas no aparelho'), findsOneWidget);
-    expect(find.text('Enviar agora'), findsOneWidget);
-    await tester.pumpWidget(const SizedBox()); // para o ticker do banner
+    expect(app.client.offlineRequests.pendingCount, 1);
+    expect(find.textContaining('salva no aparelho'), findsNothing);
+    expect(find.text('Enviar agora'), findsNothing);
   });
+
+  testWidgets(
+    'com a opção ligada, sem sinal mostra as ações e "Enviar agora"',
+    (tester) async {
+      OfflineQueueBanner.showPending.value = true;
+      await tester.runAsync(() async {
+        await app.boot();
+        await app.routes.getRoute(20);
+        server.online = false;
+        await app.routes.arrive(31);
+        await app.routes.arrive(32);
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+      await tester.pumpWidget(banner(app.client.offlineRequests));
+      await tester.pump();
+      expect(find.textContaining('2 ações salvas no aparelho'), findsOneWidget);
+      expect(find.text('Enviar agora'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox()); // para o ticker do banner
+    },
+  );
 
   testWidgets('sessão encerrada pelo servidor: o banner leva ao login', (
     tester,

@@ -3,6 +3,7 @@ import 'dart:async';
 import '../core/config/app_config.dart';
 import '../core/network/api_client.dart';
 import '../core/notifications/app_notification_manager.dart';
+import '../core/presentation/offline_queue_banner.dart';
 import '../core/realtime/fleet_realtime_channel.dart';
 import '../core/location/location_service.dart';
 import '../core/storage/session_storage.dart';
@@ -37,6 +38,12 @@ class AppDependencies {
     driverOverview = DriverOverviewService(apiClient, profileService: profile);
     notifications = NotificationService(apiClient);
     location = LocationService();
+    unawaited(
+      storage.readShowSendQueue().then(
+        (show) => OfflineQueueBanner.showPending.value = show,
+        onError: (Object _) {},
+      ),
+    );
   }
 
   static final AppDependencies instance = AppDependencies._();
