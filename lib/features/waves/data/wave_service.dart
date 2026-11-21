@@ -264,6 +264,9 @@ class WaveService {
   /// Última conferência lida do servidor, por carga.
   final Map<int, Map<String, dynamic>> _pickupRaw = {};
 
+  /// Rotas já baixadas nesta sessão por `_prefetchReadyRoutes`.
+  final Set<int> _prefetchedRoutes = {};
+
   static const _prepareRouteType = 'wave.prepare_route';
   final ApiClient apiClient;
   static const _listCacheDuration = Duration(seconds: 30);
@@ -373,6 +376,7 @@ class WaveService {
   void clearSessionData({required bool keepOffline}) {
     invalidateCache();
     _pickupRaw.clear();
+    _prefetchedRoutes.clear();
     if (!keepOffline) {
       unawaited(_pickupStore.clear());
       unawaited(_listStore.clear());
@@ -443,6 +447,7 @@ class WaveService {
       unawaited(
         _listStore.save(0, {'routes': results[0], 'waves': results[1]}),
       );
+      _prefetchReadyRoutes(results[0]);
       return _WaveListSnapshot(DateTime.now(), results[0], results[1]);
     } catch (error) {
       // Sem sinal: a última lista salva, com o status calculado no aparelho.
@@ -454,6 +459,33 @@ class WaveService {
           if (item is Map) Map<String, dynamic>.from(item),
       ];
       return _WaveListSnapshot(DateTime.now(), list('routes'), list('waves'));
+    }
+  }
+
+  /// Rotas já liberadas e ainda não iniciadas, baixadas para o aparelho.
+  ///
+  /// O servidor roteiriza sozinho ao fim da retirada, com o entregador ainda
+  /// no armazém; baixar a rota agora é o que deixa o mapa abrir e a rota
+  /// começar mesmo que o sinal caia antes de ele entrar na carga.
+  void _prefetchReadyRoutes(List<Map<String, dynamic>> routes) {
+    final service = activeRoutes;
+    if (service == null) return;
+    const ready = {'planned', 'released', 'accepted'};
+    for (final route in routes) {
+      final routeId = _asInt(route['id']);
+      if (routeId == null || !ready.contains(route['status']?.toString())) {
+        continue;
+      }
+      if (!_prefetchedRoutes.add(routeId)) continue;
+      unawaited(
+        service
+            .getRoute(routeId)
+            .then(
+              (_) {},
+              // Tenta de novo na próxima leitura da lista.
+              onError: (Object _) => _prefetchedRoutes.remove(routeId),
+            ),
+      );
     }
   }
 
@@ -754,14 +786,26 @@ class WaveService {
       final id = _asInt(order['id']);
       if (id == null) continue;
       ordersById[id] = order;
-      final waveRelation =
-          order['wave'] ?? order['wave_id'] ?? order['delivery_wave'];
-      final linkedWave = _relationId(waveRelation);
-      // O endpoint foi consultado com ?wave=<id>. APIs que nao repetem o
-      // relacionamento no serializer ainda assim devolvem somente membros da
-      // carga; uma relacao explicita com outra carga, porem, nunca e aceita.
-      if (waveRelation == null || linkedWave == wave.waveId) {
-        currentOrderIds.add(id);
+      // O servidor ignora `?wave=` (o pedido não tem campo de carga) e devolve
+      // todos os pedidos do entregador — inclusive os da carga anterior. Por
+      // isso esta lista só completa os dados; quem diz o que é da carga são
+      // as paradas da rota, a conferência de retirada e os vínculos abaixo.
+      final linkedWave = _relationId(
+        order['wave'] ?? order['wave_id'] ?? order['delivery_wave'],
+      );
+      if (linkedWave == wave.waveId) currentOrderIds.add(id);
+    }
+    // A conferência lista exatamente os pedidos da carga (WaveOrder), mesmo
+    // antes de existir rota — é o que deixa a lista aparecer na retirada.
+    final pickupById = <int, PickupOrder>{
+      for (final order in pickup.orders)
+        if (order.orderId > 0) order.orderId: order,
+    };
+    currentOrderIds.addAll(pickupById.keys);
+    for (final stop in routeStops) {
+      final orderId = _relationId(stop['order']);
+      if (orderId != null && stop['status']?.toString() != 'cancelled') {
+        currentOrderIds.add(orderId);
       }
     }
 
@@ -828,6 +872,7 @@ class WaveService {
         );
       }
     }
+    pickupById.keys.forEach(addOrderId);
     for (final order in orders) {
       final orderId = _asInt(order['id']);
       if (currentOrderIds.contains(orderId)) addOrderId(orderId);
@@ -836,8 +881,20 @@ class WaveService {
     final waveOrders = <WaveOrderItem>[];
     for (var index = 0; index < orderedIds.length; index++) {
       final orderId = orderedIds[index];
-      final order = ordersById[orderId] ?? const <String, dynamic>{};
       final stop = stopsByOrder[orderId];
+      final picked = pickupById[orderId];
+      // Pedido ainda sem parada não aparece em /pedidos/ para o entregador:
+      // número e cliente vêm da conferência.
+      final order =
+          ordersById[orderId] ??
+          <String, dynamic>{
+            if (picked != null && picked.orderNumber.isNotEmpty)
+              'order_number': picked.orderNumber,
+            if (picked != null) 'customer_name': picked.customer,
+            if (picked != null)
+              'status': picked.isPickedUp ? 'ready' : 'awaiting_pickup',
+            if (picked != null) 'units': picked.totalLabels,
+          };
       final addressParts = [
         order['address']?.toString() ?? '',
         order['address_number']?.toString() ?? '',

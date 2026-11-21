@@ -240,6 +240,86 @@ void main() {
       );
     },
   );
+
+  test(
+    'detalhe da carga em retirada lista os pedidos dela, nunca os da anterior',
+    () async {
+      final client = ApiClient(
+        baseUrl: 'https://api.example.test',
+        storage: const _EmptyStorage(),
+      );
+      client.dio.httpClientAdapter = _OtherWaveOrdersAdapter();
+      final service = WaveService(client);
+
+      final details = await service.getWaveDetails(
+        WaveListItem(
+          waveId: 11,
+          routeId: null,
+          routeNumber: 'Aguardando retirada',
+          status: 'collecting',
+          plannedDistanceMeters: 0,
+          plannedStart: null,
+          createdAt: null,
+        ),
+      );
+
+      expect(details.orders.map((order) => order.orderId), [90]);
+      expect(details.orders.single.orderNumber, 'PED 900');
+      expect(details.orders.single.customerName, 'Cliente Novo');
+      expect(details.orders.single.stopStatus, 'awaiting_pickup');
+    },
+  );
+}
+
+class _OtherWaveOrdersAdapter implements HttpClientAdapter {
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    final data = switch (options.path) {
+      '/api/v1/delivery/waves/11/retirada/' => {
+        'wave_id': 11,
+        'pickup_enabled': true,
+        'total': 1,
+        'picked_up': 0,
+        'pending': 1,
+        'is_complete': false,
+        'orders': [
+          {
+            'order_id': 90,
+            'order_number': 'PED 900',
+            'customer': 'Cliente Novo',
+            'codes': [
+              {'code': 'PED 900', 'scanned_at': null},
+            ],
+            'picked_up_at': null,
+          },
+        ],
+      },
+      '/api/v1/delivery/waves/11/' => {'id': 11, 'status': 'collecting'},
+      // O servidor ignora ?wave= e devolve os pedidos da carga anterior.
+      '/api/v1/delivery/pedidos/' => {
+        'results': [
+          {'id': 81, 'order_number': 'PED 100', 'customer_name': 'Antigo'},
+          {'id': 82, 'order_number': 'PED 101', 'customer_name': 'Antigo'},
+        ],
+        'next': null,
+      },
+      _ => {'results': <dynamic>[], 'next': null},
+    };
+    return ResponseBody.fromString(
+      jsonEncode(data),
+      200,
+      headers: {
+        Headers.contentTypeHeader: [Headers.jsonContentType],
+      },
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
 }
 
 class _EmptyStorage extends SessionStorage {

@@ -50,6 +50,14 @@ class FakeDeliveryServer implements HttpClientAdapter {
 
   /// Outras rotas do entregador na lista (id → status), além da 20.
   final Map<int, String> extraRoutes = {};
+
+  /// Detalhe de uma das [extraRoutes] (`/rotas/<id>/`), como o servidor real.
+  int? _extraRouteId(String path) {
+    final match = RegExp(r'^/api/v1/delivery/rotas/(\d+)/$').firstMatch(path);
+    final id = match == null ? null : int.parse(match.group(1)!);
+    return extraRoutes.containsKey(id) ? id : null;
+  }
+
   String routeStatus = 'started';
   String waveStatus = 'released';
   final Map<int, String> stops = {};
@@ -189,6 +197,14 @@ class FakeDeliveryServer implements HttpClientAdapter {
       '/api/v1/delivery/waves/' => _page([
         {'id': 10, 'status': waveStatus, 'created_at': '2026-11-16T07:00:00Z'},
       ]),
+      final detail when _extraRouteId(detail) != null => {
+        'id': _extraRouteId(detail),
+        'wave': _extraRouteId(detail),
+        'route_number': 'R${_extraRouteId(detail)}',
+        'status': extraRoutes[_extraRouteId(detail)],
+        'path_geometry': <dynamic>[],
+        'planned_waypoints': <dynamic>[],
+      },
       _ => _page(const []),
     };
     final hold = holdRouteReads;
