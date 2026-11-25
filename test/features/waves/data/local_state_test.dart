@@ -3,6 +3,7 @@ import 'package:star_tracker/core/sync/mobile_sync.dart';
 import 'package:star_tracker/features/waves/data/active_route_service.dart';
 import 'package:star_tracker/features/waves/data/local_pickup_state.dart';
 import 'package:star_tracker/features/waves/data/local_route_state.dart';
+import 'package:star_tracker/features/waves/data/wave_service.dart';
 
 ActiveRouteStop _stop(
   int id, {
@@ -259,6 +260,26 @@ void main() {
       expect(both['picked_up'], 2);
       expect(both['pending'], 0);
       expect(both['is_complete'], isTrue);
+    });
+
+    test('conferência feita no aparelho libera a parada com cópia antiga', () {
+      bool blocked(List<PendingSyncEvent> events, int orderId) =>
+          WaveService.parsePickupProgress(
+            {...applyLocalPickup(raw(), 3, events), 'pickup_enabled': true},
+            3,
+          ).requiresPickup(orderId: orderId, orderStatus: 'awaiting_pickup');
+      final first = _event(SyncKind.pickupScan, {
+        'wave_id': 3,
+        'code': 'PED-81-1',
+      });
+      final second = _event(SyncKind.pickupScan, {
+        'wave_id': 3,
+        'code': 'PED-81-2',
+      });
+      expect(blocked([first], 81), isTrue);
+      expect(blocked([first], 82), isFalse);
+      expect(blocked([first], 99), isTrue);
+      expect(blocked([first, second], 81), isFalse);
     });
 
     test('"não vai" tira o pedido da conferência e libera a carga', () {

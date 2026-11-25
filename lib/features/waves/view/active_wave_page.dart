@@ -259,7 +259,10 @@ class _ActiveWavePageState extends State<ActiveWavePage>
           (stop) => event.resourceKey == 'stop:${stop.stopId}',
         ) ==
         true;
-    if (!affectsRoute && !affectsStop) return;
+    // Leitura da conferência enviada ou recusada: muda o botão da parada.
+    final affectsPickup =
+        route != null && event.resourceKey == 'wave:${route.waveId}';
+    if (!affectsRoute && !affectsStop && !affectsPickup) return;
     if (event.type == OfflineQueueEventType.rejected && mounted) {
       // Antes: "A API recusou..." sem dizer qual etapa nem por quê.
       showAppMessage(
@@ -516,7 +519,12 @@ class _ActiveWavePageState extends State<ActiveWavePage>
 
   Future<void> _openPickup() async {
     final progress = _pickupProgress;
-    if (progress == null || !progress.enabled || progress.isComplete) return;
+    if (progress == null || !progress.enabled || progress.isComplete) {
+      // Nada a conferir (ou ainda não carregado): atualiza em vez de deixar
+      // o toque sem efeito.
+      await _loadRoute();
+      return;
+    }
     // O mapa (OpenGL) aberto por baixo da câmera + leitor de etiquetas
     // estourava a memória e o Android matava o app, que reabria na tela
     // inicial. Mesmo cuidado já usado na finalização da entrega.
@@ -1401,7 +1409,7 @@ class _DeliverySheetState extends State<_DeliverySheet> {
                 const SizedBox(height: 18),
                 _PrimaryStopAction(
                   routeStatus: widget.route.status,
-                  requiresPickup: widget.stop!.orderStatus == 'awaiting_pickup',
+                  requiresPickup: _stopRequiresPickup(widget.stop!),
                   loading: widget.performingAction,
                   onStart: widget.onStart,
                   onFinalize: widget.onFinalize,
@@ -1411,8 +1419,7 @@ class _DeliverySheetState extends State<_DeliverySheet> {
                   const SizedBox(height: 10),
                   _TransferredPickupNotice(
                     progress: widget.pickupProgress!,
-                    currentOrderBlocked:
-                        widget.stop!.orderStatus == 'awaiting_pickup',
+                    currentOrderBlocked: _stopRequiresPickup(widget.stop!),
                     onPressed: widget.onOpenPickup,
                   ),
                 ],
@@ -1434,7 +1441,7 @@ class _DeliverySheetState extends State<_DeliverySheet> {
                         onPressed:
                             widget.performingAction ||
                                 widget.route.status != 'started' ||
-                                widget.stop!.orderStatus == 'awaiting_pickup'
+                                _stopRequiresPickup(widget.stop!)
                             ? null
                             : widget.onFailure,
                         style: OutlinedButton.styleFrom(
@@ -1467,6 +1474,7 @@ class _DeliverySheetState extends State<_DeliverySheet> {
                   (item) => _StopTimelineItem(
                     stop: item,
                     active: item.stopId == widget.stop!.stopId,
+                    requiresPickup: _stopRequiresPickup(item),
                   ),
                 ),
               ],
@@ -1522,6 +1530,13 @@ class _DeliverySheetState extends State<_DeliverySheet> {
     );
     return _kilometers(meters);
   }
+
+  bool _stopRequiresPickup(ActiveRouteStop stop) =>
+      widget.pickupProgress?.requiresPickup(
+        orderId: stop.orderId,
+        orderStatus: stop.orderStatus,
+      ) ??
+      stop.orderStatus == 'awaiting_pickup';
 
   bool get _pickupPending =>
       widget.pickupProgress?.enabled == true &&
@@ -1748,9 +1763,14 @@ class _PrimaryStopAction extends StatelessWidget {
 }
 
 class _StopTimelineItem extends StatelessWidget {
-  const _StopTimelineItem({required this.stop, required this.active});
+  const _StopTimelineItem({
+    required this.stop,
+    required this.active,
+    required this.requiresPickup,
+  });
   final ActiveRouteStop stop;
   final bool active;
+  final bool requiresPickup;
 
   @override
   Widget build(BuildContext context) => Container(
@@ -1763,7 +1783,7 @@ class _StopTimelineItem extends StatelessWidget {
     child: Row(
       children: [
         Icon(
-          stop.orderStatus == 'awaiting_pickup'
+          requiresPickup
               ? Icons.inventory_2_outlined
               : stop.isTerminal
               ? Icons.check_circle_rounded

@@ -124,6 +124,19 @@ class PickupProgress {
       orders.fold(0, (total, order) => total + order.scannedLabels);
 
   int get pendingLabels => totalLabels - scannedLabels;
+
+  /// Pedido ainda preso à conferência. [orderStatus] vem da cópia da rota,
+  /// que pode continuar em `awaiting_pickup` depois da última leitura (envio
+  /// pendente ou cópia antiga): quem decide é a conferência, que já inclui
+  /// as leituras feitas no aparelho.
+  bool requiresPickup({required int orderId, required String orderStatus}) {
+    if (orderStatus != 'awaiting_pickup') return false;
+    if (!enabled || isComplete) return false;
+    for (final order in orders) {
+      if (order.orderId == orderId) return !order.isPickedUp;
+    }
+    return true;
+  }
 }
 
 class PickupCode {
