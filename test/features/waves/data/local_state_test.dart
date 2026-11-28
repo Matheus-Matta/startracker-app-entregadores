@@ -246,6 +246,21 @@ void main() {
       expect(matchPickupCode(scanned, 'ped-81-2').match?.orderId, 81);
     });
 
+    test('tudo lido e pedido aberto no servidor: releitura é aceita', () {
+      // Estado deixado por leituras simultâneas: as etiquetas constam como
+      // lidas, mas o servidor não fechou o pedido. A releitura conclui.
+      final stuck = raw();
+      final order = (stuck['orders'] as List).first as Map<String, dynamic>;
+      for (final code in order['codes'] as List) {
+        (code as Map)['scanned_at'] = '2026-11-16T10:00:00Z';
+      }
+      expect(matchPickupCode(stuck, 'PED-81-2').match?.orderId, 81);
+      final healed = applyLocalPickup(stuck, 3, [
+        _event(SyncKind.pickupScan, {'wave_id': 3, 'code': 'PED-81-2'}),
+      ]);
+      expect(healed['is_complete'], isTrue);
+    });
+
     test('pedido só sai da prateleira com todos os volumes lidos', () {
       final one = applyLocalPickup(raw(), 3, [
         _event(SyncKind.pickupScan, {'wave_id': 3, 'code': 'PED-81-1'}),

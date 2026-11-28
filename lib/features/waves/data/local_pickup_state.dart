@@ -34,7 +34,13 @@ class PickupMatch {
           refusal: 'O pedido ${order['order_number']} já havia sido retirado.',
         );
       }
-      if ((label['scanned_at']?.toString() ?? '').isNotEmpty) {
+      // Com tudo lido e o pedido ainda aberto (leituras simultâneas no
+      // servidor que não fecharam o pedido), a releitura é aceita: o
+      // servidor conclui a retirada em vez de recusar (`register_pickup`).
+      final allRead = _codes(
+        order,
+      ).every((item) => (item['scanned_at']?.toString() ?? '').isNotEmpty);
+      if ((label['scanned_at']?.toString() ?? '').isNotEmpty && !allRead) {
         return (
           match: null,
           refusal: 'A etiqueta $candidate já havia sido lida.',

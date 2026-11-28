@@ -40,13 +40,36 @@ void main() {
     expect((await app.routes.storedRoute(20))!.status, 'started');
   });
 
+  test('rota encerrada não é baixada pela lista', () async {
+    server.routeStatus = 'completed';
+    await app.waves.getWaves(page: 1, refresh: true);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    expect(await app.routes.storedRoute(20), isNull);
+  });
+
   test(
-    'rota já iniciada ou encerrada não é baixada de novo pela lista',
+    'rota em andamento também é baixada (outro aparelho, app reinstalado)',
     () async {
-      server.routeStatus = 'completed';
+      server.routeStatus = 'started';
       await app.waves.getWaves(page: 1, refresh: true);
       await Future<void>.delayed(const Duration(milliseconds: 200));
-      expect(await app.routes.storedRoute(20), isNull);
+      server.online = false;
+      expect((await app.routes.storedRoute(20))?.stops, isNotEmpty);
     },
   );
+
+  test('rota alterada no portal é baixada de novo pela lista', () async {
+    await app.waves.getWaves(page: 1, refresh: true);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    expect((await app.routes.storedRoute(20))!.stops, hasLength(2));
+
+    // Operador tirou uma parada da rota.
+    server
+      ..stops.remove(32)
+      ..routeUpdatedAt = '2026-11-16T10:00:00Z';
+    await app.waves.getWaves(page: 1, refresh: true);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    server.online = false;
+    expect((await app.routes.storedRoute(20))!.stops, hasLength(1));
+  });
 }

@@ -67,6 +67,10 @@ class _ActiveWavePageState extends State<ActiveWavePage>
   /// suficiente para o Android encerrar o app em aparelhos de entrada.
   bool _mapSuspended = false;
 
+  /// Rota substituída: procurando a nova / já aberta por cima.
+  bool _followingReplacement = false;
+  bool _replaced = false;
+
   @override
   void initState() {
     super.initState();
@@ -205,12 +209,18 @@ class _ActiveWavePageState extends State<ActiveWavePage>
         _error = null;
         _loading = false;
       });
+      if (route.status == 'superseded') unawaited(_followReplacement(route));
     } on ActiveRouteException catch (error) {
       if (!mounted) return;
       setState(() {
         _error = error.message;
         _loading = false;
       });
+      // Rota apagada no portal: a carga pode ter outra no lugar.
+      final known = _route;
+      if (error.statusCode == 404 && known != null) {
+        unawaited(_followReplacement(known));
+      }
     } catch (_) {
       // Resposta fora do formato esperado: sem isto o carregamento girava
       // para sempre (e o erro escapava sem tratamento).
@@ -227,6 +237,45 @@ class _ActiveWavePageState extends State<ActiveWavePage>
         _pendingPostponedStopId = null;
         unawaited(_loadRoute(postponedStopId: pendingPostponedStopId));
       }
+    }
+  }
+
+  /// O operador roteirizou a carga de novo: esta rota foi substituída (as
+  /// paradas pendentes canceladas) e outra nasceu no lugar. Antes o mapa
+  /// mostrava "Carga finalizada" e ficava preso à rota velha.
+  Future<void> _followReplacement(ActiveRoute route) async {
+    if (_followingReplacement || _replaced) return;
+    _followingReplacement = true;
+    try {
+      final current = await _waveService.findWaveRoute(
+        WaveListItem(
+          waveId: route.waveId,
+          routeId: null,
+          routeNumber: '',
+          status: '',
+          plannedDistanceMeters: 0,
+          plannedStart: null,
+          createdAt: null,
+        ),
+      );
+      final nextId = current?.routeId;
+      if (!mounted || nextId == null || nextId == widget.routeId) return;
+      _replaced = true;
+      _message('A operação refez a rota desta carga. Abrindo a rota nova.');
+      // Por cima (com este mapa fora da memória de vídeo) e devolvendo o
+      // resultado dela: com pushReplacement o "Início" da rota nova voltava
+      // só para a tela de onde o mapa antigo foi aberto.
+      setState(() => _mapSuspended = true);
+      final openHome = await Navigator.of(context).push<bool>(
+        MaterialPageRoute<bool>(
+          builder: (_) => ActiveWavePage(routeId: nextId),
+        ),
+      );
+      if (mounted) Navigator.of(context).pop(openHome);
+    } catch (_) {
+      // Sem sinal: fica nesta tela e tenta de novo na próxima leitura.
+    } finally {
+      _followingReplacement = false;
     }
   }
 
@@ -464,6 +513,9 @@ class _ActiveWavePageState extends State<ActiveWavePage>
       return;
     }
     final pending = AppDependencies.instance.apiClient.offlineRequests;
+    // Última entrega: manda tudo agora, sem esperar o intervalo de nova
+    // tentativa da fila (que cresce depois de horas sem sinal).
+    unawaited(pending.retryNow(manual: true));
     _message(
       pending.pendingCount > 0
           ? 'Rota concluída. As baixas estão salvas no aparelho e serão '
@@ -1841,9 +1893,14 @@ class _RouteFinished extends StatelessWidget {
           child: const Icon(Icons.flag_rounded, size: 32),
         ),
         const SizedBox(height: 13),
-        const Text(
-          'Carga finalizada',
-          style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900),
+        Text(
+          switch (route.status) {
+            'cancelled' => 'Rota cancelada pela operação',
+            'superseded' => 'Rota refeita pela operação',
+            _ => 'Carga finalizada',
+          },
+          textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900),
         ),
         const SizedBox(height: 5),
         Text(route.routeNumber, style: const TextStyle(color: _muted)),

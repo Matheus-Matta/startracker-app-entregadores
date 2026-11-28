@@ -33,6 +33,7 @@ class AppDependencies {
     waves = WaveService(apiClient, sync: sync);
     activeRoutes = ActiveRouteService(apiClient, storage: storage, sync: sync);
     waves.activeRoutes = activeRoutes;
+    waves.onOrdersFetched = orders.rememberOrders;
     activeRoutes.startBlocker = waves.otherRouteInProgress;
     activeWave = ActiveWaveService(apiClient, activeRoutes: activeRoutes);
     driverOverview = DriverOverviewService(apiClient, profileService: profile);

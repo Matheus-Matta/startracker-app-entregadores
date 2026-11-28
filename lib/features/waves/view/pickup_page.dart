@@ -50,6 +50,7 @@ class _PickupPageState extends State<PickupPage> with WidgetsBindingObserver {
   PickupLabelScope _labelGranularity = PickupLabelScope.fallback;
   bool _registering = false;
   bool _markingNotGoing = false;
+  bool _sending = false;
   bool _refreshing = false;
   bool _refreshPending = false;
   bool _landscape = false;
@@ -493,6 +494,15 @@ class _PickupPageState extends State<PickupPage> with WidgetsBindingObserver {
       );
       if (!mounted) return;
       setState(() => _progress = updated);
+      if (updated.total == 0) {
+        // Era o último: a câmera ficava aberta numa carga vazia.
+        _message(
+          'Todos os pedidos saíram desta carga: não há o que entregar. '
+          'A operação decide o que fazer com ela.',
+        );
+        Navigator.of(context).pop(false);
+        return;
+      }
       _showScanFeedback(
         _PickupScanFeedback(
           success: true,
@@ -538,6 +548,35 @@ class _PickupPageState extends State<PickupPage> with WidgetsBindingObserver {
     }
   }
 
+  /// Envia já as leituras ainda no aparelho: o servidor cria a rota assim
+  /// que recebe a última, com o entregador ainda no armazém e com sinal.
+  /// Sem sinal elas seguem na fila e a retirada conclui do mesmo jeito.
+  Future<void> _complete() async {
+    if (_sending) return;
+    setState(() {
+      _sending = true;
+      _scanFeedback = null;
+    });
+    await _stopCamera();
+    var sent = false;
+    try {
+      sent = await widget.service.sendPickup(
+        _progress.waveId,
+        timeout: const Duration(seconds: 15),
+      );
+    } catch (_) {
+      // A fila guarda as leituras; o envio segue em segundo plano.
+    }
+    if (!mounted) return;
+    if (!sent) {
+      _message(
+        'Conferência salva no aparelho. Ela será enviada assim que houver '
+        'sinal, e a rota é preparada em seguida.',
+      );
+    }
+    Navigator.of(context).pop(true);
+  }
+
   Future<void> _openManualCode() async {
     await _stopCamera();
     if (!mounted) return;
@@ -567,7 +606,13 @@ class _PickupPageState extends State<PickupPage> with WidgetsBindingObserver {
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
+  Widget build(BuildContext context) => PopScope(
+    // Enviando a conferência: voltar agora pulava a espera pela rota.
+    canPop: !_sending,
+    child: _buildScanner(context),
+  );
+
+  Widget _buildScanner(BuildContext context) => Scaffold(
     backgroundColor: Colors.black,
     body: _FullscreenScanner(
       controller: _scannerController,
@@ -575,7 +620,8 @@ class _PickupPageState extends State<PickupPage> with WidgetsBindingObserver {
       labelGranularity: _labelGranularity,
       landscape: _landscape,
       registering: _registering,
-      busy: _registering || _markingNotGoing || _refreshing,
+      sending: _sending,
+      busy: _registering || _markingNotGoing || _refreshing || _sending,
       candidateCode: _candidateCode,
       scanFeedback: _scanFeedback,
       onDetect: _onDetect,
@@ -584,7 +630,7 @@ class _PickupPageState extends State<PickupPage> with WidgetsBindingObserver {
       onOrders: _openOrders,
       onRefresh: () => unawaited(_refreshProgress(showError: true)),
       onManualCode: _openManualCode,
-      onComplete: () => Navigator.of(context).pop(true),
+      onComplete: _complete,
     ),
   );
 }
@@ -596,6 +642,7 @@ class _FullscreenScanner extends StatelessWidget {
     required this.labelGranularity,
     required this.landscape,
     required this.registering,
+    required this.sending,
     required this.busy,
     required this.candidateCode,
     required this.scanFeedback,
@@ -613,6 +660,7 @@ class _FullscreenScanner extends StatelessWidget {
   final PickupLabelScope labelGranularity;
   final bool landscape;
   final bool registering;
+  final bool sending;
   final bool busy;
   final String? candidateCode;
   final _PickupScanFeedback? scanFeedback;
@@ -661,7 +709,7 @@ class _FullscreenScanner extends StatelessWidget {
                     _CameraFloatingButton(
                       tooltip: 'Fechar retirada',
                       icon: Icons.close_rounded,
-                      onPressed: registering ? null : onClose,
+                      onPressed: registering || sending ? null : onClose,
                     ),
                     const SizedBox(height: 8),
                     _CameraFloatingButton(
@@ -742,7 +790,7 @@ class _FullscreenScanner extends StatelessWidget {
                   ? _ScannerBottomButton(
                       icon: Icons.check_circle_rounded,
                       label: 'Concluir retirada',
-                      onPressed: onComplete,
+                      onPressed: busy ? null : onComplete,
                     )
                   : _ScannerBottomButton(
                       icon: Icons.keyboard_rounded,
@@ -762,7 +810,9 @@ class _FullscreenScanner extends StatelessWidget {
                 const CircularProgressIndicator(color: _yellow),
                 const SizedBox(height: 16),
                 Text(
-                  registering
+                  sending
+                      ? 'Enviando a conferência...'
+                      : registering
                       ? 'Conferindo etiqueta...'
                       : 'Atualizando a carga...',
                   style: const TextStyle(

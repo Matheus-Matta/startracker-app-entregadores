@@ -559,6 +559,27 @@ class OfflineRequestQueue {
     await _drain();
   }
 
+  /// Envia agora e espera o envio terminar, até [timeout].
+  ///
+  /// Com [resourceKey], só importa o que é desse alvo (ex.: as leituras da
+  /// conferência `wave:<id>`). `true` quando nada dele ficou na fila; sem
+  /// sinal devolve `false` logo que o envio para, e a fila segue sozinha.
+  Future<bool> flush({
+    String? resourceKey,
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    bool done() => !_mine(
+      _pending,
+    ).any((item) => resourceKey == null || item.resourceKey == resourceKey);
+    if (done()) return true;
+    try {
+      await retryNow().timeout(timeout);
+    } on TimeoutException {
+      // Envio longo (fotos no 4G): segue em segundo plano.
+    }
+    return done();
+  }
+
   /// Devolve uma ação recusada para a fila de envio.
   Future<void> retryRejected(String id) async {
     final request = _rejected.where((item) => item.id == id).firstOrNull;

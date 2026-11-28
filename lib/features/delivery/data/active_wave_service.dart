@@ -117,7 +117,23 @@ class ActiveWaveService {
   Future<ActiveWave?> _loadActiveWave() async {
     final routes = await _getAllRoutes().timeout(OfflineDeadline.read);
     unawaited(_store.save(0, {'routes': routes}));
-    return _pick(routes);
+    final wave = await _pick(routes);
+    if (wave != null) unawaited(_ensureDownloaded(wave.routeId));
+    return wave;
+  }
+
+  /// A carga ativa da tela inicial com a rota no aparelho: sem isso, se a
+  /// rota nunca tinha sido aberta, o mapa dependia do sinal na hora de sair.
+  /// Só baixa quando não há cópia (a tela relê a cada evento em tempo real).
+  Future<void> _ensureDownloaded(int routeId) async {
+    final service = activeRoutes;
+    if (service == null) return;
+    try {
+      if (await service.storedRoute(routeId) != null) return;
+      await service.getRoute(routeId);
+    } catch (_) {
+      // Tenta de novo na próxima leitura da tela inicial.
+    }
   }
 
   Future<ActiveWave?> _pick(List<Map<String, dynamic>> routes) async {

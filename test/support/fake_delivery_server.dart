@@ -60,6 +60,17 @@ class FakeDeliveryServer implements HttpClientAdapter {
 
   String routeStatus = 'started';
   String waveStatus = 'released';
+
+  /// `false`: a carga ainda não tem rota (retirada em andamento), como antes
+  /// de o servidor roteirizar ao fim da conferência.
+  bool routeExists = true;
+
+  /// `updated_at` da rota 20 na lista (muda quando o portal altera a rota).
+  String routeUpdatedAt = '2026-11-16T08:00:00Z';
+
+  /// Carga refeita pelo operador: a rota 20 fica substituída e esta nasce
+  /// no lugar, na mesma carga 10.
+  int? replacementRoute;
   final Map<int, String> stops = {};
   final Map<int, String> orders = {};
 
@@ -140,14 +151,19 @@ class FakeDeliveryServer implements HttpClientAdapter {
       statusReports.add(Map<String, dynamic>.from(options.data as Map));
       return _json(const {'reported_at': 'agora'});
     }
+    if (!routeExists && path.startsWith('/api/v1/delivery/rotas/20/')) {
+      return status(404, const {'detail': 'Não encontrado.'});
+    }
     // A resposta é montada ANTES de esperar: é o estado no início da leitura.
     final Object data = switch (path) {
+      '/api/v1/delivery/rotas/' ||
+      '/api/v1/delivery/paradas/' when !routeExists => _page(const []),
       '/api/v1/' => const <String, dynamic>{},
       '/api/v1/delivery/rotas/20/' => {
         'id': 20,
         'wave': 10,
         'route_number': 'Rota 20',
-        'status': routeStatus,
+        'status': replacementRoute != null ? 'superseded' : routeStatus,
         'path_geometry': <dynamic>[],
         'planned_waypoints': <dynamic>[],
       },
@@ -171,6 +187,33 @@ class FakeDeliveryServer implements HttpClientAdapter {
           },
       ]),
       '/api/v1/delivery/waves/10/retirada/' => _pickup(),
+      '/api/v1/delivery/waves/10/' => {'id': 10, 'status': waveStatus},
+      final detail
+          when replacementRoute != null &&
+              detail == '/api/v1/delivery/rotas/$replacementRoute/' =>
+        {
+          'id': replacementRoute,
+          'wave': 10,
+          'route_number': 'R$replacementRoute',
+          'status': 'released',
+          'path_geometry': <dynamic>[],
+          'planned_waypoints': <dynamic>[],
+        },
+      '/api/v1/delivery/rotas/' when replacementRoute != null => _page([
+        {
+          'id': 20,
+          'wave': 10,
+          'route_number': 'Rota 20',
+          'status': 'superseded',
+        },
+        {
+          'id': replacementRoute!,
+          'wave': 10,
+          'route_number': 'R$replacementRoute',
+          'status': 'released',
+          'created_at': '2026-11-16T09:00:00Z',
+        },
+      ]),
       '/api/v1/delivery/rotas/' when listOverride != null => _page([
         for (final id in listOverride!)
           {'id': id, 'wave': id, 'route_number': 'R$id', 'status': 'started'},
@@ -185,6 +228,7 @@ class FakeDeliveryServer implements HttpClientAdapter {
           'route_number': 'Rota 20',
           'status': routeStatus,
           'created_at': '2026-11-16T08:00:00Z',
+          'updated_at': routeUpdatedAt,
         },
         for (final entry in extraRoutes.entries)
           {
@@ -439,6 +483,7 @@ class TestDevice {
       ),
       routeStore: RouteSnapshotStore(baseDirectory: () => folder('snap')),
     );
+    waves.onOrdersFetched = orders.rememberOrders;
   }
 
   final FakeDeliveryServer server;

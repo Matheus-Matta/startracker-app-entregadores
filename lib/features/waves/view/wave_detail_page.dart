@@ -91,6 +91,20 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
         setState(() {
           _currentStatus = details.status;
           _pickupProgress = details.pickup;
+          // A rota pode ter nascido com a tela aberta (o servidor roteiriza
+          // ao fim da retirada): sem guardar o id, "Começar a rota" dizia
+          // que a carga não tinha rota até sair e voltar à lista.
+          final routeId = details.routeId;
+          if (routeId != null && routeId != _currentWave.routeId) {
+            _currentWave = _currentWave.withRoute(
+              id: routeId,
+              number: details.routeNumber,
+              routeStatus: details.status,
+              distanceMeters: details.plannedDistanceMeters,
+              start: details.plannedStart,
+              routeCreatedAt: null,
+            );
+          }
         });
       }
     }, onError: (Object _, StackTrace _) {});
@@ -98,9 +112,12 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
   }
 
   void _onRealtimeEvent(FleetRealtimeEvent event) {
+    // Sem rota conhecida, qualquer rota nova pode ser a desta carga.
     final affectsCurrentRoute =
         event.isRouteChange &&
-        (event.routeId == null || event.routeId == _currentWave.routeId);
+        (event.routeId == null ||
+            _currentWave.routeId == null ||
+            event.routeId == _currentWave.routeId);
     // Um pedido transferido para dentro da carga ainda nao existe na tela; por
     // isso qualquer alteracao de pedido do tenant precisa reconciliar o REST.
     if (!event.isConnected && !event.isOrderChange && !affectsCurrentRoute) {
@@ -153,9 +170,11 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
         final result = await _service.optimizeAndRelease(_currentWave);
         if (!mounted) return;
         if (result.queued) {
+          // "Na fila" também é o otimizador demorando com sinal: dizer "sem
+          // conexão" mandava o entregador procurar sinal à toa.
           _message(
-            'Sem conexão. A rota será preparada assim que houver sinal: '
-            'roteirizar depende do servidor.',
+            'A rota está sendo preparada pelo servidor. Ela aparece aqui '
+            'assim que ficar pronta (sem sinal, assim que ele voltar).',
           );
           return;
         }
@@ -165,10 +184,21 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
           _currentStatus = prepared.status;
         });
       }
-      final routeId = _currentWave.routeId;
+      var routeId = _currentWave.routeId;
       if (routeId == null) {
+        // A tela pode ter sido aberta antes de o servidor criar a rota.
+        final found = await _service.findWaveRoute(_currentWave);
+        if (!mounted) return;
+        if (found != null) {
+          setState(() => _currentWave = found);
+          routeId = found.routeId;
+        }
+      }
+      if (routeId == null) {
+        unawaited(_refresh());
         throw const WaveServiceException(
-          'Esta carga ainda não possui uma rota para iniciar.',
+          'A rota desta carga ainda está sendo preparada. Aguarde alguns '
+          'segundos e toque de novo.',
         );
       }
       setState(() => _currentStatus = 'started');
@@ -239,12 +269,30 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
   Future<void> _openPickup() async {
     final progress = _pickupProgress;
     if (progress == null || !progress.enabled) return;
-    await Navigator.of(context).push<bool>(
+    final completed = await Navigator.of(context).push<bool>(
       MaterialPageRoute<bool>(
         builder: (_) => PickupPage(service: _service, progress: progress),
       ),
     );
-    if (mounted) await _refresh();
+    if (!mounted) return;
+    await _refresh();
+    if (completed == true) unawaited(_awaitRouteAfterPickup());
+  }
+
+  /// Conferência concluída e enviada: o servidor cria a rota em segundo
+  /// plano, em alguns segundos. Relê algumas vezes para o botão passar a
+  /// "Começar a rota" sozinho (o botão segue liberado enquanto isso: tocar
+  /// em "Roteirizar" pede a mesma rota ao servidor).
+  Future<void> _awaitRouteAfterPickup() async {
+    for (var attempt = 0; attempt < 4; attempt++) {
+      if (!mounted || _currentWave.routeId != null) return;
+      if (!const {'ready', 'optimizing'}.contains(_currentStatus)) return;
+      if (_pickupProgress?.isComplete != true) return;
+      await Future<void>.delayed(const Duration(seconds: 2));
+      if (!mounted || _startingRoute) return;
+      _service.invalidateCache();
+      await _refresh();
+    }
   }
 
   Future<void> _openOrder(WaveOrderItem order) async {
@@ -263,10 +311,20 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
   bool get _pickupPending =>
       _pickupProgress?.enabled == true && _pickupProgress?.isComplete == false;
 
+  /// Todos os pedidos marcados como "não vai" (ou tirados no portal): não
+  /// há o que conferir nem roteirizar. Antes o botão "Conferir retirada
+  /// (0/0)" abria uma conferência vazia e a carga ficava presa.
+  bool get _emptyLoad =>
+      _pickupProgress?.enabled == true &&
+      _pickupProgress!.total == 0 &&
+      _currentWave.routeId == null &&
+      _currentStatus != 'started';
+
   bool get _requiresPickupBeforeStart =>
-      _currentStatus != 'started' && _pickupPending;
+      _currentStatus != 'started' && _pickupPending && !_emptyLoad;
 
   bool get _canStart {
+    if (_emptyLoad) return false;
     if (!const {
       'ready',
       'planned',
@@ -283,6 +341,7 @@ class _WaveDetailPageState extends State<WaveDetailPage> {
 
   String get _buttonLabel {
     if (_currentStatus == 'started') return 'Rota em andamento';
+    if (_emptyLoad) return 'Carga sem pedidos para entregar';
     if (_pickupProgress == null && _canHaveRouteAction) {
       return 'Carregando retirada...';
     }

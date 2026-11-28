@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import '../../../core/network/api_client.dart';
 import '../../../core/network/api_collection.dart';
@@ -626,8 +627,29 @@ class OrderService {
     return found == null ? null : (found, bestAt);
   }
 
+  /// Conteúdo da última cópia gravada por pedido (sem regravar o que não
+  /// mudou: o detalhe da carga é relido a cada evento em tempo real).
+  final Map<int, int> _rememberedHash = {};
+
+  /// Guarda no aparelho os pedidos lidos com a carga (antes de existir rota
+  /// eles não estão em nenhuma cópia), para o "Ver pedido" abrir sem sinal.
+  void rememberOrders(List<Map<String, dynamic>> orders) {
+    final fetchedAt = DateTime.now().toUtc().toIso8601String();
+    for (final order in orders) {
+      final orderId = _asInt(order['id']);
+      if (orderId == null) continue;
+      final hash = jsonEncode(order).hashCode;
+      if (_rememberedHash[orderId] == hash) continue;
+      _rememberedHash[orderId] = hash;
+      unawaited(
+        _detailStore.save(orderId, {...order, 'fetched_at': fetchedAt}),
+      );
+    }
+  }
+
   /// Logout/troca de conta sem nada pendente: não deixa cópias para trás.
   Future<void> clearStoredCopies() async {
+    _rememberedHash.clear();
     await _detailStore.clear();
     await _pageStore.clear();
   }

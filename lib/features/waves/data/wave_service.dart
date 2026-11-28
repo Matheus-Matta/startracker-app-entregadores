@@ -274,11 +274,20 @@ class WaveService {
   /// Status calculado no aparelho para a lista (definido pelo app).
   ActiveRouteService? activeRoutes;
 
+  /// Recebe os pedidos lidos com o detalhe da carga, para guardar no
+  /// aparelho (definido pelo app; ver `OrderService.rememberOrders`).
+  void Function(List<Map<String, dynamic>> orders)? onOrdersFetched;
+
   /// Última conferência lida do servidor, por carga.
   final Map<int, Map<String, dynamic>> _pickupRaw = {};
 
   /// Rotas já baixadas nesta sessão por `_prefetchReadyRoutes`.
-  final Set<int> _prefetchedRoutes = {};
+  /// Chave: id + `updated_at` — rota alterada depois (status, trajeto)
+  /// é baixada de novo, em vez de uma vez só por sessão.
+  final Set<String> _prefetchedRoutes = {};
+
+  /// Conferências já baixadas nesta sessão por `_prefetchPickups`.
+  final Set<String> _prefetchedPickups = {};
 
   static const _prepareRouteType = 'wave.prepare_route';
   final ApiClient apiClient;
@@ -390,6 +399,7 @@ class WaveService {
     invalidateCache();
     _pickupRaw.clear();
     _prefetchedRoutes.clear();
+    _prefetchedPickups.clear();
     if (!keepOffline) {
       unawaited(_pickupStore.clear());
       unawaited(_listStore.clear());
@@ -461,6 +471,7 @@ class WaveService {
         _listStore.save(0, {'routes': results[0], 'waves': results[1]}),
       );
       _prefetchReadyRoutes(results[0]);
+      _prefetchPickups(results[1]);
       return _WaveListSnapshot(DateTime.now(), results[0], results[1]);
     } catch (error) {
       // Sem sinal: a última lista salva, com o status calculado no aparelho.
@@ -483,21 +494,51 @@ class WaveService {
   void _prefetchReadyRoutes(List<Map<String, dynamic>> routes) {
     final service = activeRoutes;
     if (service == null) return;
-    const ready = {'planned', 'released', 'accepted'};
+    // Em andamento também: aberta noutro aparelho, reinstalada ou com a
+    // cópia apagada, o mapa só abria sem sinal se já tivesse sido aberto.
+    const ready = {'planned', 'released', 'accepted', 'started'};
     for (final route in routes) {
       final routeId = _asInt(route['id']);
       if (routeId == null || !ready.contains(route['status']?.toString())) {
         continue;
       }
-      if (!_prefetchedRoutes.add(routeId)) continue;
+      final key = '$routeId:${route['updated_at']}';
+      if (!_prefetchedRoutes.add(key)) continue;
       unawaited(
         service
             .getRoute(routeId)
             .then(
               (_) {},
               // Tenta de novo na próxima leitura da lista.
-              onError: (Object _) => _prefetchedRoutes.remove(routeId),
+              onError: (Object _) => _prefetchedRoutes.remove(key),
             ),
+      );
+    }
+  }
+
+  /// Cargas abertas com no máximo esta quantidade de conferências baixadas
+  /// por leitura da lista (as mais novas; as antigas já estão encerradas).
+  static const _pickupPrefetchLimit = 8;
+
+  /// Conferência de cada carga aberta salva no aparelho: a carga recebida
+  /// pode ser conferida no armazém sem sinal, sem precisar ter sido aberta
+  /// antes com internet.
+  void _prefetchPickups(List<Map<String, dynamic>> waves) {
+    const open = {'collecting', 'ready', 'optimizing', 'planned', 'released'};
+    var scheduled = 0;
+    for (final wave in waves) {
+      if (scheduled >= _pickupPrefetchLimit) break;
+      final waveId = _asInt(wave['id']);
+      if (waveId == null || !open.contains(wave['status']?.toString())) {
+        continue;
+      }
+      scheduled++;
+      final key = '$waveId:${wave['updated_at']}';
+      if (!_prefetchedPickups.add(key)) continue;
+      unawaited(
+        getPickupProgress(
+          waveId,
+        ).then((_) {}, onError: (Object _) => _prefetchedPickups.remove(key)),
       );
     }
   }
@@ -651,7 +692,21 @@ class WaveService {
   }
 
   Future<WaveDetails?> _offlineDetails(WaveListItem wave) async {
-    final routeId = wave.routeId;
+    // Tela aberta antes da rota existir: a lista salva depois já a traz.
+    var routeId = wave.routeId;
+    if (routeId == null) {
+      routeId = _asInt((await _storedCurrentRoute(wave.waveId))?['id']);
+      if (routeId != null) {
+        wave = wave.withRoute(
+          id: routeId,
+          number: wave.routeNumber,
+          routeStatus: wave.status,
+          distanceMeters: wave.plannedDistanceMeters,
+          start: wave.plannedStart,
+          routeCreatedAt: wave.createdAt,
+        );
+      }
+    }
     final route = routeId == null
         ? null
         : await activeRoutes?.storedRoute(routeId).catchError((_) => null);
@@ -710,7 +765,6 @@ class WaveService {
   }
 
   Future<WaveDetails> _fetchWaveDetails(WaveListItem wave) async {
-    final routeId = wave.routeId;
     final refreshToken = DateTime.now().microsecondsSinceEpoch;
     final freshQuery = {'_detail_refresh': refreshToken};
     final noCache = Options(
@@ -724,20 +778,42 @@ class WaveService {
       queryParameters: freshQuery,
       options: noCache,
     );
-    final routeFuture = routeId == null
-        ? Future.value(const <String, dynamic>{})
-        : _getOptionalMap(
-            '/api/v1/delivery/rotas/$routeId/',
-            queryParameters: freshQuery,
-            options: noCache,
-          );
-    final stopsFuture = routeId == null
-        ? Future.value(const <Map<String, dynamic>>[])
-        : _getAll(
-            '/api/v1/delivery/paradas/',
-            queryParameters: {'route': routeId, ...freshQuery},
-            options: noCache,
-          );
+    // Sem rota conhecida, pergunta ao servidor: ele roteiriza sozinho ao fim
+    // da retirada, e a tela aberta antes disso ficava sem o id — "Começar a
+    // rota" dizia que a carga não tinha rota até sair e voltar à lista.
+    // A rota conhecida também pode ter morrido: o operador roteirizou de
+    // novo (substituída, até em andamento) ou cancelou. Sem procurar a atual,
+    // a tela seguia na rota velha.
+    final knownRouteId = wave.routeId;
+    final routeFuture =
+        (knownRouteId == null
+                ? Future.value(const <String, dynamic>{})
+                : _getOptionalMap(
+                    '/api/v1/delivery/rotas/$knownRouteId/',
+                    queryParameters: freshQuery,
+                    options: noCache,
+                  ))
+            .then((route) async {
+              if (route.isNotEmpty &&
+                  !_deadRouteStatuses.contains(route['status'])) {
+                return route;
+              }
+              final current = await _findCurrentRoute(
+                wave.waveId,
+                queryParameters: freshQuery,
+                options: noCache,
+              );
+              return current ?? route;
+            });
+    final stopsFuture = routeFuture.then<List<Map<String, dynamic>>>((route) {
+      final id = _asInt(route['id']) ?? knownRouteId;
+      if (id == null) return const <Map<String, dynamic>>[];
+      return _getAll(
+        '/api/v1/delivery/paradas/',
+        queryParameters: {'route': id, ...freshQuery},
+        options: noCache,
+      );
+    });
     final linksFuture = _getAllOptional(
       '/api/v1/delivery/pedidos-wave/',
       queryParameters: {'wave': wave.waveId, ...freshQuery},
@@ -762,6 +838,7 @@ class WaveService {
     final pickup = await pickupFuture;
     final waveData = await waveDataFuture;
     final route = await routeFuture;
+    final routeId = _asInt(route['id']) ?? knownRouteId;
     final stops = await stopsFuture;
     final routeStops = stops
         .where((item) => _asInt(item['route']) == routeId)
@@ -849,6 +926,13 @@ class WaveService {
         ordersById[id] = Map<String, dynamic>.from(link['order'] as Map);
       }
     }
+
+    // Só os completos, de /pedidos/: os aninhados na carga podem ser parciais.
+    final fetchedOrders = [
+      for (final order in orders)
+        if (currentOrderIds.contains(_asInt(order['id']))) order,
+    ];
+    if (fetchedOrders.isNotEmpty) onOrdersFetched?.call(fetchedOrders);
 
     final stopsByOrder = <int, Map<String, dynamic>>{
       for (final stop in routeStops)
@@ -1171,6 +1255,104 @@ class WaveService {
     return _asInt(value);
   }
 
+  /// Rota que não vale mais: a carga pode ter outra no lugar.
+  static const _deadRouteStatuses = {'cancelled', 'superseded'};
+
+  /// Rota viva mais nova da carga (canceladas e substituídas não contam:
+  /// a carga pode ter sido roteirizada de novo).
+  Future<Map<String, dynamic>?> _findCurrentRoute(
+    int waveId, {
+    Map<String, dynamic>? queryParameters,
+    Options? options,
+  }) async {
+    final routes = await _getAllOptional(
+      '/api/v1/delivery/rotas/',
+      queryParameters: {'wave': waveId, ...?queryParameters},
+      options: options,
+    );
+    Map<String, dynamic>? current;
+    for (final route in routes) {
+      if (_asInt(route['wave']) != waveId) continue;
+      if (_deadRouteStatuses.contains(route['status'])) {
+        continue;
+      }
+      if (current == null ||
+          (_asInt(route['id']) ?? 0) > (_asInt(current['id']) ?? 0)) {
+        current = route;
+      }
+    }
+    return current;
+  }
+
+  WaveListItem _withRouteData(WaveListItem wave, Map<String, dynamic> route) {
+    final routeId = _asInt(route['id'])!;
+    final number = route['route_number']?.toString() ?? '';
+    return wave.withRoute(
+      id: routeId,
+      number: number.isEmpty ? 'Rota #$routeId' : number,
+      routeStatus: route['status']?.toString() ?? 'released',
+      distanceMeters: _asInt(route['planned_distance']) ?? 0,
+      start: DateTime.tryParse(route['planned_start']?.toString() ?? ''),
+      routeCreatedAt: DateTime.tryParse(route['created_at']?.toString() ?? ''),
+    );
+  }
+
+  /// A carga já com a rota que o servidor criou (ao fim da retirada), ou
+  /// `null` se ainda não há rota. Sem sinal, a cópia da lista no aparelho.
+  Future<WaveListItem?> findWaveRoute(WaveListItem wave) async {
+    Map<String, dynamic>? route;
+    try {
+      route = await _findCurrentRoute(
+        wave.waveId,
+        queryParameters: {
+          '_detail_refresh': DateTime.now().microsecondsSinceEpoch,
+        },
+        options: Options(
+          headers: const {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'},
+        ),
+      ).timeout(OfflineDeadline.read);
+    } catch (error) {
+      if (!isOfflineError(error)) rethrow;
+      route = await _storedCurrentRoute(wave.waveId);
+    }
+    if (route == null || _asInt(route['id']) == null) return null;
+    invalidateCache();
+    return _withRouteData(wave, route);
+  }
+
+  /// Rota viva mais nova da carga na última lista salva no aparelho.
+  Future<Map<String, dynamic>?> _storedCurrentRoute(int waveId) async {
+    Map<String, dynamic>? route;
+    final stored = await _listStore.read(0);
+    final routes = stored?['routes'];
+    for (final item in routes is List ? routes : const []) {
+      if (item is! Map || _asInt(item['wave']) != waveId) continue;
+      if (_deadRouteStatuses.contains(item['status'])) continue;
+      final candidate = Map<String, dynamic>.from(item);
+      if (route == null ||
+          (_asInt(candidate['id']) ?? 0) > (_asInt(route['id']) ?? 0)) {
+        route = candidate;
+      }
+    }
+    return route;
+  }
+
+  /// Envia já as leituras da conferência ainda no aparelho e espera, até
+  /// [timeout]. O servidor roteiriza assim que recebe a última: enviar ao
+  /// concluir a retirada (com o entregador ainda no armazém, com sinal) é o
+  /// que deixa a rota pronta antes de ele sair. `true` se tudo foi enviado.
+  Future<bool> sendPickup(
+    int waveId, {
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    final sent = await apiClient.offlineRequests.flush(
+      resourceKey: 'wave:$waveId',
+      timeout: timeout,
+    );
+    if (sent) invalidateCache();
+    return sent;
+  }
+
   /// Quanto esperar a roteirização antes de seguir com ela na fila.
   static const prepareWait = Duration(seconds: 45);
 
@@ -1205,35 +1387,13 @@ class WaveService {
     try {
       await _postPrepareRoute(wave.waveId, idempotencyKey);
       invalidateCache();
-      final routes = await _getAll(
-        '/api/v1/delivery/rotas/',
-        queryParameters: {'wave': wave.waveId},
-      );
-      final matching =
-          routes.where((route) => _asInt(route['wave']) == wave.waveId).toList()
-            ..sort(
-              (first, second) => (_asInt(second['id']) ?? 0).compareTo(
-                _asInt(first['id']) ?? 0,
-              ),
-            );
-      if (matching.isEmpty) {
+      final route = await _findCurrentRoute(wave.waveId);
+      if (route == null || _asInt(route['id']) == null) {
         throw const WaveServiceException(
           'A roteirização terminou sem criar uma rota para esta carga.',
         );
       }
-      final route = matching.first;
-      final routeId = _asInt(route['id'])!;
-      final number = route['route_number']?.toString() ?? '';
-      return wave.withRoute(
-        id: routeId,
-        number: number.isEmpty ? 'Rota #$routeId' : number,
-        routeStatus: route['status']?.toString() ?? 'released',
-        distanceMeters: _asInt(route['planned_distance']) ?? 0,
-        start: DateTime.tryParse(route['planned_start']?.toString() ?? ''),
-        routeCreatedAt: DateTime.tryParse(
-          route['created_at']?.toString() ?? '',
-        ),
-      );
+      return _withRouteData(wave, route);
     } on WaveServiceException {
       rethrow;
     } on DioException {

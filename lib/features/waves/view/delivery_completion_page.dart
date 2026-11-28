@@ -373,9 +373,25 @@ class _DeliveryCompletionPageState extends State<DeliveryCompletionPage> {
 
   @override
   Widget build(BuildContext context) {
+    // Voltar no meio do envio devolvia "não concluída" ao mapa, que relia a
+    // rota antes de a baixa ser gravada e mostrava a entrega como pendente
+    // (e o entregador fazia de novo). Durante o envio a tela fica presa.
+    return PopScope(
+      canPop: !_submitting,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _submitting) {
+          _message('Aguarde: a entrega está sendo salva.');
+        }
+      },
+      child: _buildPage(context),
+    );
+  }
+
+  Widget _buildPage(BuildContext context) {
     return Scaffold(
       backgroundColor: _cream,
       appBar: AppBar(
+        automaticallyImplyLeading: !_submitting,
         backgroundColor: Colors.transparent,
         surfaceTintColor: Colors.transparent,
         elevation: 0,
