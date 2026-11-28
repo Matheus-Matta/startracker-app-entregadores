@@ -1,0 +1,5 @@
+<!-- Só no APK distribuído direto (flutter build apk), nunca no AAB da Play:
+     a Play não aceita app que se atualiza fora dela. Ver build.gradle.kts. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+</manifest>

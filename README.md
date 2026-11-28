@@ -93,3 +93,17 @@ e uma assinatura de desenvolvimento para permitir a instalação direta. Esse AP
 não serve para o Google Play nem atualiza uma instalação assinada por outra
 chave. Com a chave Android válida, o workflow gera o APK e o AAB oficiais antes
 da tentativa de envio ao Google Play.
+
+## Atualização dentro do app
+
+No APK distribuído direto, o aviso de versão nova baixa o instalador dentro do
+próprio app (com progresso e opção de cancelar) e abre o instalador do Android
+por cima do app, sem passar pelo navegador. Na primeira vez o Android pede para
+liberar "instalar apps desta fonte"; ao voltar para o app, a instalação segue
+sozinha. O que estiver na fila de envio fica salvo e continua depois.
+
+A permissão `REQUEST_INSTALL_PACKAGES` existe só no APK (`flutter build apk`,
+manifesto em `android/app/src/sideload/`). O AAB (`flutter build appbundle`)
+vai para o Google Play sem ela, porque a Play proíbe o app de se atualizar fora
+da loja; instalações vindas da Play abrem a página da Play Store. No iOS o
+aviso continua abrindo a App Store.

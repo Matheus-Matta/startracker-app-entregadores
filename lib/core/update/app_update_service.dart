@@ -57,6 +57,7 @@ class AppUpdateService {
 
   final Dio _http;
   final Future<PackageInfo> Function() _packageInfo;
+
   /// Só para testes; no app vale a plataforma atual.
   final TargetPlatform? platform;
   final String githubRepository;

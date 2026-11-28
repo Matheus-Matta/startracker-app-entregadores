@@ -79,6 +79,16 @@ android {
         }
     }
 
+    // Atualização dentro do app só no APK distribuído direto: o AAB vai para
+    // a Play, que proíbe o app de se atualizar fora dela (e a permissão de
+    // instalar pacotes). `flutter build appbundle` roda bundleRelease.
+    val buildingPlayBundle = gradle.startParameter.taskNames.any {
+        it.substringAfterLast(':').startsWith("bundle")
+    }
+    if (!buildingPlayBundle) {
+        sourceSets.getByName("release").manifest.srcFile("src/sideload/AndroidManifest.xml")
+    }
+
     buildTypes {
         release {
             // APKs Android precisam ser assinados mesmo quando distribuidos fora da loja.
@@ -103,6 +113,8 @@ android {
 
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+    // FileProvider: entrega o APK baixado ao instalador do Android.
+    implementation("androidx.core:core-ktx:1.13.1")
 }
 
 kotlin {
